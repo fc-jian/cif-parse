@@ -1,0 +1,21 @@
+name: mmcif-parse
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy>=2.3,<3
+  - biotite>=1.6,<2
+  - pandas>=2.3,<3
+  - scipy>=1.17,<2
+  - networkx>=3.6,<4
+  - biopython>=1.85,<2
+  - pyhmmer>=0.11,<1
+  - rdkit>=2026.03
+  - pytest>=8,<9
+  - pip:
+      - sadie-antibody>=1.1,<2
+      - -e .
+

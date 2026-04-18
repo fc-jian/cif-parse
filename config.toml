@@ -1,0 +1,18 @@
+[settings]
+output_format = "json"
+assembly_mode = "biological_assembly"
+coverage_mode = "nearest"
+log_level = "INFO"
+verbose = false
+model = 1
+use_author_fields = false
+max_polymer_chains = 100
+min_polymer_chain_length = 20
+
+[single]
+outdir = "outputs"
+
+[batch]
+outdir = "batch_outputs"
+jobs = 8
+fail_fast = false

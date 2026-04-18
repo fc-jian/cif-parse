@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmcif-parse"
+version = "0.1.0"
+description = "Utilities for parsing and annotating mmCIF structures."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "biotite>=1.6,<2",
+    "numpy>=2.3,<3",
+    "biopython>=1.85,<2",
+    "pyhmmer>=0.11,<1",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "pandas>=2.3,<3",
+    "scipy>=1.17,<2",
+    "networkx>=3.6,<4",
+]
+immune = [
+    "sadie-antibody>=1.1,<2",
+]
+chem = [
+    "rdkit>=2026.03",
+]
+dev = [
+    "pytest>=8,<9",
+]
+all = [
+    "pandas>=2.3,<3",
+    "scipy>=1.17,<2",
+    "networkx>=3.6,<4",
+    "sadie-antibody>=1.1,<2",
+    "rdkit>=2026.03",
+    "pytest>=8,<9",
+    "biopython>=1.85,<2",
+    "pyhmmer>=0.11,<1",
+]
+
+[project.scripts]
+mmcif-parse = "mmcif_parse.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
