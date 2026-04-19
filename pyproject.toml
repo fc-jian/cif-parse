@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mmcif-parse"
+name = "cif-parse"
 version = "0.1.0"
 description = "Utilities for parsing and annotating mmCIF structures."
 readme = "README.md"
@@ -22,7 +22,7 @@ analysis = [
     "networkx>=3.6,<4",
 ]
 immune = [
-    "sadie-antibody>=1.1,<2",
+    "sadie-antibody>=2.0,<3",
 ]
 chem = [
     "rdkit>=2026.03",
@@ -34,7 +34,7 @@ all = [
     "pandas>=2.3,<3",
     "scipy>=1.17,<2",
     "networkx>=3.6,<4",
-    "sadie-antibody>=1.1,<2",
+    "sadie-antibody>=2.0,<3",
     "rdkit>=2026.03",
     "pytest>=8,<9",
     "biopython>=1.85,<2",
@@ -42,7 +42,7 @@ all = [
 ]
 
 [project.scripts]
-mmcif-parse = "mmcif_parse.cli:main"
+cif-parse = "cif_parse.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

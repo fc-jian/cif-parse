@@ -1,4 +1,4 @@
-name: mmcif-parse
+name: cif-parse
 channels:
   - conda-forge
   - bioconda
@@ -14,8 +14,7 @@ dependencies:
   - biopython>=1.85,<2
   - pyhmmer>=0.11,<1
   - rdkit>=2026.03
+  - sadie-antibody=2.0
   - pytest>=8,<9
   - pip:
-      - sadie-antibody>=1.1,<2
       - -e .
-
