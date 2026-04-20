@@ -6,12 +6,40 @@ from typing import Any
 import numpy as np
 from biotite.structure import AtomArray, sasa
 
+from cif_parse.utils import filter_atom_array_for_analysis, normalize_element_symbol
+
 
 RESIDUE_CONTACT_CUTOFF = 8.0
 ATOM_CONTACT_CUTOFF = 5.0
 MIN_RESIDUE_CONTACTS = 3
 MIN_ATOM_CONTACTS = 20
 ATOM_CHUNK_SIZE = 256
+GENERIC_VDW_RADII = {
+    "B": 1.92,
+    "C": 1.70,
+    "N": 1.55,
+    "O": 1.52,
+    "F": 1.47,
+    "P": 1.80,
+    "S": 1.80,
+    "SE": 1.90,
+    "CL": 1.75,
+    "BR": 1.85,
+    "I": 1.98,
+    "SI": 2.10,
+    "NA": 2.27,
+    "MG": 1.73,
+    "K": 2.75,
+    "CA": 2.31,
+    "MN": 1.97,
+    "FE": 1.94,
+    "CO": 1.92,
+    "NI": 1.63,
+    "CU": 1.40,
+    "ZN": 1.39,
+    "CD": 1.58,
+    "HG": 1.55,
+}
 
 
 @dataclass(slots=True)
@@ -26,6 +54,54 @@ class ChainGeometry:
     bbox_min: np.ndarray
     bbox_max: np.ndarray
     centroid: np.ndarray
+
+
+def _prepare_atom_array_for_area(atom_array: AtomArray) -> tuple[AtomArray, dict[str, int]]:
+    return filter_atom_array_for_analysis(atom_array, drop_hydrogens=True, drop_nonfinite=True)
+
+
+def _prepare_fallback_radii(atom_array: AtomArray) -> tuple[AtomArray, np.ndarray, int]:
+    if atom_array.array_length() == 0:
+        return atom_array, np.asarray([], dtype=np.float32), 0
+
+    keep_mask = np.zeros(atom_array.array_length(), dtype=bool)
+    radii = np.zeros(atom_array.array_length(), dtype=np.float32)
+    unsupported_atoms = 0
+    for atom_index, (element, atom_name) in enumerate(
+        zip(atom_array.element, atom_array.atom_name, strict=False)
+    ):
+        normalized = normalize_element_symbol(str(element), str(atom_name))
+        radius = GENERIC_VDW_RADII.get(normalized)
+        if radius is None:
+            unsupported_atoms += 1
+            continue
+        keep_mask[atom_index] = True
+        radii[atom_index] = radius
+
+    return atom_array[keep_mask], radii[keep_mask], unsupported_atoms
+
+
+def _run_sasa_triplet(
+    atom_array_1: AtomArray,
+    atom_array_2: AtomArray,
+    complex_array: AtomArray,
+    *,
+    vdw_radii: str | tuple[np.ndarray, np.ndarray, np.ndarray] = "ProtOr",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if isinstance(vdw_radii, tuple):
+        radii_1, radii_2, radii_complex = vdw_radii
+        sasa_1 = np.asarray(sasa(atom_array_1, ignore_ions=False, vdw_radii=radii_1), dtype=np.float32)
+        sasa_2 = np.asarray(sasa(atom_array_2, ignore_ions=False, vdw_radii=radii_2), dtype=np.float32)
+        complex_sasa = np.asarray(
+            sasa(complex_array, ignore_ions=False, vdw_radii=radii_complex),
+            dtype=np.float32,
+        )
+        return sasa_1, sasa_2, complex_sasa
+
+    sasa_1 = np.asarray(sasa(atom_array_1), dtype=np.float32)
+    sasa_2 = np.asarray(sasa(atom_array_2), dtype=np.float32)
+    complex_sasa = np.asarray(sasa(complex_array), dtype=np.float32)
+    return sasa_1, sasa_2, complex_sasa
 
 
 def _bbox_distance(bbox_min_1: np.ndarray, bbox_max_1: np.ndarray, bbox_min_2: np.ndarray, bbox_max_2: np.ndarray) -> float:
@@ -46,12 +122,21 @@ def _select_representative_atom(chain_type: str, atom_names: list[str]) -> int:
     return 0
 
 
-def build_chain_geometries(atom_array: AtomArray, chain_records: list[Any]) -> dict[str, ChainGeometry]:
+def build_chain_geometries(
+    atom_array: AtomArray,
+    chain_records: list[Any],
+    *,
+    drop_hydrogens_for_analysis: bool = True,
+) -> dict[str, ChainGeometry]:
     chain_type_map = {record.label_asym_id: record.chain_type for record in chain_records}
     geometries: dict[str, ChainGeometry] = {}
     for label_asym_id in sorted({str(chain_id) for chain_id in atom_array.chain_id.tolist()}):
         mask = atom_array.chain_id == label_asym_id
-        chain_atoms = atom_array[mask]
+        chain_atoms, _ = filter_atom_array_for_analysis(
+            atom_array[mask],
+            drop_hydrogens=drop_hydrogens_for_analysis,
+            drop_nonfinite=True,
+        )
         atom_coords = np.asarray(chain_atoms.coord, dtype=np.float32)
         if atom_coords.size == 0:
             continue
@@ -102,7 +187,12 @@ def build_chain_geometries(atom_array: AtomArray, chain_records: list[Any]) -> d
     return geometries
 
 
-def build_instance_geometries(atom_array: AtomArray, chain_records: list[Any]) -> dict[str, ChainGeometry]:
+def build_instance_geometries(
+    atom_array: AtomArray,
+    chain_records: list[Any],
+    *,
+    drop_hydrogens_for_analysis: bool = True,
+) -> dict[str, ChainGeometry]:
     chain_type_map = {record.label_asym_id: record.chain_type for record in chain_records}
     geometries: dict[str, ChainGeometry] = {}
     sym_ids = atom_array.sym_id.tolist() if hasattr(atom_array, "sym_id") else [0] * atom_array.array_length()
@@ -114,7 +204,11 @@ def build_instance_geometries(atom_array: AtomArray, chain_records: list[Any]) -
     )
     for label_asym_id, sym_id in instance_keys:
         mask = (atom_array.chain_id == label_asym_id) & (atom_array.sym_id == sym_id)
-        chain_atoms = atom_array[mask]
+        chain_atoms, _ = filter_atom_array_for_analysis(
+            atom_array[mask],
+            drop_hydrogens=drop_hydrogens_for_analysis,
+            drop_nonfinite=True,
+        )
         atom_coords = np.asarray(chain_atoms.coord, dtype=np.float32)
         if atom_coords.size == 0:
             continue
@@ -210,12 +304,104 @@ def _residue_contact_metrics(
     }
 
 
-def _interface_area_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeometry) -> dict[str, float]:
-    sasa_1 = np.asarray(sasa(geometry_1.atom_array), dtype=np.float32)
-    sasa_2 = np.asarray(sasa(geometry_2.atom_array), dtype=np.float32)
-    complex_array = geometry_1.atom_array + geometry_2.atom_array
-    complex_sasa = np.asarray(sasa(complex_array), dtype=np.float32)
-    split_index = geometry_1.atom_array.array_length()
+def _interface_area_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeometry) -> dict[str, Any]:
+    filtered_1, filter_counts_1 = _prepare_atom_array_for_area(geometry_1.atom_array)
+    filtered_2, filter_counts_2 = _prepare_atom_array_for_area(geometry_2.atom_array)
+    warnings: list[str] = []
+    warning_details: dict[str, Any] = {}
+    evidence: dict[str, Any] = {
+        "interface_area_atom_filtering": {
+            "chain_1": filter_counts_1,
+            "chain_2": filter_counts_2,
+        }
+    }
+
+    if filtered_1.array_length() == 0 or filtered_2.array_length() == 0:
+        warnings.append("interface_area_not_computed_after_filtering")
+        warning_details["interface_area_not_computed_after_filtering"] = {
+            "reason": "no_atoms_remain_after_filtering",
+            "chain_1_remaining_atoms": int(filtered_1.array_length()),
+            "chain_2_remaining_atoms": int(filtered_2.array_length()),
+        }
+        evidence["interface_area_method"] = "not_computed"
+        return {
+            "delta_sasa_1": 0.0,
+            "delta_sasa_2": 0.0,
+            "buried_area": 0.0,
+            "warnings": warnings,
+            "warning_details": warning_details,
+            "evidence": evidence,
+        }
+
+    complex_array = filtered_1 + filtered_2
+    split_index = filtered_1.array_length()
+    try:
+        sasa_1, sasa_2, complex_sasa = _run_sasa_triplet(filtered_1, filtered_2, complex_array)
+        evidence["interface_area_method"] = "ProtOr"
+    except Exception as exc:  # noqa: BLE001
+        warnings.append("interface_area_used_element_vdw_fallback")
+        warning_details["interface_area_used_element_vdw_fallback"] = {
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        evidence["interface_area_fallback_error"] = f"{type(exc).__name__}: {exc}"
+        fallback_1, radii_1, unsupported_1 = _prepare_fallback_radii(filtered_1)
+        fallback_2, radii_2, unsupported_2 = _prepare_fallback_radii(filtered_2)
+        evidence["interface_area_fallback_filtering"] = {
+            "chain_1": {"unsupported_atoms_removed": unsupported_1},
+            "chain_2": {"unsupported_atoms_removed": unsupported_2},
+        }
+        if unsupported_1 > 0 or unsupported_2 > 0:
+            warnings.append("interface_area_dropped_unsupported_atoms_for_fallback")
+            warning_details["interface_area_dropped_unsupported_atoms_for_fallback"] = {
+                "chain_1_unsupported_atoms_removed": int(unsupported_1),
+                "chain_2_unsupported_atoms_removed": int(unsupported_2),
+            }
+        if fallback_1.array_length() == 0 or fallback_2.array_length() == 0:
+            warnings.append("interface_area_not_computed_after_filtering")
+            warning_details["interface_area_not_computed_after_filtering"] = {
+                "reason": "no_atoms_remain_after_fallback_filtering",
+                "chain_1_remaining_atoms": int(fallback_1.array_length()),
+                "chain_2_remaining_atoms": int(fallback_2.array_length()),
+            }
+            evidence["interface_area_method"] = "not_computed"
+            return {
+                "delta_sasa_1": 0.0,
+                "delta_sasa_2": 0.0,
+                "buried_area": 0.0,
+                "warnings": warnings,
+                "warning_details": warning_details,
+                "evidence": evidence,
+            }
+
+        complex_array = fallback_1 + fallback_2
+        split_index = fallback_1.array_length()
+        radii_complex = np.concatenate([radii_1, radii_2]).astype(np.float32, copy=False)
+        try:
+            sasa_1, sasa_2, complex_sasa = _run_sasa_triplet(
+                fallback_1,
+                fallback_2,
+                complex_array,
+                vdw_radii=(radii_1, radii_2, radii_complex),
+            )
+            evidence["interface_area_method"] = "element_vdw_fallback"
+        except Exception as fallback_exc:  # noqa: BLE001
+            warnings.append("interface_area_fallback_failed")
+            warning_details["interface_area_fallback_failed"] = {
+                "error": f"{type(fallback_exc).__name__}: {fallback_exc}",
+            }
+            evidence["interface_area_method"] = "not_computed"
+            evidence["interface_area_fallback_failure"] = (
+                f"{type(fallback_exc).__name__}: {fallback_exc}"
+            )
+            return {
+                "delta_sasa_1": 0.0,
+                "delta_sasa_2": 0.0,
+                "buried_area": 0.0,
+                "warnings": warnings,
+                "warning_details": warning_details,
+                "evidence": evidence,
+            }
+
     complex_sasa_1 = complex_sasa[:split_index]
     complex_sasa_2 = complex_sasa[split_index:]
 
@@ -226,10 +412,13 @@ def _interface_area_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeometry
         "delta_sasa_1": max(delta_sasa_1, 0.0),
         "delta_sasa_2": max(delta_sasa_2, 0.0),
         "buried_area": buried_area,
+        "warnings": warnings,
+        "warning_details": warning_details,
+        "evidence": evidence,
     }
 
 
-def compute_interface_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeometry) -> dict[str, float | int] | None:
+def compute_interface_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeometry) -> dict[str, Any] | None:
     bbox_distance = _bbox_distance(
         geometry_1.bbox_min,
         geometry_1.bbox_max,
@@ -259,6 +448,10 @@ def compute_interface_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeomet
 
     centroid_distance = float(np.linalg.norm(geometry_1.centroid - geometry_2.centroid))
     area_metrics = _interface_area_metrics(geometry_1, geometry_2)
+    interface_residue_count_1 = int(residue_metrics["interface_residue_count_1"])
+    interface_residue_count_2 = int(residue_metrics["interface_residue_count_2"])
+    mean_interface_residue_count = (interface_residue_count_1 + interface_residue_count_2) / 2.0
+    buried_area = float(area_metrics["buried_area"])
     return {
         "num_residue_contacts": residue_contacts,
         "num_atom_contacts": atom_contacts,
@@ -267,7 +460,20 @@ def compute_interface_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeomet
         "centroid_distance": centroid_distance,
         "delta_sasa_1": area_metrics["delta_sasa_1"],
         "delta_sasa_2": area_metrics["delta_sasa_2"],
-        "buried_area": area_metrics["buried_area"],
-        "interface_residue_count_1": int(residue_metrics["interface_residue_count_1"]),
-        "interface_residue_count_2": int(residue_metrics["interface_residue_count_2"]),
+        "buried_area": buried_area,
+        "area_warnings": list(area_metrics.get("warnings", [])),
+        "area_warning_details": dict(area_metrics.get("warning_details", {})),
+        "area_evidence": dict(area_metrics.get("evidence", {})),
+        "interface_residue_count_1": interface_residue_count_1,
+        "interface_residue_count_2": interface_residue_count_2,
+        "mean_interface_residue_count": mean_interface_residue_count,
+        "buried_area_per_interface_residue": (
+            buried_area / mean_interface_residue_count if mean_interface_residue_count > 0.0 else 0.0
+        ),
+        "atom_contacts_per_interface_residue": (
+            atom_contacts / mean_interface_residue_count if mean_interface_residue_count > 0.0 else 0.0
+        ),
+        "residue_contacts_per_interface_residue": (
+            residue_contacts / mean_interface_residue_count if mean_interface_residue_count > 0.0 else 0.0
+        ),
     }

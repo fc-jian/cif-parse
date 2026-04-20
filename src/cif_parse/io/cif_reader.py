@@ -14,6 +14,7 @@ from biotite.structure.io.pdbx import CIFFile, get_structure, list_assemblies
 
 from cif_parse.annotate import analyze_antibody_sequence, analyze_immune_sequence
 from cif_parse.models import ChainRecord, StructureSummary
+from cif_parse.utils import filter_atom_array_for_analysis
 
 
 STANDARD_AMINO_ACIDS = frozenset(
@@ -44,6 +45,14 @@ STANDARD_RNA_NUCLEOTIDES = frozenset({"A", "C", "G", "U", "I"})
 STANDARD_DNA_NUCLEOTIDES = frozenset({"DA", "DC", "DG", "DT", "DI", "DU"})
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _append_warning_detail(record: ChainRecord, warning_code: str, detail: dict[str, Any]) -> None:
+    warning_details = record.features.setdefault("coverage_warning_details", {})
+    if not isinstance(warning_details, dict):
+        warning_details = {}
+        record.features["coverage_warning_details"] = warning_details
+    warning_details[warning_code] = detail
 
 
 def read_structure_preflight(path: str | Path) -> dict[str, Any]:
@@ -1002,15 +1011,51 @@ def _apply_single_chain_coverage(
     *,
     model: int,
     coverage_mode: str,
+    drop_hydrogens_for_analysis: bool,
     distance_threshold: float = 4.5,
 ) -> None:
     if coverage_mode != "nearest":
         return
 
-    atom_array = get_structure(
-        cif_file,
-        model=model,
-        use_author_fields=False,
+    subordinate_chain_types = {
+        "glycan / branched component",
+        "small molecule compound",
+        "metal ion",
+    }
+
+    for record in chain_records:
+        record.features["coverage_mode"] = coverage_mode
+
+    try:
+        atom_array = get_structure(
+            cif_file,
+            model=model,
+            use_author_fields=False,
+        )
+    except ValueError as exc:
+        if str(exc) != "Array must contain at least one element":
+            raise
+        for record in chain_records:
+            if record.chain_type not in subordinate_chain_types:
+                continue
+            record.features["coverage_status"] = "structure_extraction_failed"
+            record.warnings.append("coverage skipped because atom array extraction failed")
+            _append_warning_detail(
+                record,
+                "coverage skipped because atom array extraction failed",
+                {
+                    "coverage_mode": coverage_mode,
+                    "model": model,
+                    "drop_hydrogens_for_analysis": drop_hydrogens_for_analysis,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        return
+
+    atom_array, _ = filter_atom_array_for_analysis(
+        atom_array,
+        drop_hydrogens=drop_hydrogens_for_analysis,
+        drop_nonfinite=True,
     )
     chain_coords: dict[str, np.ndarray] = {}
     for label_asym_id in sorted({str(chain_id) for chain_id in atom_array.chain_id.tolist()}):
@@ -1028,11 +1073,6 @@ def _apply_single_chain_coverage(
         "RNA chain",
         "other nucleic acid chain",
     }
-    subordinate_chain_types = {
-        "glycan / branched component",
-        "small molecule compound",
-        "metal ion",
-    }
     primary_records = {
         record.label_asym_id: record
         for record in chain_records
@@ -1040,7 +1080,6 @@ def _apply_single_chain_coverage(
     }
 
     for record in chain_records:
-        record.features["coverage_mode"] = coverage_mode
         if record.chain_type not in subordinate_chain_types:
             continue
 
@@ -1048,6 +1087,16 @@ def _apply_single_chain_coverage(
         if sub_coords is None or sub_coords.size == 0:
             record.features["coverage_status"] = "no_coordinates"
             record.warnings.append("coverage skipped because the chain has no coordinates")
+            _append_warning_detail(
+                record,
+                "coverage skipped because the chain has no coordinates",
+                {
+                    "coverage_mode": coverage_mode,
+                    "distance_threshold": distance_threshold,
+                    "label_asym_id": record.label_asym_id,
+                    "auth_asym_id": record.auth_asym_id,
+                },
+            )
             continue
 
         owner_labels: list[str] = []
@@ -1089,9 +1138,29 @@ def _apply_single_chain_coverage(
         elif len(unique_owner_labels) > 1:
             record.features["coverage_status"] = "multiple_owners"
             record.warnings.append("coverage assigned to multiple main chains")
+            _append_warning_detail(
+                record,
+                "coverage assigned to multiple main chains",
+                {
+                    "coverage_mode": coverage_mode,
+                    "distance_threshold": distance_threshold,
+                    "owner_label_asym_ids": unique_owner_labels,
+                    "owner_auth_asym_ids": owner_auth_ids,
+                },
+            )
         else:
             record.features["coverage_status"] = "unassigned"
             record.warnings.append("coverage owner not found within the nearest-distance threshold")
+            _append_warning_detail(
+                record,
+                "coverage owner not found within the nearest-distance threshold",
+                {
+                    "coverage_mode": coverage_mode,
+                    "distance_threshold": distance_threshold,
+                    "owner_label_asym_ids": unique_owner_labels,
+                    "owner_auth_asym_ids": owner_auth_ids,
+                },
+            )
 
 
 def read_cif_file(path: str | Path) -> CIFFile:
@@ -1107,6 +1176,7 @@ def read_chain_inventory(
     *,
     model: int = 1,
     coverage_mode: str = "nearest",
+    drop_hydrogens_for_analysis: bool = True,
 ) -> list[ChainRecord]:
     """Build the annotated chain inventory for one mmCIF structure."""
 
@@ -1247,6 +1317,7 @@ def read_chain_inventory(
         chain_records,
         model=model,
         coverage_mode=coverage_mode,
+        drop_hydrogens_for_analysis=drop_hydrogens_for_analysis,
     )
     sorted_records = sorted(chain_records, key=lambda record: (record.label_asym_id, record.entity_id))
     LOGGER.debug(
@@ -1264,33 +1335,49 @@ def read_structure_summary(
     model: int = 1,
     use_author_fields: bool = False,
     coverage_mode: str = "nearest",
+    drop_hydrogens_for_analysis: bool = True,
 ) -> StructureSummary:
     """Read a structure-level summary and filtered visible chain ids."""
 
     cif_path = Path(path)
     cif_file = read_cif_file(cif_path)
     LOGGER.debug("Reading structure summary from %s", cif_path)
-    atom_array = get_structure(
-        cif_file,
-        model=model,
-        use_author_fields=use_author_fields,
-    )
     assembly_map = {
         str(assembly_id): str(description)
         for assembly_id, description in list_assemblies(cif_file).items()
     }
-    chain_ids = sorted({str(chain_id) for chain_id in atom_array.chain_id.tolist()})
     chain_inventory = read_chain_inventory(
         cif_path,
         model=model,
         coverage_mode=coverage_mode,
+        drop_hydrogens_for_analysis=drop_hydrogens_for_analysis,
     )
+    try:
+        atom_array = get_structure(
+            cif_file,
+            model=model,
+            use_author_fields=use_author_fields,
+        )
+        atom_count = int(atom_array.array_length())
+        chain_ids = sorted({str(chain_id) for chain_id in atom_array.chain_id.tolist()})
+    except ValueError as exc:
+        if str(exc) != "Array must contain at least one element":
+            raise
+        LOGGER.warning(
+            "Structure summary atom array extraction failed for %s; falling back to chain inventory only",
+            cif_path,
+        )
+        atom_count = 0
+        chain_ids = []
     visible_chain_ids = {
         record.auth_asym_id if use_author_fields else record.label_asym_id
         for record in chain_inventory
         if (record.auth_asym_id if use_author_fields else record.label_asym_id) is not None
     }
-    chain_ids = [chain_id for chain_id in chain_ids if chain_id in visible_chain_ids]
+    if chain_ids:
+        chain_ids = [chain_id for chain_id in chain_ids if chain_id in visible_chain_ids]
+    else:
+        chain_ids = sorted(str(chain_id) for chain_id in visible_chain_ids)
     chain_type_counts: dict[str, int] = {}
     for record in chain_inventory:
         chain_type_counts[record.chain_type] = chain_type_counts.get(record.chain_type, 0) + 1
@@ -1302,7 +1389,7 @@ def read_structure_summary(
         data_block=block_name,
         chain_id_source="auth_asym_id" if use_author_fields else "label_asym_id",
         model=model,
-        atom_count=int(atom_array.array_length()),
+        atom_count=atom_count,
         entity_count=_count_category_rows(cif_file, "entity", "id"),
         chain_ids=chain_ids,
         chain_id_pairs=[

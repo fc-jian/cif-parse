@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import html
 import json
 from pathlib import Path
+
+from cif_parse.export import load_json
 
 
 ANTIBODY_CHAIN_TYPES = frozenset({"antibody heavy chain", "antibody light chain"})
 LOW_CONFIDENCE_ANTIBODY_THRESHOLD = 0.8
 COVERAGE_WARNING_CODES = frozenset(
     {
+        "coverage skipped because atom array extraction failed",
         "coverage skipped because the chain has no coordinates",
         "coverage assigned to multiple main chains",
         "coverage owner not found within the nearest-distance threshold",
@@ -18,7 +22,7 @@ COVERAGE_WARNING_CODES = frozenset(
 
 
 def _read_json(path: Path) -> dict | list:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return load_json(path)
 
 
 def _antibody_analysis(chain: dict[str, object]) -> dict[str, object]:
@@ -338,3 +342,253 @@ def build_review_report(results: list[dict[str, object]]) -> dict[str, object]:
         in result["metrics"].get("tcr_complex_warning_counts", {})
     ]
     return review
+
+
+def _html_json_block(payload: object) -> str:
+    return html.escape(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False))
+
+
+def _html_scalar(value: object) -> str:
+    if isinstance(value, float):
+        return str(round(value, 4))
+    return html.escape(str(value))
+
+
+def _render_metric_table(metrics: dict[str, object]) -> str:
+    rows = []
+    for key, value in metrics.items():
+        if isinstance(value, (dict, list)):
+            rendered_value = f"<pre>{_html_json_block(value)}</pre>"
+        else:
+            rendered_value = _html_scalar(value)
+        rows.append(
+            "<tr>"
+            f"<th>{html.escape(str(key))}</th>"
+            f"<td>{rendered_value}</td>"
+            "</tr>"
+        )
+    return "<table class='metrics-table'><tbody>" + "".join(rows) + "</tbody></table>"
+
+
+def _render_record_details(items: list[dict[str, object]], *, empty_message: str) -> str:
+    if not items:
+        return f"<p class='muted'>{html.escape(empty_message)}</p>"
+    blocks = []
+    for item in items:
+        title = html.escape(str(item.get("case_id", "(unknown case)")))
+        blocks.append(
+            "<details class='record'>"
+            f"<summary>{title}</summary>"
+            f"<pre>{_html_json_block(item)}</pre>"
+            "</details>"
+        )
+    return "".join(blocks)
+
+
+def _render_priority_groups(priority_cases: dict[str, object]) -> str:
+    groups = []
+    for group_name, raw_items in priority_cases.items():
+        items = raw_items if isinstance(raw_items, list) else []
+        groups.append(
+            "<details class='section'>"
+            f"<summary>{html.escape(group_name)} <span class='count'>{len(items)}</span></summary>"
+            f"{_render_record_details(items, empty_message='No flagged cases in this group.')}"
+            "</details>"
+        )
+    return "".join(groups)
+
+
+def build_batch_html_report(
+    *,
+    summary: dict[str, object],
+    review: dict[str, object],
+    manifest: dict[str, object] | None = None,
+    title: str = "cif-parse Batch Summary Report",
+    artifact_paths: dict[str, str] | None = None,
+) -> str:
+    """Build a self-contained HTML summary report with expandable sections."""
+
+    manifest = manifest or {}
+    artifact_paths = artifact_paths or {}
+    status_summary = review.get("status_summary", {})
+    priority_cases = review.get("priority_cases", {})
+    skipped_targets = review.get("skipped_targets", [])
+    failed_targets = review.get("failed_targets", [])
+    manifest_metadata = {
+        "input_count": len(manifest.get("input_paths", [])) if isinstance(manifest.get("input_paths"), list) else 0,
+        "result_count": len(manifest.get("results", [])) if isinstance(manifest.get("results"), list) else 0,
+    }
+    if isinstance(manifest.get("settings"), dict):
+        manifest_metadata["settings"] = manifest["settings"]
+
+    artifact_table = _render_metric_table(artifact_paths) if artifact_paths else "<p class='muted'>No artifact paths.</p>"
+    summary_table = _render_metric_table(summary)
+    status_table = _render_metric_table(status_summary if isinstance(status_summary, dict) else {})
+    manifest_table = _render_metric_table(manifest_metadata)
+    skipped_reason_counts = review.get("skipped_target_counts_by_reason", {})
+    skipped_reason_table = _render_metric_table(
+        skipped_reason_counts if isinstance(skipped_reason_counts, dict) else {}
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f4ef;
+      --panel: #fffdf8;
+      --line: #d8d2c3;
+      --ink: #1e2430;
+      --muted: #667085;
+      --accent: #1f6f78;
+      --accent-soft: #e4f0ef;
+      --code: #f2eee4;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: linear-gradient(180deg, #f6f4ef 0%, #ece7dc 100%);
+      color: var(--ink);
+      font: 14px/1.5 "DejaVu Sans", "Noto Sans", sans-serif;
+    }}
+    main {{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+    }}
+    h1, h2 {{
+      margin: 0 0 12px;
+      line-height: 1.2;
+    }}
+    .hero {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 10px 30px rgba(31, 42, 68, 0.08);
+      margin-bottom: 20px;
+    }}
+    .hero p {{
+      margin: 8px 0 0;
+      color: var(--muted);
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }}
+    .card {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 8px 24px rgba(31, 42, 68, 0.06);
+    }}
+    details.section {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      box-shadow: 0 8px 24px rgba(31, 42, 68, 0.05);
+    }}
+    details.record {{
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+      margin-top: 10px;
+    }}
+    details > summary {{
+      cursor: pointer;
+      font-weight: 700;
+      color: var(--accent);
+    }}
+    .count {{
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+    }}
+    .muted {{
+      color: var(--muted);
+    }}
+    .metrics-table {{
+      width: 100%;
+      border-collapse: collapse;
+    }}
+    .metrics-table th,
+    .metrics-table td {{
+      text-align: left;
+      vertical-align: top;
+      padding: 8px 10px;
+      border-top: 1px solid var(--line);
+    }}
+    .metrics-table th {{
+      width: 38%;
+      color: var(--muted);
+      font-weight: 600;
+    }}
+    pre {{
+      margin: 10px 0 0;
+      padding: 12px;
+      overflow-x: auto;
+      border-radius: 12px;
+      background: var(--code);
+      border: 1px solid var(--line);
+      font: 12px/1.5 "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>{html.escape(title)}</h1>
+      <p>Batch-level human-readable summary. Expand sections below for skipped targets, failures, and priority review groups.</p>
+    </section>
+    <section class="grid">
+      <div class="card">
+        <h2>Artifacts</h2>
+        {artifact_table}
+      </div>
+      <div class="card">
+        <h2>Status</h2>
+        {status_table}
+      </div>
+      <div class="card">
+        <h2>Batch Metadata</h2>
+        {manifest_table}
+      </div>
+      <div class="card">
+        <h2>Summary</h2>
+        {summary_table}
+      </div>
+    </section>
+    <details class="section" open>
+      <summary>Skipped Target Counts By Reason <span class="count">{len(skipped_reason_counts) if isinstance(skipped_reason_counts, dict) else 0}</span></summary>
+      {skipped_reason_table}
+    </details>
+    <details class="section">
+      <summary>Skipped Targets <span class="count">{len(skipped_targets) if isinstance(skipped_targets, list) else 0}</span></summary>
+      {_render_record_details(skipped_targets if isinstance(skipped_targets, list) else [], empty_message="No skipped targets.")}
+    </details>
+    <details class="section">
+      <summary>Failed Targets <span class="count">{len(failed_targets) if isinstance(failed_targets, list) else 0}</span></summary>
+      {_render_record_details(failed_targets if isinstance(failed_targets, list) else [], empty_message="No failed targets.")}
+    </details>
+    <details class="section" open>
+      <summary>Priority Review Groups <span class="count">{len(priority_cases) if isinstance(priority_cases, dict) else 0}</span></summary>
+      {_render_priority_groups(priority_cases if isinstance(priority_cases, dict) else {})}
+    </details>
+  </main>
+</body>
+</html>
+"""

@@ -42,6 +42,10 @@ class DimerInterfaceRecord:
     interface_label: str
     contains_antibody_unit: bool
     contains_tcr_pmhc_unit: bool
+    mean_interface_residue_count: float = 0.0
+    buried_area_per_interface_residue: float = 0.0
+    atom_contacts_per_interface_residue: float = 0.0
+    residue_contacts_per_interface_residue: float = 0.0
     evidence: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -77,6 +81,10 @@ class DimerInterfaceRecord:
             "delta_sasa_1": self.delta_sasa_1,
             "delta_sasa_2": self.delta_sasa_2,
             "buried_area": self.buried_area,
+            "mean_interface_residue_count": self.mean_interface_residue_count,
+            "buried_area_per_interface_residue": self.buried_area_per_interface_residue,
+            "atom_contacts_per_interface_residue": self.atom_contacts_per_interface_residue,
+            "residue_contacts_per_interface_residue": self.residue_contacts_per_interface_residue,
             "is_same_entity": self.is_same_entity,
             "interface_label": self.interface_label,
             "contains_antibody_unit": self.contains_antibody_unit,

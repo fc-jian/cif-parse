@@ -221,6 +221,7 @@ def process_single_structure(
         input_path,
         model=settings.model,
         coverage_mode=settings.coverage_mode,
+        drop_hydrogens_for_analysis=settings.drop_hydrogens_for_analysis,
     )
     validate_processing_inputs(input_path, chain_inventory, settings)
     summary = read_structure_summary(
@@ -228,6 +229,7 @@ def process_single_structure(
         model=settings.model,
         use_author_fields=settings.use_author_fields,
         coverage_mode=settings.coverage_mode,
+        drop_hydrogens_for_analysis=settings.drop_hydrogens_for_analysis,
     )
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
@@ -236,6 +238,7 @@ def process_single_structure(
         chain_inventory,
         model=settings.model,
         assembly_mode=settings.assembly_mode,
+        drop_hydrogens_for_analysis=settings.drop_hydrogens_for_analysis,
     )
     apply_antibody_pairing(chain_inventory, dimer_interfaces)
     LOGGER.debug("Identified %d dimer interfaces for %s", len(dimer_interfaces), summary.pdb_id)

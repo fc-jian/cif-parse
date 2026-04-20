@@ -32,6 +32,7 @@ class AppSettings:
     verbose: bool = False
     model: int = 1
     use_author_fields: bool = False
+    drop_hydrogens_for_analysis: bool = True
     max_polymer_chains: int = 100
     min_polymer_chain_length: int = 20
 
@@ -65,6 +66,7 @@ def default_cli_config() -> dict[str, Any]:
             "verbose": False,
             "model": 1,
             "use_author_fields": False,
+            "drop_hydrogens_for_analysis": True,
             "max_polymer_chains": 100,
             "min_polymer_chain_length": 20,
         },
@@ -125,6 +127,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "verbose",
             "model",
             "use_author_fields",
+            "drop_hydrogens_for_analysis",
             "max_polymer_chains",
             "min_polymer_chain_length",
         },
@@ -142,6 +145,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "verbose": validated_settings.verbose,
         "model": validated_settings.model,
         "use_author_fields": validated_settings.use_author_fields,
+        "drop_hydrogens_for_analysis": validated_settings.drop_hydrogens_for_analysis,
         "max_polymer_chains": validated_settings.max_polymer_chains,
         "min_polymer_chain_length": validated_settings.min_polymer_chain_length,
     }

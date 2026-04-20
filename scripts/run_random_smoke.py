@@ -6,8 +6,14 @@ import random
 import shutil
 from collections import Counter
 from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from cif_parse.cli import main as cli_main
+from cif_parse.export import dump_json
+from cif_parse.reporting import build_batch_html_report
 
 
 PROTEIN_CHAIN_TYPES = frozenset(
@@ -865,19 +871,24 @@ def main() -> int:
     manifest["aggregate"] = aggregate
     manifest["review"] = review
 
-    manifest_path = args.outdir / "manifest.json"
+    manifest_path = dump_json(args.outdir / "manifest.json.gz", manifest)
     summary_path = args.outdir / "summary.json"
-    review_path = args.outdir / "review.json"
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    summary_path.write_text(
-        json.dumps(aggregate, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    review_path.write_text(
-        json.dumps(review, ensure_ascii=False, indent=2) + "\n",
+    review_path = dump_json(args.outdir / "review.json.gz", review)
+    dump_json(summary_path, aggregate)
+    html_report_path = args.outdir / "summary_report.html"
+    html_report_path.write_text(
+        build_batch_html_report(
+            summary=aggregate,
+            review=review,
+            manifest=manifest,
+            title="cif-parse Random Smoke Summary Report",
+            artifact_paths={
+                "manifest_path": str(manifest_path.resolve()),
+                "summary_path": str(summary_path.resolve()),
+                "review_path": str(review_path.resolve()),
+                "html_report_path": str(html_report_path.resolve()),
+            },
+        ),
         encoding="utf-8",
     )
     print(manifest_path)

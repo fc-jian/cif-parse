@@ -57,10 +57,11 @@ The primary output format is JSON. CSV is supported as an optional flattened exp
 
 Typical batch outputs include:
 
-1. `manifest.json`
+1. `manifest.json.gz`
 2. `summary.json`
-3. `review.json`
-4. per-case output directories under `cases/`
+3. `review.json.gz`
+4. `summary_report.html`
+5. per-case output directories under `cases/`
 
 ## Environment
 

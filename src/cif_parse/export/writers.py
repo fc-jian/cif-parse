@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 from pathlib import Path
 from typing import Any
@@ -11,11 +12,39 @@ def dump_json(path: str | Path, payload: Any, *, indent: int = 2) -> Path:
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=indent) + "\n",
-        encoding="utf-8",
-    )
+    text = json.dumps(payload, ensure_ascii=False, indent=indent) + "\n"
+    if output_path.suffix == ".gz":
+        with gzip.open(output_path, "wt", encoding="utf-8") as handle:
+            handle.write(text)
+    else:
+        output_path.write_text(text, encoding="utf-8")
     return output_path
+
+
+def load_json(path: str | Path) -> Any:
+    """Read one JSON document from `.json` or `.json.gz`."""
+
+    input_path = resolve_json_path(path)
+    if input_path.suffix == ".gz":
+        with gzip.open(input_path, "rt", encoding="utf-8") as handle:
+            return json.load(handle)
+    return json.loads(input_path.read_text(encoding="utf-8"))
+
+
+def resolve_json_path(path: str | Path) -> Path:
+    """Resolve a JSON artifact path, allowing `.json` / `.json.gz` fallback."""
+
+    input_path = Path(path)
+    candidates = [input_path]
+    if input_path.suffix == ".json":
+        candidates.append(input_path.with_name(f"{input_path.name}.gz"))
+    elif input_path.suffix == ".gz":
+        candidates.append(input_path.with_suffix(""))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"JSON artifact not found: {input_path}")
 
 
 def dump_csv_rows(path: str | Path, rows: list[dict[str, Any]]) -> Path:

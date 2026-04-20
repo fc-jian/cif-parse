@@ -121,6 +121,7 @@ def identify_dimer_interfaces(
     *,
     model: int = 1,
     assembly_mode: str = "biological_assembly",
+    drop_hydrogens_for_analysis: bool = True,
 ) -> list[DimerInterfaceRecord]:
     cif_path = Path(path)
     cif_file = read_cif_file(cif_path)
@@ -131,36 +132,51 @@ def identify_dimer_interfaces(
     chain_map = {chain.label_asym_id: chain for chain in polymer_chains}
     dimers: list[DimerInterfaceRecord] = []
     if assembly_mode == "biological_assembly" and assembly_ids:
-        atom_array_inputs = [
-            (
-                assembly_id,
-                get_assembly(
+        atom_array_inputs = []
+        for assembly_id in assembly_ids:
+            try:
+                atom_array = get_assembly(
                     cif_file,
                     assembly_id=assembly_id,
                     model=model,
                     use_author_fields=False,
-                ),
-            )
-            for assembly_id in assembly_ids
-        ]
+                )
+            except ValueError as exc:
+                if str(exc) != "Array must contain at least one element":
+                    raise
+                continue
+            atom_array_inputs.append((assembly_id, atom_array))
     else:
-        atom_array_inputs = [
-            (
-                None,
-                get_structure(
-                    cif_file,
-                    model=model,
-                    use_author_fields=False,
-                ),
-            )
-        ]
+        try:
+            atom_array_inputs = [
+                (
+                    None,
+                    get_structure(
+                        cif_file,
+                        model=model,
+                        use_author_fields=False,
+                    ),
+                )
+            ]
+        except ValueError as exc:
+            if str(exc) != "Array must contain at least one element":
+                raise
+            return []
 
     use_assembly_prefix = assembly_mode == "biological_assembly" and len(atom_array_inputs) > 1
     for assembly_id, atom_array in atom_array_inputs:
         if assembly_mode == "biological_assembly" and hasattr(atom_array, "sym_id"):
-            geometries = build_instance_geometries(atom_array, polymer_chains)
+            geometries = build_instance_geometries(
+                atom_array,
+                polymer_chains,
+                drop_hydrogens_for_analysis=drop_hydrogens_for_analysis,
+            )
         else:
-            geometries = build_chain_geometries(atom_array, polymer_chains)
+            geometries = build_chain_geometries(
+                atom_array,
+                polymer_chains,
+                drop_hydrogens_for_analysis=drop_hydrogens_for_analysis,
+            )
 
         ordered_instance_ids = sorted(geometries)
         for index, instance_id_1 in enumerate(ordered_instance_ids):
@@ -192,6 +208,29 @@ def identify_dimer_interfaces(
                 is_same_entity = chain_1.entity_id == chain_2.entity_id
                 interface_residue_count_1 = int(metrics["interface_residue_count_1"])
                 interface_residue_count_2 = int(metrics["interface_residue_count_2"])
+                dimer_warnings = list(metrics.get("area_warnings", []))
+                dimer_warning_details = metrics.get("area_warning_details", {})
+                dimer_evidence = {
+                    "stage": "dimer_interface_v1",
+                    "metric": "representative_residue_contacts_plus_atom_contacts",
+                    "residue_contact_cutoff": 8.0,
+                    "atom_contact_cutoff": 5.0,
+                    "min_residue_contacts": 3,
+                    "min_atom_contacts": 20,
+                    "interface_area_metric": "buried_area_from_delta_sasa",
+                    "interface_area_method": str(
+                        metrics.get("area_evidence", {}).get("interface_area_method", "ProtOr")
+                    ),
+                    "instance_granularity": "chain_id_plus_sym_id"
+                    if assembly_mode == "biological_assembly"
+                    else "label_asym_id",
+                    "bbox_distance": round(float(metrics["bbox_distance"]), 4),
+                }
+                area_evidence = metrics.get("area_evidence", {})
+                if isinstance(area_evidence, dict):
+                    dimer_evidence.update(area_evidence)
+                if isinstance(dimer_warning_details, dict) and dimer_warning_details:
+                    dimer_evidence["warning_details"] = dimer_warning_details
                 dimers.append(
                     DimerInterfaceRecord(
                         pdb_id=chain_1.pdb_id,
@@ -221,6 +260,19 @@ def identify_dimer_interfaces(
                         delta_sasa_1=round(float(metrics["delta_sasa_1"]), 4),
                         delta_sasa_2=round(float(metrics["delta_sasa_2"]), 4),
                         buried_area=round(float(metrics["buried_area"]), 4),
+                        mean_interface_residue_count=round(float(metrics["mean_interface_residue_count"]), 4),
+                        buried_area_per_interface_residue=round(
+                            float(metrics["buried_area_per_interface_residue"]),
+                            4,
+                        ),
+                        atom_contacts_per_interface_residue=round(
+                            float(metrics["atom_contacts_per_interface_residue"]),
+                            4,
+                        ),
+                        residue_contacts_per_interface_residue=round(
+                            float(metrics["residue_contacts_per_interface_residue"]),
+                            4,
+                        ),
                         is_same_entity=is_same_entity,
                         interface_label=_interface_label(
                             chain_1.chain_type,
@@ -235,19 +287,8 @@ def identify_dimer_interfaces(
                             chain_1.chain_type,
                             chain_2.chain_type,
                         ),
-                        evidence={
-                            "stage": "dimer_interface_v1",
-                            "metric": "representative_residue_contacts_plus_atom_contacts",
-                            "residue_contact_cutoff": 8.0,
-                            "atom_contact_cutoff": 5.0,
-                            "min_residue_contacts": 3,
-                            "min_atom_contacts": 20,
-                            "interface_area_metric": "buried_area_from_delta_sasa",
-                            "instance_granularity": "chain_id_plus_sym_id"
-                            if assembly_mode == "biological_assembly"
-                            else "label_asym_id",
-                            "bbox_distance": round(float(metrics["bbox_distance"]), 4),
-                        },
+                        evidence=dimer_evidence,
+                        warnings=dimer_warnings,
                     )
                 )
 

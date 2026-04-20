@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from cif_parse.cli import main as cli_main
+from cif_parse.export import load_json
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,7 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    payload = load_json(path)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected JSON object in {path}")
+    return payload
 
 
 def _priority_case_counts(review: dict[str, Any]) -> dict[str, int]:
@@ -90,10 +94,17 @@ def _run_mode(
     )
 
     summary_path = mode_outdir / "summary.json"
-    review_path = mode_outdir / "review.json"
-    manifest_path = mode_outdir / "manifest.json"
-    summary = _read_json(summary_path) if summary_path.exists() else {}
-    review = _read_json(review_path) if review_path.exists() else {}
+    review_path = mode_outdir / "review.json.gz"
+    manifest_path = mode_outdir / "manifest.json.gz"
+    html_report_path = mode_outdir / "summary_report.html"
+    try:
+        summary = _read_json(summary_path)
+    except FileNotFoundError:
+        summary = {}
+    try:
+        review = _read_json(review_path)
+    except FileNotFoundError:
+        review = {}
     return {
         "assembly_mode": assembly_mode,
         "exit_code": exit_code,
@@ -101,6 +112,7 @@ def _run_mode(
         "manifest_path": str(manifest_path.resolve()),
         "summary_path": str(summary_path.resolve()),
         "review_path": str(review_path.resolve()),
+        "html_report_path": str(html_report_path.resolve()),
         "summary": summary,
         "review_priority_case_counts": _priority_case_counts(review),
     }

@@ -14,7 +14,11 @@ from typing import Any
 from cif_parse.export import dump_json
 from cif_parse.io import read_structure_summary
 from cif_parse.pipeline import StructureSkipWarning, infer_case_id, process_single_structure
-from cif_parse.reporting import build_review_report, collect_case_review_metrics
+from cif_parse.reporting import (
+    build_batch_html_report,
+    build_review_report,
+    collect_case_review_metrics,
+)
 from cif_parse.settings import (
     AppSettings,
     DEFAULT_BATCH_OUTDIR,
@@ -121,6 +125,12 @@ def _add_read_options(parser: argparse.ArgumentParser, *, settings_defaults: dic
         default=bool(settings_defaults.get("use_author_fields", False)),
         help="Use auth_asym_id/auth_seq_id fields when reading structure arrays",
     )
+    parser.add_argument(
+        "--drop-hydrogens-for-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=bool(settings_defaults.get("drop_hydrogens_for_analysis", True)),
+        help="Use heavy-atom-only arrays for downstream coverage/interface analysis",
+    )
 
 
 def _add_runtime_args(
@@ -192,6 +202,7 @@ def _settings_from_args(args: argparse.Namespace) -> AppSettings:
         verbose=args.verbose,
         model=args.model,
         use_author_fields=args.author_fields,
+        drop_hydrogens_for_analysis=args.drop_hydrogens_for_analysis,
         max_polymer_chains=args.max_polymer_chains,
         min_polymer_chain_length=args.min_polymer_chain_length,
     )
@@ -352,6 +363,7 @@ def _print_single_result(settings: AppSettings, outdir: Path, result: dict[str, 
                         "min_polymer_chain_length": settings.min_polymer_chain_length,
                         "model": settings.model,
                         "use_author_fields": settings.use_author_fields,
+                        "drop_hydrogens_for_analysis": settings.drop_hydrogens_for_analysis,
                     },
                     **result,
                 },
@@ -369,6 +381,7 @@ def _print_batch_result(
     manifest_path: Path,
     summary_path: Path,
     review_path: Path,
+    html_report_path: Path,
     summary: dict[str, Any],
 ) -> None:
     """Print the batch-run CLI response."""
@@ -386,10 +399,12 @@ def _print_batch_result(
                         "min_polymer_chain_length": settings.min_polymer_chain_length,
                         "model": settings.model,
                         "use_author_fields": settings.use_author_fields,
+                        "drop_hydrogens_for_analysis": settings.drop_hydrogens_for_analysis,
                     },
                     "manifest_path": str(manifest_path),
                     "summary_path": str(summary_path),
                     "review_path": str(review_path),
+                    "html_report_path": str(html_report_path),
                     **summary,
                 },
                 ensure_ascii=False,
@@ -422,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             use_author_fields=args.author_fields,
             coverage_mode="nearest",
+            drop_hydrogens_for_analysis=args.drop_hydrogens_for_analysis,
         )
         print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2))
         return 0
@@ -468,6 +484,7 @@ def main(argv: list[str] | None = None) -> int:
         "verbose": settings.verbose,
         "model": settings.model,
         "use_author_fields": settings.use_author_fields,
+        "drop_hydrogens_for_analysis": settings.drop_hydrogens_for_analysis,
         "max_polymer_chains": settings.max_polymer_chains,
         "min_polymer_chain_length": settings.min_polymer_chain_length,
     }
@@ -512,15 +529,38 @@ def main(argv: list[str] | None = None) -> int:
         "input_paths": [str(path) for path in input_paths],
         "results": results,
     }
-    manifest_path = dump_json(args.outdir / "manifest.json", manifest)
+    manifest_path = dump_json(args.outdir / "manifest.json.gz", manifest)
     summary_path = dump_json(args.outdir / "summary.json", summary)
-    review_path = dump_json(args.outdir / "review.json", review)
+    review_path = dump_json(args.outdir / "review.json.gz", review)
+    html_report_path = args.outdir / "summary_report.html"
+    html_report_path.write_text(
+        build_batch_html_report(
+            summary=summary,
+            review=review,
+            manifest=manifest,
+            artifact_paths={
+                "manifest_path": str(manifest_path),
+                "summary_path": str(summary_path),
+                "review_path": str(review_path),
+                "html_report_path": str(html_report_path.resolve()),
+            },
+        ),
+        encoding="utf-8",
+    )
     LOGGER.info(
         "Finished batch: %d success, %d failure",
         summary["success_count"],
         summary["failure_count"],
     )
-    _print_batch_result(settings, args.outdir, manifest_path, summary_path, review_path, summary)
+    _print_batch_result(
+        settings,
+        args.outdir,
+        manifest_path,
+        summary_path,
+        review_path,
+        html_report_path,
+        summary,
+    )
     return 0 if summary["failure_count"] == 0 else 1
 
 
