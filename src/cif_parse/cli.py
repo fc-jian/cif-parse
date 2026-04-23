@@ -216,6 +216,54 @@ def _add_runtime_args(
         help="Add a large-component warning when a tight multimer reaches this many instance nodes",
     )
     parser.add_argument(
+        "--residue-contact-cutoff",
+        type=float,
+        default=float(settings_defaults.get("residue_contact_cutoff", 8.0)),
+        help="Distance cutoff (Å) for residue-level contact detection",
+    )
+    parser.add_argument(
+        "--atom-contact-cutoff",
+        type=float,
+        default=float(settings_defaults.get("atom_contact_cutoff", 5.0)),
+        help="Distance cutoff (Å) for atom-level contact detection",
+    )
+    parser.add_argument(
+        "--min-residue-contacts",
+        type=int,
+        default=int(settings_defaults.get("min_residue_contacts", 3)),
+        help="Minimum residue-residue contacts required to keep a dimer interface",
+    )
+    parser.add_argument(
+        "--min-atom-contacts",
+        type=int,
+        default=int(settings_defaults.get("min_atom_contacts", 20)),
+        help="Minimum atom-atom contacts required to keep a dimer interface",
+    )
+    parser.add_argument(
+        "--peptide-max-length",
+        type=int,
+        default=int(settings_defaults.get("peptide_max_length", 30)),
+        help="Maximum peptide chain length for TCR-pMHC complex assembly",
+    )
+    parser.add_argument(
+        "--sadie-domain-bitscore-threshold",
+        type=float,
+        default=float(settings_defaults.get("sadie_domain_bitscore_threshold", 80.0)),
+        help="Minimum HMMER bitscore for a Sadie variable-domain hit",
+    )
+    parser.add_argument(
+        "--sadie-domain-limit",
+        type=int,
+        default=int(settings_defaults.get("sadie_domain_limit", 4)),
+        help="Maximum number of Sadie variable domains to retain per chain",
+    )
+    parser.add_argument(
+        "--low-confidence-antibody-threshold",
+        type=float,
+        default=float(settings_defaults.get("low_confidence_antibody_threshold", 0.8)),
+        help="Confidence threshold below which an antibody annotation is flagged as low confidence",
+    )
+    parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
         default=bool(settings_defaults.get("verbose", False)),
@@ -242,6 +290,14 @@ def _settings_from_args(args: argparse.Namespace) -> AppSettings:
         tight_multimer_louvain_resolution=args.tight_multimer_louvain_resolution,
         tight_multimer_min_member_instances=args.tight_multimer_min_member_instances,
         tight_multimer_large_component_warning_size=args.tight_multimer_large_component_warning_size,
+        residue_contact_cutoff=args.residue_contact_cutoff,
+        atom_contact_cutoff=args.atom_contact_cutoff,
+        min_residue_contacts=args.min_residue_contacts,
+        min_atom_contacts=args.min_atom_contacts,
+        peptide_max_length=args.peptide_max_length,
+        sadie_domain_bitscore_threshold=args.sadie_domain_bitscore_threshold,
+        sadie_domain_limit=args.sadie_domain_limit,
+        low_confidence_antibody_threshold=args.low_confidence_antibody_threshold,
     )
 
 
@@ -406,6 +462,14 @@ def _print_single_result(settings: AppSettings, outdir: Path, result: dict[str, 
                         "tight_multimer_louvain_resolution": settings.tight_multimer_louvain_resolution,
                         "tight_multimer_min_member_instances": settings.tight_multimer_min_member_instances,
                         "tight_multimer_large_component_warning_size": settings.tight_multimer_large_component_warning_size,
+                        "residue_contact_cutoff": settings.residue_contact_cutoff,
+                        "atom_contact_cutoff": settings.atom_contact_cutoff,
+                        "min_residue_contacts": settings.min_residue_contacts,
+                        "min_atom_contacts": settings.min_atom_contacts,
+                        "peptide_max_length": settings.peptide_max_length,
+                        "sadie_domain_bitscore_threshold": settings.sadie_domain_bitscore_threshold,
+                        "sadie_domain_limit": settings.sadie_domain_limit,
+                        "low_confidence_antibody_threshold": settings.low_confidence_antibody_threshold,
                     },
                     **result,
                 },
@@ -447,6 +511,14 @@ def _print_batch_result(
                         "tight_multimer_louvain_resolution": settings.tight_multimer_louvain_resolution,
                         "tight_multimer_min_member_instances": settings.tight_multimer_min_member_instances,
                         "tight_multimer_large_component_warning_size": settings.tight_multimer_large_component_warning_size,
+                        "residue_contact_cutoff": settings.residue_contact_cutoff,
+                        "atom_contact_cutoff": settings.atom_contact_cutoff,
+                        "min_residue_contacts": settings.min_residue_contacts,
+                        "min_atom_contacts": settings.min_atom_contacts,
+                        "peptide_max_length": settings.peptide_max_length,
+                        "sadie_domain_bitscore_threshold": settings.sadie_domain_bitscore_threshold,
+                        "sadie_domain_limit": settings.sadie_domain_limit,
+                        "low_confidence_antibody_threshold": settings.low_confidence_antibody_threshold,
                     },
                     "manifest_path": str(manifest_path),
                     "summary_path": str(summary_path),
@@ -539,6 +611,14 @@ def main(argv: list[str] | None = None) -> int:
         "tight_multimer_louvain_resolution": settings.tight_multimer_louvain_resolution,
         "tight_multimer_min_member_instances": settings.tight_multimer_min_member_instances,
         "tight_multimer_large_component_warning_size": settings.tight_multimer_large_component_warning_size,
+        "residue_contact_cutoff": settings.residue_contact_cutoff,
+        "atom_contact_cutoff": settings.atom_contact_cutoff,
+        "min_residue_contacts": settings.min_residue_contacts,
+        "min_atom_contacts": settings.min_atom_contacts,
+        "peptide_max_length": settings.peptide_max_length,
+        "sadie_domain_bitscore_threshold": settings.sadie_domain_bitscore_threshold,
+        "sadie_domain_limit": settings.sadie_domain_limit,
+        "low_confidence_antibody_threshold": settings.low_confidence_antibody_threshold,
     }
     tasks = [
         {
@@ -573,7 +653,10 @@ def main(argv: list[str] | None = None) -> int:
     for result in results:
         review_result = dict(result)
         if result.get("status") == "ok":
-            review_result["metrics"] = collect_case_review_metrics(result["output_dir"])
+            review_result["metrics"] = collect_case_review_metrics(
+                result["output_dir"],
+                low_confidence_antibody_threshold=settings.low_confidence_antibody_threshold,
+            )
         review_results.append(review_result)
     review = build_review_report(review_results)
     manifest = {

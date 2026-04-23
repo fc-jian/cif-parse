@@ -13,30 +13,17 @@ from sadie.numbering import Numbering
 from sadie.renumbering.aligners.hmmer import HMMER
 from sadie.renumbering.numbering_translator import NumberingTranslator
 
-
-SCFV_LINKER_MOTIFS = ("GGGGS", "GGGGSGGGGS", "GGGSGGGG", "SSGGGGSGGGG")
-ANTIBODY_DESCRIPTION_MARKERS = ("antibody", "immunoglobulin", "fab", "fv", "nanobody", "vhh")
-TCR_DESCRIPTION_MARKERS = ("t cell receptor", "t-cell receptor", "tcr")
-CAMELID_SPECIES = frozenset({"alpaca", "llama", "camel", "camelid"})
-SADIE_CHAIN_CODES = ("H", "K", "L", "A", "B", "G", "D")
-SADIE_SCHEME = "imgt"
-SADIE_REGION_DEFINITION = "imgt"
-SADIE_DOMAIN_BITSCORE_THRESHOLD = 80.0
-SADIE_DOMAIN_LIMIT = 4
-IMGT_CDR_RANGES = {
-    "cdr1": (27, 38),
-    "cdr2": (56, 65),
-    "cdr3": (105, 117),
-}
-CHAIN_CODE_DESCRIPTION_HINTS = {
-    "H": ("heavy chain",),
-    "K": ("kappa",),
-    "L": ("lambda",),
-    "A": ("alpha",),
-    "B": ("beta",),
-    "G": ("gamma",),
-    "D": ("delta",),
-}
+from cif_parse.constants import (
+    ANTIBODY_DESCRIPTION_MARKERS,
+    CAMELID_SPECIES,
+    CHAIN_CODE_DESCRIPTION_HINTS,
+    IMGT_CDR_RANGES,
+    SADIE_CHAIN_CODES,
+    SADIE_REGION_DEFINITION,
+    SADIE_SCHEME,
+    SCFV_LINKER_MOTIFS,
+    TCR_DESCRIPTION_MARKERS,
+)
 
 
 @dataclass(slots=True)
@@ -161,14 +148,14 @@ def _sadie_chain_type(chain_code: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _annotation_confidence(bitscore: float) -> float:
+def _annotation_confidence(bitscore: float, domain_bitscore_threshold: float = 80.0) -> float:
     if bitscore >= 170.0:
         return 0.98
     if bitscore >= 140.0:
         return 0.95
     if bitscore >= 110.0:
         return 0.9
-    if bitscore >= SADIE_DOMAIN_BITSCORE_THRESHOLD:
+    if bitscore >= domain_bitscore_threshold:
         return 0.82
     return 0.7
 
@@ -186,7 +173,11 @@ def _offline_sadie_runtime() -> tuple[HMMER, Numbering]:
     return hmmer, numbering
 
 
-def _collect_candidate_hits(sequence: str) -> list[dict[str, Any]]:
+def _collect_candidate_hits(
+    sequence: str,
+    *,
+    domain_bitscore_threshold: float = 80.0,
+) -> list[dict[str, Any]]:
     hmmer, _ = _offline_sadie_runtime()
     seqrecord = SeqRecord(Seq(sequence), id="query")
     sequences = hmmer.transform_seqs([seqrecord])
@@ -198,7 +189,7 @@ def _collect_candidate_hits(sequence: str) -> list[dict[str, Any]]:
     for top_hits in pyhmmer.hmmsearch(hmmer.hmms, sequences, cpus=1):
         for hit in top_hits:
             domain = hit.best_domain
-            if domain.score < SADIE_DOMAIN_BITSCORE_THRESHOLD:
+            if domain.score < domain_bitscore_threshold:
                 continue
             alignment = domain.alignment
             hmm_name = _decode_name(alignment.hmm_name)
@@ -233,6 +224,8 @@ def _collect_candidate_hits(sequence: str) -> list[dict[str, Any]]:
 def _select_variable_domains(
     candidate_hits: list[dict[str, Any]],
     description_lower: str,
+    *,
+    domain_limit: int = 4,
 ) -> list[dict[str, Any]]:
     preferred_codes = _preferred_chain_codes(description_lower)
     clusters: list[list[dict[str, Any]]] = []
@@ -271,7 +264,7 @@ def _select_variable_domains(
                 choice = candidate
                 break
         selected.append(choice)
-        if len(selected) >= SADIE_DOMAIN_LIMIT:
+        if len(selected) >= domain_limit:
             break
     return sorted(selected, key=lambda item: (int(item["query_start"]), -float(item["bitscore"])))
 
@@ -414,7 +407,7 @@ def analyze_immune_sequence(
         annotation.sequence_hits.append(f"sadie_error:{exc.__class__.__name__}")
         return annotation
 
-    selected_hits = _select_variable_domains(candidate_hits, description_lower)
+    selected_hits = _select_variable_domains(candidate_hits, description_lower, domain_limit=4)
     annotation.sequence_hits.extend(
         [
             f"sadie_domain:{hit['chain_type']}:{int(hit['query_start']) + 1}-{int(hit['query_end'])}"

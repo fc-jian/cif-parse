@@ -41,6 +41,18 @@ class AppSettings:
     tight_multimer_min_member_instances: int = 2
     tight_multimer_large_component_warning_size: int = 8
 
+    # Contact / interface geometry
+    residue_contact_cutoff: float = 8.0
+    atom_contact_cutoff: float = 5.0
+    min_residue_contacts: int = 3
+    min_atom_contacts: int = 20
+
+    # Immune annotation thresholds
+    peptide_max_length: int = 30
+    sadie_domain_bitscore_threshold: float = 80.0
+    sadie_domain_limit: int = 4
+    low_confidence_antibody_threshold: float = 0.8
+
     def __post_init__(self) -> None:
         if self.output_format not in SUPPORTED_FORMATS:
             raise ValueError(f"Unsupported output format: {self.output_format}")
@@ -65,6 +77,22 @@ class AppSettings:
             raise ValueError("tight_multimer_min_member_instances must be >= 2")
         if self.tight_multimer_large_component_warning_size < 2:
             raise ValueError("tight_multimer_large_component_warning_size must be >= 2")
+        if self.residue_contact_cutoff <= 0:
+            raise ValueError("residue_contact_cutoff must be > 0")
+        if self.atom_contact_cutoff <= 0:
+            raise ValueError("atom_contact_cutoff must be > 0")
+        if self.min_residue_contacts < 0:
+            raise ValueError("min_residue_contacts must be >= 0")
+        if self.min_atom_contacts < 0:
+            raise ValueError("min_atom_contacts must be >= 0")
+        if self.peptide_max_length < 1:
+            raise ValueError("peptide_max_length must be >= 1")
+        if self.sadie_domain_bitscore_threshold < 0:
+            raise ValueError("sadie_domain_bitscore_threshold must be >= 0")
+        if self.sadie_domain_limit < 1:
+            raise ValueError("sadie_domain_limit must be >= 1")
+        if self.low_confidence_antibody_threshold < 0 or self.low_confidence_antibody_threshold > 1:
+            raise ValueError("low_confidence_antibody_threshold must be in [0, 1]")
 
 
 def default_cli_config() -> dict[str, Any]:
@@ -87,6 +115,14 @@ def default_cli_config() -> dict[str, Any]:
             "tight_multimer_louvain_resolution": 1.0,
             "tight_multimer_min_member_instances": 2,
             "tight_multimer_large_component_warning_size": 8,
+            "residue_contact_cutoff": 8.0,
+            "atom_contact_cutoff": 5.0,
+            "min_residue_contacts": 3,
+            "min_atom_contacts": 20,
+            "peptide_max_length": 30,
+            "sadie_domain_bitscore_threshold": 80.0,
+            "sadie_domain_limit": 4,
+            "low_confidence_antibody_threshold": 0.8,
         },
         "single": {
             "outdir": DEFAULT_SINGLE_OUTDIR,
@@ -153,6 +189,14 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "tight_multimer_louvain_resolution",
             "tight_multimer_min_member_instances",
             "tight_multimer_large_component_warning_size",
+            "residue_contact_cutoff",
+            "atom_contact_cutoff",
+            "min_residue_contacts",
+            "min_atom_contacts",
+            "peptide_max_length",
+            "sadie_domain_bitscore_threshold",
+            "sadie_domain_limit",
+            "low_confidence_antibody_threshold",
         },
         "settings",
     )
@@ -176,6 +220,14 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "tight_multimer_louvain_resolution": validated_settings.tight_multimer_louvain_resolution,
         "tight_multimer_min_member_instances": validated_settings.tight_multimer_min_member_instances,
         "tight_multimer_large_component_warning_size": validated_settings.tight_multimer_large_component_warning_size,
+        "residue_contact_cutoff": validated_settings.residue_contact_cutoff,
+        "atom_contact_cutoff": validated_settings.atom_contact_cutoff,
+        "min_residue_contacts": validated_settings.min_residue_contacts,
+        "min_atom_contacts": validated_settings.min_atom_contacts,
+        "peptide_max_length": validated_settings.peptide_max_length,
+        "sadie_domain_bitscore_threshold": validated_settings.sadie_domain_bitscore_threshold,
+        "sadie_domain_limit": validated_settings.sadie_domain_limit,
+        "low_confidence_antibody_threshold": validated_settings.low_confidence_antibody_threshold,
     }
     config["single"]["outdir"] = Path(config["single"]["outdir"])
     config["batch"]["outdir"] = Path(config["batch"]["outdir"])

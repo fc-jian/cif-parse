@@ -13,36 +13,13 @@ import numpy as np
 from biotite.structure.io.pdbx import CIFFile, get_structure, list_assemblies
 
 from cif_parse.annotate import analyze_antibody_sequence, analyze_immune_sequence
+from cif_parse.constants import (
+    STANDARD_AMINO_ACIDS,
+    STANDARD_DNA_NUCLEOTIDES,
+    STANDARD_RNA_NUCLEOTIDES,
+)
 from cif_parse.models import ChainRecord, StructureSummary
 from cif_parse.utils import filter_atom_array_for_analysis
-
-
-STANDARD_AMINO_ACIDS = frozenset(
-    {
-        "ALA",
-        "ARG",
-        "ASN",
-        "ASP",
-        "CYS",
-        "GLN",
-        "GLU",
-        "GLY",
-        "HIS",
-        "ILE",
-        "LEU",
-        "LYS",
-        "MET",
-        "PHE",
-        "PRO",
-        "SER",
-        "THR",
-        "TRP",
-        "TYR",
-        "VAL",
-    }
-)
-STANDARD_RNA_NUCLEOTIDES = frozenset({"A", "C", "G", "U", "I"})
-STANDARD_DNA_NUCLEOTIDES = frozenset({"DA", "DC", "DG", "DT", "DI", "DU"})
 
 LOGGER = logging.getLogger(__name__)
 

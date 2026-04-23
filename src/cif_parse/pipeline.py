@@ -21,26 +21,17 @@ from cif_parse.io import (
     read_structure_summary,
     read_structure_preflight,
 )
+from cif_parse.constants import (
+    BRANCHED_CHAIN_TYPES,
+    METAL_CHAIN_TYPES,
+    NUCLEIC_ACID_CHAIN_TYPES,
+    PROTEIN_CHAIN_TYPES,
+    SMALL_MOLECULE_CHAIN_TYPES,
+)
 from cif_parse.settings import AppSettings
 
 
 LOGGER = logging.getLogger(__name__)
-
-PROTEIN_CHAIN_TYPES = frozenset(
-    {
-        "antibody heavy chain",
-        "antibody light chain",
-        "TCR chain",
-        "MHC heavy chain",
-        "beta2m or auxiliary immune chain",
-        "peptide antigen",
-        "other protein chain",
-    }
-)
-NUCLEIC_ACID_CHAIN_TYPES = frozenset({"DNA chain", "RNA chain", "other nucleic acid chain"})
-BRANCHED_CHAIN_TYPES = frozenset({"glycan / branched component"})
-METAL_CHAIN_TYPES = frozenset({"metal ion"})
-SMALL_MOLECULE_CHAIN_TYPES = frozenset({"small molecule compound"})
 
 
 class StructureSkipWarning(RuntimeError):
@@ -240,6 +231,10 @@ def process_single_structure(
         model=settings.model,
         assembly_mode=settings.assembly_mode,
         drop_hydrogens_for_analysis=settings.drop_hydrogens_for_analysis,
+        residue_contact_cutoff=settings.residue_contact_cutoff,
+        atom_contact_cutoff=settings.atom_contact_cutoff,
+        min_residue_contacts=settings.min_residue_contacts,
+        min_atom_contacts=settings.min_atom_contacts,
     )
     apply_antibody_pairing(chain_inventory, dimer_interfaces)
     LOGGER.debug("Identified %d dimer interfaces for %s", len(dimer_interfaces), summary.pdb_id)
@@ -267,6 +262,7 @@ def process_single_structure(
         chain_inventory,
         dimer_interfaces,
         tight_multimers,
+        peptide_max_length=settings.peptide_max_length,
     )
     output_paths = write_single_outputs(
         outdir,

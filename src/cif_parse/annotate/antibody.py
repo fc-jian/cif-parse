@@ -3,35 +3,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from cif_parse.constants import (
+    ANTIBODY_DESCRIPTION_MARKERS,
+    HEAVY_J_MOTIFS,
+    HEAVY_PREFIX_MOTIFS,
+    LIGHT_J_MOTIFS,
+    LIGHT_PREFIX_MOTIFS,
+    SCFV_LINKER_MOTIFS,
+)
+
 from .immune import analyze_immune_sequence
-
-
-HEAVY_PREFIX_MOTIFS = (
-    "QVQL",
-    "EVQL",
-    "DVQL",
-    "DIQV",
-    "QVQLV",
-    "EVQLV",
-    "GLVQ",
-    "QVQ",
-    "EVQ",
-)
-LIGHT_PREFIX_MOTIFS = (
-    "DIQ",
-    "DIV",
-    "DVV",
-    "EIV",
-    "QSV",
-    "QIV",
-    "ELV",
-    "AIQ",
-    "TVL",
-)
-HEAVY_J_MOTIFS = ("WGQG", "WGPG", "WGRG", "WGGG", "WSQG", "WGKG")
-LIGHT_J_MOTIFS = ("FGQG", "FGSG", "LGQG", "SGSG", "QGTK", "FGGG")
-SCFV_LINKER_MOTIFS = ("GGGGS", "GGGGSGGGGS", "GGGSGGGG", "SSGGGGSGGGG")
-ANTIBODY_DESCRIPTION_MARKERS = ("antibody", "immunoglobulin", "fab", "fv", "nanobody", "vhh")
 
 
 @dataclass(slots=True)

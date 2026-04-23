@@ -3,10 +3,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from cif_parse.constants import ANTIBODY_CHAIN_TYPES
 from cif_parse.models import AntibodyAntigenComplexRecord
-
-
-ANTIBODY_CHAIN_TYPES = frozenset({"antibody heavy chain", "antibody light chain"})
 
 
 def _antibody_unit_type(chain: Any) -> str:

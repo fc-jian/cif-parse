@@ -4,18 +4,8 @@ from collections import defaultdict
 
 import networkx as nx
 
+from cif_parse.constants import ANTIBODY_CHAIN_TYPES, TCR_PMHC_CHAIN_TYPES
 from cif_parse.models import TightMultimerRecord
-
-
-ANTIBODY_CHAIN_TYPES = frozenset({"antibody heavy chain", "antibody light chain"})
-TCR_PMHC_CHAIN_TYPES = frozenset(
-    {
-        "TCR chain",
-        "MHC heavy chain",
-        "beta2m or auxiliary immune chain",
-        "peptide antigen",
-    }
-)
 
 
 def _multimer_type(member_entity_ids: list[str], num_member_instances: int) -> str:

@@ -6,40 +6,11 @@ from typing import Any
 import numpy as np
 from biotite.structure import AtomArray, sasa
 
+from cif_parse.constants import (
+    ATOM_CHUNK_SIZE,
+    GENERIC_VDW_RADII,
+)
 from cif_parse.utils import filter_atom_array_for_analysis, normalize_element_symbol
-
-
-RESIDUE_CONTACT_CUTOFF = 8.0
-ATOM_CONTACT_CUTOFF = 5.0
-MIN_RESIDUE_CONTACTS = 3
-MIN_ATOM_CONTACTS = 20
-ATOM_CHUNK_SIZE = 256
-GENERIC_VDW_RADII = {
-    "B": 1.92,
-    "C": 1.70,
-    "N": 1.55,
-    "O": 1.52,
-    "F": 1.47,
-    "P": 1.80,
-    "S": 1.80,
-    "SE": 1.90,
-    "CL": 1.75,
-    "BR": 1.85,
-    "I": 1.98,
-    "SI": 2.10,
-    "NA": 2.27,
-    "MG": 1.73,
-    "K": 2.75,
-    "CA": 2.31,
-    "MN": 1.97,
-    "FE": 1.94,
-    "CO": 1.92,
-    "NI": 1.63,
-    "CU": 1.40,
-    "ZN": 1.39,
-    "CD": 1.58,
-    "HG": 1.55,
-}
 
 
 @dataclass(slots=True)
@@ -474,32 +445,40 @@ def _interface_area_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeometry
     }
 
 
-def compute_interface_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeometry) -> dict[str, Any] | None:
+def compute_interface_metrics(
+    geometry_1: ChainGeometry,
+    geometry_2: ChainGeometry,
+    *,
+    residue_contact_cutoff: float = 8.0,
+    atom_contact_cutoff: float = 5.0,
+    min_residue_contacts: int = 3,
+    min_atom_contacts: int = 20,
+) -> dict[str, Any] | None:
     bbox_distance = _bbox_distance(
         geometry_1.bbox_min,
         geometry_1.bbox_max,
         geometry_2.bbox_min,
         geometry_2.bbox_max,
     )
-    if bbox_distance > RESIDUE_CONTACT_CUTOFF:
+    if bbox_distance > residue_contact_cutoff:
         return None
 
     residue_metrics = _residue_contact_metrics(
         geometry_1,
         geometry_2,
-        RESIDUE_CONTACT_CUTOFF,
+        residue_contact_cutoff,
     )
     residue_contacts = int(residue_metrics["num_residue_contacts"])
-    if residue_contacts < MIN_RESIDUE_CONTACTS:
+    if residue_contacts < min_residue_contacts:
         return None
 
     atom_contacts, atom_min_distance = _count_distance_contacts(
         geometry_1.atom_coords,
         geometry_2.atom_coords,
-        ATOM_CONTACT_CUTOFF,
+        atom_contact_cutoff,
     )
     min_distance = min(float(residue_metrics["residue_min_distance"]), atom_min_distance)
-    if atom_contacts < MIN_ATOM_CONTACTS:
+    if atom_contacts < min_atom_contacts:
         return None
 
     centroid_distance = float(np.linalg.norm(geometry_1.centroid - geometry_2.centroid))

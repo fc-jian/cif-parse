@@ -5,6 +5,7 @@ from pathlib import Path
 
 from biotite.structure.io.pdbx import get_assembly, get_structure, list_assemblies
 
+from cif_parse.constants import POLYMER_CHAIN_TYPES
 from cif_parse.interact.contacts import (
     build_chain_geometries,
     build_instance_geometries,
@@ -12,23 +13,6 @@ from cif_parse.interact.contacts import (
 )
 from cif_parse.io import read_cif_file, select_largest_polymer_assembly_id
 from cif_parse.models import DimerInterfaceRecord
-
-
-POLYMER_CHAIN_TYPES = frozenset(
-    {
-        "antibody heavy chain",
-        "antibody light chain",
-        "TCR chain",
-        "MHC heavy chain",
-        "beta2m or auxiliary immune chain",
-        "peptide antigen",
-        "other protein chain",
-        "DNA chain",
-        "RNA chain",
-        "other nucleic acid chain",
-        "other polymer chain",
-    }
-)
 
 
 def _interface_label(chain_type_1: str, chain_type_2: str, is_same_entity: bool) -> str:
@@ -123,6 +107,10 @@ def identify_dimer_interfaces(
     model: int = 1,
     assembly_mode: str = "largest_assembly",
     drop_hydrogens_for_analysis: bool = True,
+    residue_contact_cutoff: float = 8.0,
+    atom_contact_cutoff: float = 5.0,
+    min_residue_contacts: int = 3,
+    min_atom_contacts: int = 20,
 ) -> list[DimerInterfaceRecord]:
     cif_path = Path(path)
     cif_file = read_cif_file(cif_path)
@@ -205,6 +193,10 @@ def identify_dimer_interfaces(
             metrics = compute_interface_metrics(
                 geometry_1,
                 geometry_2,
+                residue_contact_cutoff=residue_contact_cutoff,
+                atom_contact_cutoff=atom_contact_cutoff,
+                min_residue_contacts=min_residue_contacts,
+                min_atom_contacts=min_atom_contacts,
             )
             if metrics is None:
                 continue

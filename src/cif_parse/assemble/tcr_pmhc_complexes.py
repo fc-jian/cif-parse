@@ -4,18 +4,15 @@ from collections import defaultdict
 import re
 from typing import Any
 
+from cif_parse.constants import (
+    AUX_CHAIN_TYPE,
+    MHC_CHAIN_TYPE,
+    PEPTIDE_CHAIN_TYPE,
+    PEPTIDE_MAX_LENGTH,
+    TCR_CHAIN_TYPE,
+    TCR_PAIR_TYPES,
+)
 from cif_parse.models import TcrPmhcComplexRecord
-
-
-TCR_CHAIN_TYPE = "TCR chain"
-MHC_CHAIN_TYPE = "MHC heavy chain"
-AUX_CHAIN_TYPE = "beta2m or auxiliary immune chain"
-PEPTIDE_CHAIN_TYPE = "peptide antigen"
-PEPTIDE_MAX_LENGTH = 30
-TCR_PAIR_TYPES = {
-    frozenset({"alpha", "beta"}): "alpha_beta",
-    frozenset({"gamma", "delta"}): "gamma_delta",
-}
 
 
 def _tcr_pair_type(chain_a: Any, chain_b: Any) -> str | None:
@@ -158,10 +155,10 @@ def _mhc_role_rank(role: str) -> int:
     return 2
 
 
-def _is_length_limited_peptide_candidate(chain: Any) -> bool:
+def _is_length_limited_peptide_candidate(chain: Any, peptide_max_length: int = 30) -> bool:
     if chain.chain_type not in {PEPTIDE_CHAIN_TYPE, "other protein chain"}:
         return False
-    return int(chain.length) <= PEPTIDE_MAX_LENGTH
+    return int(chain.length) <= peptide_max_length
 
 
 def _multimer_member_map(tight_multimers: list[Any]) -> dict[str, set[str]]:
@@ -281,6 +278,7 @@ def _select_peptide_chains_for_complex(
     dimer_interfaces: list[Any],
     tcr_chain_ids: set[str],
     mhc_chain_ids: set[str],
+    peptide_max_length: int = 30,
 ) -> tuple[list[Any], list[str]]:
     chain_map = {chain.label_asym_id: chain for chain in chain_inventory}
     mhc_contact_labels: set[str] = set()
@@ -294,7 +292,7 @@ def _select_peptide_chains_for_complex(
             partner_label = dimer.label_asym_id_1
         if partner_label is not None:
             partner = chain_map.get(partner_label)
-            if partner is not None and _is_length_limited_peptide_candidate(partner):
+            if partner is not None and _is_length_limited_peptide_candidate(partner, peptide_max_length=peptide_max_length):
                 mhc_contact_labels.add(partner_label)
 
         partner_label: str | None = None
@@ -305,7 +303,7 @@ def _select_peptide_chains_for_complex(
         if partner_label is None:
             continue
         partner = chain_map.get(partner_label)
-        if partner is not None and _is_length_limited_peptide_candidate(partner):
+        if partner is not None and _is_length_limited_peptide_candidate(partner, peptide_max_length=peptide_max_length):
             tcr_contact_labels.add(partner_label)
 
     peptide_labels = sorted(mhc_contact_labels & tcr_contact_labels)
@@ -331,6 +329,7 @@ def identify_tcr_pmhc_complexes(
     chain_inventory: list[Any],
     dimer_interfaces: list[Any],
     tight_multimers: list[Any],
+    peptide_max_length: int = 30,
 ) -> list[TcrPmhcComplexRecord]:
     chain_map = {chain.label_asym_id: chain for chain in chain_inventory}
     tcr_units = _build_tcr_units(chain_inventory, dimer_interfaces)
@@ -350,6 +349,7 @@ def identify_tcr_pmhc_complexes(
                 dimer_interfaces,
                 tcr_chain_ids,
                 mhc_chain_ids,
+                peptide_max_length=peptide_max_length,
             )
             pmhc_member_ids = {
                 *mhc_chain_ids,

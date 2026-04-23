@@ -83,6 +83,61 @@ tight_multimer_min_member_instances = 2
 # Allowed values: integer >= 2.
 tight_multimer_large_component_warning_size = 8
 
+# ---------------------------------------------------------------------------
+# Contact / interface geometry
+# ---------------------------------------------------------------------------
+
+# Distance cutoff (in Angstroms) for residue-level contact detection.
+# Two residues are considered in contact when their representative atoms are
+# within this distance. This cutoff is used both for the initial bounding-box
+# filter and for counting residue-residue contacts across chain pairs.
+# Allowed values: float > 0.
+residue_contact_cutoff = 8.0
+
+# Distance cutoff (in Angstroms) for atom-level contact detection.
+# After a residue-level contact is found, atom-atom distances are checked with
+# this stricter cutoff to count actual atomic contacts.
+# Allowed values: float > 0.
+atom_contact_cutoff = 4.5
+
+# Minimum number of residue-residue contacts required to keep a dimer interface.
+# Pairs with fewer contacts are discarded before area calculation.
+# Allowed values: integer >= 0.
+min_residue_contacts = 3
+
+# Minimum number of atom-atom contacts required to keep a dimer interface.
+# Pairs with fewer atomic contacts are discarded before area calculation.
+# Allowed values: integer >= 0.
+min_atom_contacts = 20
+
+# ---------------------------------------------------------------------------
+# Immune annotation thresholds
+# ---------------------------------------------------------------------------
+
+# Maximum peptide chain length for TCR-pMHC complex assembly.
+# During TCR-pMHC complex identification, candidate chains that are not
+# already labeled as peptide antigen are only considered if their sequence
+# length is at most this value.
+# Allowed values: integer >= 1.
+peptide_max_length = 30
+
+# Minimum HMMER bitscore for a Sadie variable-domain hit to be accepted.
+# Domains scoring below this threshold are discarded before clustering and
+# chain-type assignment.
+# Allowed values: float >= 0.
+sadie_domain_bitscore_threshold = 80.0
+
+# Maximum number of Sadie variable domains to retain per chain.
+# After clustering overlapping hits, at most this many domains are kept,
+# ordered by bitscore and preferred chain code.
+# Allowed values: integer >= 1.
+sadie_domain_limit = 4
+
+# Confidence threshold below which an antibody annotation is flagged as
+# low confidence in review outputs.
+# Allowed values: float in [0, 1].
+low_confidence_antibody_threshold = 0.8
+
 [single]
 # Default output directory for `cif-parse single`.
 # Allowed values: any writable filesystem path.

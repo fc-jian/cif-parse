@@ -6,20 +6,13 @@ import html
 import json
 from pathlib import Path
 
-from cif_parse.export import load_case_output_bundle
-
-
-ANTIBODY_CHAIN_TYPES = frozenset({"antibody heavy chain", "antibody light chain"})
-LOW_CONFIDENCE_ANTIBODY_THRESHOLD = 0.8
-HTML_SKIPPED_TARGET_DETAIL_LIMIT = 100
-COVERAGE_WARNING_CODES = frozenset(
-    {
-        "coverage skipped because atom array extraction failed",
-        "coverage skipped because the chain has no coordinates",
-        "coverage assigned to multiple main chains",
-        "coverage owner not found within the nearest-distance threshold",
-    }
+from cif_parse.constants import (
+    ANTIBODY_CHAIN_TYPES,
+    COVERAGE_WARNING_CODES,
+    HTML_SKIPPED_TARGET_DETAIL_LIMIT,
+    LOW_CONFIDENCE_ANTIBODY_THRESHOLD,
 )
+from cif_parse.export import load_case_output_bundle
 
 
 def _antibody_analysis(chain: dict[str, object]) -> dict[str, object]:
@@ -88,7 +81,11 @@ def _warning_counts(records: list[dict[str, object]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def collect_case_review_metrics(case_outdir: str | Path) -> dict[str, object]:
+def collect_case_review_metrics(
+    case_outdir: str | Path,
+    *,
+    low_confidence_antibody_threshold: float = 0.8,
+) -> dict[str, object]:
     """Collect the per-case metrics used by `review.json`."""
 
     case_outdir = Path(case_outdir)
@@ -128,7 +125,7 @@ def collect_case_review_metrics(case_outdir: str | Path) -> dict[str, object]:
 
     return {
         "num_low_confidence_antibody_chains": sum(
-            1 for chain in antibody_chains if _antibody_confidence(chain) < LOW_CONFIDENCE_ANTIBODY_THRESHOLD
+            1 for chain in antibody_chains if _antibody_confidence(chain) < low_confidence_antibody_threshold
         ),
         "num_unpaired_antibody_heavy_chains": sum(
             1
