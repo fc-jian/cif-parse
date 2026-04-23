@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import logging
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from cif_parse.export import build_single_json_bundle, dump_csv_rows, dump_json,
 from cif_parse.io import (
     read_assembly_chain_operations,
     read_assembly_copy_numbers,
+    read_available_assembly_ids,
     read_chain_inventory,
     read_structure_summary,
     read_structure_preflight,
@@ -131,6 +133,8 @@ def write_single_outputs(
     tight_multimers: list[Any],
     antibody_antigen_complexes: list[Any],
     tcr_pmhc_complexes: list[Any],
+    *,
+    bundle_name: str = "result.json.gz",
 ) -> list[str]:
     """Write all single-structure outputs in the configured primary format."""
 
@@ -147,6 +151,7 @@ def write_single_outputs(
             tight_multimers,
             antibody_antigen_complexes,
             tcr_pmhc_complexes,
+            bundle_name=bundle_name,
         )
     return _write_single_outputs_csv(
         output_dir,
@@ -225,28 +230,142 @@ def process_single_structure(
     )
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
+    if settings.assembly_mode != "all":
+        result = _process_single_structure_for_mode(
+            input_path=input_path,
+            outdir=outdir,
+            settings=settings,
+            summary=summary,
+            chain_inventory=chain_inventory,
+            analysis_assembly_mode=settings.assembly_mode,
+            selected_assembly_id=None,
+            bundle_name="result.json.gz",
+        )
+        LOGGER.info(
+            "Finished %s: %d chains, %d dimers, %d multimers, %d antibody complexes, %d TCR complexes",
+            summary.pdb_id,
+            result["num_chains"],
+            result["num_dimers"],
+            result["num_multimers"],
+            result["num_antibody_antigen_complexes"],
+            result["num_tcr_pmhc_complexes"],
+        )
+        return result
+
+    available_assembly_ids = read_available_assembly_ids(input_path)
+    if not available_assembly_ids:
+        raise StructureSkipWarning(
+            "no_available_assemblies_for_all_mode",
+            f"Skipping {summary.pdb_id}: assembly_mode=all requires at least one assembly id",
+            details={"assembly_ids": []},
+        )
+
+    assembly_results: list[dict[str, Any]] = []
+    output_paths: list[str] = []
+    total_dimers = 0
+    total_multimers = 0
+    total_antibody_complexes = 0
+    total_tcr_complexes = 0
+    for assembly_id in available_assembly_ids:
+        assembly_outdir, bundle_name = _resolve_all_mode_output_target(
+            outdir,
+            settings,
+            assembly_id,
+        )
+        assembly_result = _process_single_structure_for_mode(
+            input_path=input_path,
+            outdir=assembly_outdir,
+            settings=settings,
+            summary=summary,
+            chain_inventory=chain_inventory,
+            analysis_assembly_mode="all",
+            selected_assembly_id=assembly_id,
+            bundle_name=bundle_name,
+        )
+        assembly_results.append(assembly_result)
+        output_paths.extend(assembly_result["output_paths"])
+        total_dimers += int(assembly_result["num_dimers"])
+        total_multimers += int(assembly_result["num_multimers"])
+        total_antibody_complexes += int(assembly_result["num_antibody_antigen_complexes"])
+        total_tcr_complexes += int(assembly_result["num_tcr_pmhc_complexes"])
+
+    LOGGER.info(
+        "Finished %s across %d assemblies: %d chains, %d dimers, %d multimers, %d antibody complexes, %d TCR complexes",
+        summary.pdb_id,
+        len(assembly_results),
+        len(chain_inventory),
+        total_dimers,
+        total_multimers,
+        total_antibody_complexes,
+        total_tcr_complexes,
+    )
+    return {
+        "pdb_id": summary.pdb_id,
+        "input_path": str(input_path),
+        "output_dir": str(outdir),
+        "output_paths": output_paths,
+        "num_chains": len(chain_inventory),
+        "num_dimers": total_dimers,
+        "num_multimers": total_multimers,
+        "num_antibody_antigen_complexes": total_antibody_complexes,
+        "num_tcr_pmhc_complexes": total_tcr_complexes,
+        "chain_type_counts": summary.chain_type_counts,
+        "num_assemblies_processed": len(assembly_results),
+        "processed_assembly_ids": available_assembly_ids,
+        "assembly_results": assembly_results,
+    }
+
+
+def _resolve_all_mode_output_target(
+    outdir: Path,
+    settings: AppSettings,
+    assembly_id: str,
+) -> tuple[Path, str]:
+    if settings.output_format == "json" and not settings.debug:
+        return outdir, f"result_assembly_{assembly_id}.json.gz"
+    return outdir / f"assembly_{assembly_id}", "result.json.gz"
+
+
+def _process_single_structure_for_mode(
+    *,
+    input_path: Path,
+    outdir: Path,
+    settings: AppSettings,
+    summary: Any,
+    chain_inventory: list[Any],
+    analysis_assembly_mode: str,
+    selected_assembly_id: str | None,
+    bundle_name: str,
+) -> dict[str, Any]:
+    working_chain_inventory = deepcopy(chain_inventory)
     dimer_interfaces = identify_dimer_interfaces(
         input_path,
-        chain_inventory,
+        working_chain_inventory,
         model=settings.model,
-        assembly_mode=settings.assembly_mode,
+        assembly_mode=analysis_assembly_mode,
+        assembly_id=selected_assembly_id,
         drop_hydrogens_for_analysis=settings.drop_hydrogens_for_analysis,
         residue_contact_cutoff=settings.residue_contact_cutoff,
         atom_contact_cutoff=settings.atom_contact_cutoff,
         min_residue_contacts=settings.min_residue_contacts,
         min_atom_contacts=settings.min_atom_contacts,
     )
-    apply_antibody_pairing(chain_inventory, dimer_interfaces)
-    LOGGER.debug("Identified %d dimer interfaces for %s", len(dimer_interfaces), summary.pdb_id)
-    _, assembly_copy_numbers = read_assembly_copy_numbers(input_path)
-    _, assembly_chain_operations = read_assembly_chain_operations(input_path)
+    apply_antibody_pairing(working_chain_inventory, dimer_interfaces)
+    LOGGER.debug(
+        "Identified %d dimer interfaces for %s%s",
+        len(dimer_interfaces),
+        summary.pdb_id,
+        f" assembly {selected_assembly_id}" if selected_assembly_id is not None else "",
+    )
+    _, assembly_copy_numbers = read_assembly_copy_numbers(input_path, assembly_id=selected_assembly_id)
+    _, assembly_chain_operations = read_assembly_chain_operations(input_path, assembly_id=selected_assembly_id)
     tight_multimers = identify_tight_multimers(
-        chain_inventory,
+        working_chain_inventory,
         dimer_interfaces,
-        assembly_mode=settings.assembly_mode,
-        assembly_copy_numbers=assembly_copy_numbers if settings.assembly_mode == "largest_assembly" else {},
+        assembly_mode=analysis_assembly_mode,
+        assembly_copy_numbers=assembly_copy_numbers if analysis_assembly_mode in {"largest_assembly", "all"} else {},
         assembly_chain_operations=(
-            assembly_chain_operations if settings.assembly_mode == "largest_assembly" else {}
+            assembly_chain_operations if analysis_assembly_mode in {"largest_assembly", "all"} else {}
         ),
         min_buried_area=settings.tight_multimer_min_buried_area,
         louvain_resolution=settings.tight_multimer_louvain_resolution,
@@ -254,12 +373,12 @@ def process_single_structure(
         large_component_warning_size=settings.tight_multimer_large_component_warning_size,
     )
     antibody_antigen_complexes = identify_antibody_antigen_complexes(
-        chain_inventory,
+        working_chain_inventory,
         dimer_interfaces,
         tight_multimers,
     )
     tcr_pmhc_complexes = identify_tcr_pmhc_complexes(
-        chain_inventory,
+        working_chain_inventory,
         dimer_interfaces,
         tight_multimers,
         peptide_max_length=settings.peptide_max_length,
@@ -268,32 +387,25 @@ def process_single_structure(
         outdir,
         settings,
         summary,
-        chain_inventory,
+        working_chain_inventory,
         dimer_interfaces,
         tight_multimers,
         antibody_antigen_complexes,
         tcr_pmhc_complexes,
-    )
-    LOGGER.info(
-        "Finished %s: %d chains, %d dimers, %d multimers, %d antibody complexes, %d TCR complexes",
-        summary.pdb_id,
-        len(chain_inventory),
-        len(dimer_interfaces),
-        len(tight_multimers),
-        len(antibody_antigen_complexes),
-        len(tcr_pmhc_complexes),
+        bundle_name=bundle_name,
     )
     return {
         "pdb_id": summary.pdb_id,
         "input_path": str(input_path),
         "output_dir": str(outdir),
         "output_paths": output_paths,
-        "num_chains": len(chain_inventory),
+        "num_chains": len(working_chain_inventory),
         "num_dimers": len(dimer_interfaces),
         "num_multimers": len(tight_multimers),
         "num_antibody_antigen_complexes": len(antibody_antigen_complexes),
         "num_tcr_pmhc_complexes": len(tcr_pmhc_complexes),
         "chain_type_counts": summary.chain_type_counts,
+        "assembly_id": selected_assembly_id,
     }
 
 
@@ -307,6 +419,8 @@ def _write_single_outputs_json(
     tight_multimers: list[Any],
     antibody_antigen_complexes: list[Any],
     tcr_pmhc_complexes: list[Any],
+    *,
+    bundle_name: str,
 ) -> list[str]:
     if not settings.debug:
         bundle = build_single_json_bundle(
@@ -318,7 +432,7 @@ def _write_single_outputs_json(
             antibody_antigen_complexes=antibody_antigen_complexes,
             tcr_pmhc_complexes=tcr_pmhc_complexes,
         )
-        return [str(dump_single_json_bundle(outdir / "result.json.gz", bundle))]
+        return [str(dump_single_json_bundle(outdir / bundle_name, bundle))]
 
     output_paths = [
         str(dump_json(outdir / "structure_summary.json", summary.to_dict())),

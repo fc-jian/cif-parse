@@ -12,7 +12,7 @@ from cif_parse.constants import (
     HTML_SKIPPED_TARGET_DETAIL_LIMIT,
     LOW_CONFIDENCE_ANTIBODY_THRESHOLD,
 )
-from cif_parse.export import load_case_output_bundle
+from cif_parse.export import load_case_output_bundles
 
 
 def _antibody_analysis(chain: dict[str, object]) -> dict[str, object]:
@@ -89,11 +89,24 @@ def collect_case_review_metrics(
     """Collect the per-case metrics used by `review.json`."""
 
     case_outdir = Path(case_outdir)
-    payload = load_case_output_bundle(case_outdir)
-    chain_inventory = payload["chain_inventory"]
-    tight_multimers = payload["tight_multimers"]
-    antibody_antigen_complexes = payload["antibody_antigen_complexes"]
-    tcr_pmhc_complexes = payload["tcr_pmhc_complexes"]
+    payloads = load_case_output_bundles(case_outdir)
+    primary_payload = payloads[0]
+    chain_inventory = primary_payload["chain_inventory"]
+    tight_multimers = [
+        multimer
+        for payload in payloads
+        for multimer in payload["tight_multimers"]
+    ]
+    antibody_antigen_complexes = [
+        complex_record
+        for payload in payloads
+        for complex_record in payload["antibody_antigen_complexes"]
+    ]
+    tcr_pmhc_complexes = [
+        complex_record
+        for payload in payloads
+        for complex_record in payload["tcr_pmhc_complexes"]
+    ]
 
     antibody_chains = [
         chain for chain in chain_inventory if chain.get("chain_type") in ANTIBODY_CHAIN_TYPES
@@ -151,6 +164,7 @@ def collect_case_review_metrics(
         "num_mhc_heavy_chains": sum(
             1 for chain in chain_inventory if chain.get("chain_type") == "MHC heavy chain"
         ),
+        "num_processed_assemblies": len(payloads),
         "chain_warning_counts": chain_warning_counts,
         "antibody_complex_warning_counts": antibody_complex_warning_counts,
         "tcr_complex_warning_counts": dict(sorted(tcr_complex_warning_counts.items())),

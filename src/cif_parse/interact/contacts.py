@@ -12,6 +12,9 @@ from cif_parse.constants import (
 )
 from cif_parse.utils import filter_atom_array_for_analysis, normalize_element_symbol
 
+MIN_RESIDUE_CONTACTS = 3
+MIN_ATOM_CONTACTS = 20
+
 
 @dataclass(slots=True)
 class ChainGeometry:
@@ -451,9 +454,14 @@ def compute_interface_metrics(
     *,
     residue_contact_cutoff: float = 8.0,
     atom_contact_cutoff: float = 5.0,
-    min_residue_contacts: int = 3,
-    min_atom_contacts: int = 20,
+    min_residue_contacts: int | None = None,
+    min_atom_contacts: int | None = None,
 ) -> dict[str, Any] | None:
+    if min_residue_contacts is None:
+        min_residue_contacts = MIN_RESIDUE_CONTACTS
+    if min_atom_contacts is None:
+        min_atom_contacts = MIN_ATOM_CONTACTS
+
     bbox_distance = _bbox_distance(
         geometry_1.bbox_min,
         geometry_1.bbox_max,

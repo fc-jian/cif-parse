@@ -13,7 +13,9 @@ output_format = "json"
 # - "asymmetric_unit": analyze the deposited asymmetric unit directly.
 # - "largest_assembly": choose the assembly containing the most polymer chain
 #   instances; ties are resolved by the lowest/earliest assembly id.
-assembly_mode = "largest_assembly"
+# - "all": run each deposited assembly independently and export one result per
+#   assembly.
+assembly_mode = "all"
 
 # Method for assigning observed coordinates to polymer sequence positions.
 # Options:
@@ -61,7 +63,7 @@ tight_multimer_min_buried_area = 10.0
 # Resolution parameter for Louvain community detection over the weighted
 # tight-multimer graph.
 # Allowed values: float > 0.
-tight_multimer_louvain_resolution = 1.0
+tight_multimer_louvain_resolution = 0.8
 
 # Minimum community size, counted in instance-level member nodes, for exporting
 # a tight multimer.

@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from cif_parse.cli import main as cli_main
-from cif_parse.export import dump_json, load_case_output_bundle
+from cif_parse.export import dump_json, load_case_output_bundles
 from cif_parse.reporting import build_batch_html_report
 from cif_parse.settings import SUPPORTED_ASSEMBLY_MODES
 
@@ -177,13 +177,30 @@ def _warning_counts(records: list[dict[str, object]]) -> dict[str, int]:
 
 
 def _case_metrics(case_outdir: Path) -> dict[str, object]:
-    payload = load_case_output_bundle(case_outdir)
-    summary = payload["structure_summary"]
-    chain_inventory = payload["chain_inventory"]
-    dimers = payload["dimer_interfaces"]
-    multimers = payload["tight_multimers"]
-    antibody_antigen_complexes = payload["antibody_antigen_complexes"]
-    tcr_pmhc_complexes = payload["tcr_pmhc_complexes"]
+    payloads = load_case_output_bundles(case_outdir)
+    primary_payload = payloads[0]
+    summary = primary_payload["structure_summary"]
+    chain_inventory = primary_payload["chain_inventory"]
+    dimers = [
+        dimer
+        for payload in payloads
+        for dimer in payload["dimer_interfaces"]
+    ]
+    multimers = [
+        multimer
+        for payload in payloads
+        for multimer in payload["tight_multimers"]
+    ]
+    antibody_antigen_complexes = [
+        complex_record
+        for payload in payloads
+        for complex_record in payload["antibody_antigen_complexes"]
+    ]
+    tcr_pmhc_complexes = [
+        complex_record
+        for payload in payloads
+        for complex_record in payload["tcr_pmhc_complexes"]
+    ]
 
     num_dimers = len(dimers)
     num_multimers = len(multimers)
@@ -353,6 +370,7 @@ def _case_metrics(case_outdir: Path) -> dict[str, object]:
         "num_auxiliary_immune_chains": num_auxiliary_immune_chains,
         "num_explicit_peptide_chains": num_explicit_peptide_chains,
         "num_contextual_peptide_chains_in_complexes": len(contextual_peptide_chain_ids),
+        "num_processed_assemblies": len(payloads),
         "chain_warning_counts": chain_warning_counts,
         "antibody_complex_warning_counts": antibody_complex_warning_counts,
         "tcr_complex_warning_counts": dict(sorted(tcr_complex_warning_counts.items())),

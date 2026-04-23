@@ -3,6 +3,7 @@
 from .cif_reader import (
     count_oper_expression_copies,
     expand_oper_expression,
+    read_available_assembly_ids,
     read_assembly_chain_operations,
     read_assembly_copy_numbers,
     read_chain_inventory,
@@ -15,6 +16,7 @@ from .cif_reader import (
 __all__ = [
     "count_oper_expression_copies",
     "expand_oper_expression",
+    "read_available_assembly_ids",
     "read_assembly_chain_operations",
     "read_assembly_copy_numbers",
     "read_chain_inventory",

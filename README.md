@@ -33,6 +33,12 @@ Run a single mmCIF file:
 python -m cif_parse.cli single path/to/file.cif --outdir ./outputs --log-level INFO
 ```
 
+Analyze every deposited assembly independently:
+
+```bash
+python -m cif_parse.cli single path/to/file.cif --assembly-mode all --outdir ./outputs
+```
+
 Run a batch job on a directory:
 
 ```bash

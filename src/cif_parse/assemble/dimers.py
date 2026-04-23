@@ -106,6 +106,7 @@ def identify_dimer_interfaces(
     *,
     model: int = 1,
     assembly_mode: str = "largest_assembly",
+    assembly_id: str | None = None,
     drop_hydrogens_for_analysis: bool = True,
     residue_contact_cutoff: float = 8.0,
     atom_contact_cutoff: float = 5.0,
@@ -120,8 +121,10 @@ def identify_dimer_interfaces(
     ]
     chain_map = {chain.label_asym_id: chain for chain in polymer_chains}
     dimers: list[DimerInterfaceRecord] = []
-    if assembly_mode == "largest_assembly" and assembly_ids:
-        selected_assembly_id = select_largest_polymer_assembly_id(cif_file)
+    if assembly_mode in {"largest_assembly", "all"} and assembly_ids:
+        selected_assembly_id = assembly_id
+        if selected_assembly_id is None and assembly_mode == "largest_assembly":
+            selected_assembly_id = select_largest_polymer_assembly_id(cif_file)
         if selected_assembly_id is None:
             return []
         try:
@@ -140,6 +143,8 @@ def identify_dimer_interfaces(
             if str(exc) != "Array must contain at least one element":
                 raise
             return []
+    elif assembly_mode == "all":
+        return []
     else:
         try:
             atom_array_inputs = [
@@ -157,7 +162,7 @@ def identify_dimer_interfaces(
                 raise
             return []
     geometries: dict[str, object] = {}
-    if assembly_mode == "largest_assembly":
+    if assembly_mode in {"largest_assembly", "all"}:
         selected_assembly_id, atom_array = atom_array_inputs[0]
         built_geometries = build_instance_geometries(
             atom_array,
@@ -228,7 +233,7 @@ def identify_dimer_interfaces(
                     metrics.get("area_evidence", {}).get("interface_area_method", "ProtOr")
                 ),
                 "instance_granularity": "chain_id_plus_sym_id"
-                if assembly_mode == "largest_assembly"
+                if assembly_mode in {"largest_assembly", "all"}
                 else "label_asym_id",
                 "bbox_distance": round(float(metrics["bbox_distance"]), 4),
             }
@@ -241,7 +246,7 @@ def identify_dimer_interfaces(
                 DimerInterfaceRecord(
                     pdb_id=chain_1.pdb_id,
                     assembly_mode=assembly_mode,
-                    assembly_id=geometry_1.assembly_id if assembly_mode == "largest_assembly" else None,
+                    assembly_id=geometry_1.assembly_id if assembly_mode in {"largest_assembly", "all"} else None,
                     num_supporting_instance_pairs=1,
                     instance_id_1=output_instance_id_1,
                     sym_id_1=geometry_1.sym_id,

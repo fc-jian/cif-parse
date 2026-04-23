@@ -156,7 +156,7 @@ def _add_runtime_args(
     parser.add_argument(
         "--assembly-mode",
         choices=sorted(SUPPORTED_ASSEMBLY_MODES),
-        default=str(settings_defaults.get("assembly_mode", "largest_assembly")),
+        default=str(settings_defaults.get("assembly_mode", "asymmetric_unit")),
         help="Assembly mode recorded in settings metadata",
     )
     parser.add_argument(
@@ -388,6 +388,7 @@ def _summarize_batch_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     total_chains = sum(int(result.get("num_chains", 0)) for result in successes)
     total_dimers = sum(int(result.get("num_dimers", 0)) for result in successes)
     total_multimers = sum(int(result.get("num_multimers", 0)) for result in successes)
+    total_processed_assemblies = sum(int(result.get("num_assemblies_processed", 1)) for result in successes)
     total_antibody_complexes = sum(
         int(result.get("num_antibody_antigen_complexes", 0)) for result in successes
     )
@@ -400,6 +401,7 @@ def _summarize_batch_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_chains": total_chains,
         "total_dimers": total_dimers,
         "total_multimers": total_multimers,
+        "total_processed_assemblies": total_processed_assemblies,
         "total_antibody_antigen_complexes": total_antibody_complexes,
         "total_tcr_pmhc_complexes": total_tcr_complexes,
         "average_chains_per_successful_case": round(total_chains / total_success, 2) if total_success else 0.0,

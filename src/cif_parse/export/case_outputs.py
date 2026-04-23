@@ -21,6 +21,35 @@ JSON_CASE_ARTIFACT_NAMES = (
     "other_entities",
 )
 JSON_CASE_BUNDLE_NAME = "result.json.gz"
+JSON_CASE_ASSEMBLY_BUNDLE_PREFIX = "result_assembly_"
+ASSEMBLY_OUTPUT_DIR_PREFIX = "assembly_"
+
+
+def _assembly_sort_key(label: str) -> tuple[int, int | str]:
+    if label.isdigit():
+        return (0, int(label))
+    return (1, label)
+
+
+def _list_multi_bundle_paths(case_path: Path) -> list[Path]:
+    bundle_paths = sorted(
+        case_path.glob(f"{JSON_CASE_ASSEMBLY_BUNDLE_PREFIX}*.json.gz"),
+        key=lambda path: _assembly_sort_key(
+            path.name.removeprefix(JSON_CASE_ASSEMBLY_BUNDLE_PREFIX).removesuffix(".json.gz")
+        ),
+    )
+    if bundle_paths:
+        return bundle_paths
+
+    assembly_dirs = sorted(
+        [
+            candidate
+            for candidate in case_path.iterdir()
+            if candidate.is_dir() and candidate.name.startswith(ASSEMBLY_OUTPUT_DIR_PREFIX)
+        ],
+        key=lambda path: _assembly_sort_key(path.name.removeprefix(ASSEMBLY_OUTPUT_DIR_PREFIX)),
+    ) if case_path.exists() else []
+    return assembly_dirs
 
 
 def build_single_json_bundle(
@@ -57,21 +86,45 @@ def dump_single_json_bundle(path: str | Path, payload: dict[str, Any]) -> Path:
     return dump_json(path, payload, indent=None)
 
 
-def load_case_output_bundle(case_outdir: str | Path) -> dict[str, Any]:
-    """Load a case output bundle, supporting both bundled and split JSON layouts."""
+def load_case_output_bundles(case_outdir: str | Path) -> list[dict[str, Any]]:
+    """Load one or more case output bundles from bundled or split JSON layouts."""
 
     case_path = Path(case_outdir)
     bundle_path = case_path / JSON_CASE_BUNDLE_NAME
     if bundle_path.exists():
         payload = load_json(bundle_path)
-        if isinstance(payload, dict):
-            return payload
-        raise TypeError(f"Expected dict payload in {bundle_path}")
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected dict payload in {bundle_path}")
+        return [payload]
+
+    multi_locations = _list_multi_bundle_paths(case_path)
+    if multi_locations:
+        payloads: list[dict[str, Any]] = []
+        for location in multi_locations:
+            if location.is_dir():
+                payloads.extend(load_case_output_bundles(location))
+                continue
+            payload = load_json(location)
+            if not isinstance(payload, dict):
+                raise TypeError(f"Expected dict payload in {location}")
+            payloads.append(payload)
+        return payloads
 
     payload: dict[str, Any] = {}
     for artifact_name in JSON_CASE_ARTIFACT_NAMES:
         payload[artifact_name] = load_case_output_artifact(case_path, artifact_name)
-    return payload
+    return [payload]
+
+
+def load_case_output_bundle(case_outdir: str | Path) -> dict[str, Any]:
+    """Load a case output bundle, supporting both bundled and split JSON layouts."""
+
+    payloads = load_case_output_bundles(case_outdir)
+    if len(payloads) != 1:
+        raise ValueError(
+            f"Expected exactly one case output bundle under {case_outdir}, found {len(payloads)}"
+        )
+    return payloads[0]
 
 
 def load_case_output_artifact(case_outdir: str | Path, artifact_name: str) -> Any:

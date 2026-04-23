@@ -197,6 +197,15 @@ def _assembly_sort_key(assembly_id: str) -> tuple[int, int | str]:
     return (1, assembly_id)
 
 
+def read_available_assembly_ids(path: str | Path) -> list[str]:
+    cif_path = Path(path)
+    cif_file = read_cif_file(cif_path)
+    return sorted(
+        [str(assembly_id) for assembly_id in list_assemblies(cif_file)],
+        key=_assembly_sort_key,
+    )
+
+
 def select_largest_polymer_assembly_id(cif_file: CIFFile) -> str | None:
     rows = _category_rows(cif_file, "pdbx_struct_assembly_gen")
     available_assembly_ids = sorted(
