@@ -1,18 +1,102 @@
+# Default cif-parse configuration.
+#
+# CLI arguments always override values from this file. Supported sections are:
+# [settings], [single], and [batch].
+
 [settings]
+# Primary export format for per-structure result tables.
+# Options: "json", "csv".
 output_format = "json"
-assembly_mode = "biological_assembly"
+
+# Structure coordinate mode used for dimer/multimer/complex analysis.
+# Options:
+# - "asymmetric_unit": analyze the deposited asymmetric unit directly.
+# - "largest_assembly": choose the assembly containing the most polymer chain
+#   instances; ties are resolved by the lowest/earliest assembly id.
+assembly_mode = "asymmetric_unit"
+
+# Method for assigning observed coordinates to polymer sequence positions.
+# Options:
+# - "nearest": assign by nearest residue/atom coordinate when direct identifiers
+#   are incomplete; recommended default.
+# - "contact": contact-aware assignment mode.
+# - "covalent": covalent-connectivity-aware assignment mode.
 coverage_mode = "nearest"
+
+# JSON export layout switch.
+# Options:
+# - false: default; write one compact `result.json.gz` bundle containing all JSON artifacts.
+# - true: write split JSON artifacts directly under the output directory.
+# This option is ignored when `output_format = "csv"`.
+debug = false
+
+# Root logging level for CLI, batch parent process, and worker processes.
+# Options: "DEBUG", "INFO", "WARNING", "ERROR".
 log_level = "INFO"
+
+# Print verbose JSON summaries from CLI commands instead of only output paths.
+# Options: true, false.
 verbose = false
+
+# 1-based model index to read from multi-model mmCIF files.
+# Allowed values: integer >= 1.
 model = 1
+
+# Use author coordinate identifiers when reading atom arrays.
+# Options:
+# - false: use label_asym_id/label_seq_id internally; recommended default.
+# - true: use auth_asym_id/auth_seq_id when constructing structure arrays.
 use_author_fields = false
+
+# Remove hydrogen atoms before downstream coverage/interface calculations.
+# Options:
+# - true: heavy-atom-only analysis; recommended default.
+# - false: retain hydrogens where present.
+drop_hydrogens_for_analysis = true
+
+# Skip structures with more polymer chains than this threshold.
+# Allowed values: integer >= 1.
 max_polymer_chains = 100
+
+# Skip structures unless at least one polymer chain has length greater than this
+# threshold. A value of 0 disables the practical length guard.
+# Allowed values: integer >= 0.
 min_polymer_chain_length = 20
 
+# Minimum buried area required to keep a dimer edge in the tight-multimer
+# graph.
+# Allowed values: float >= 0.
+tight_multimer_min_buried_area = 10.0
+
+# Resolution parameter for Louvain community detection over the weighted
+# tight-multimer graph.
+# Allowed values: float > 0.
+tight_multimer_louvain_resolution = 1.0
+
+# Minimum community size, counted in instance-level member nodes, for exporting
+# a tight multimer.
+# Allowed values: integer >= 2.
+tight_multimer_min_member_instances = 2
+
+# Emit `large_component_without_bridge_pruning` once a tight multimer reaches
+# this many instance-level member nodes.
+# Allowed values: integer >= 2.
+tight_multimer_large_component_warning_size = 8
+
 [single]
+# Default output directory for `cif-parse single`.
+# Allowed values: any writable filesystem path.
 outdir = "outputs"
 
 [batch]
+# Default output directory for `cif-parse batch`.
+# Allowed values: any writable filesystem path.
 outdir = "batch_outputs"
+
+# Number of worker processes for `cif-parse batch`.
+# Allowed values: integer >= 1.
 jobs = 8
+
+# Stop the batch run after the first failed input.
+# Options: true, false.
 fail_fast = false

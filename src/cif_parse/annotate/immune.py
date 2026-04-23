@@ -23,6 +23,11 @@ SADIE_SCHEME = "imgt"
 SADIE_REGION_DEFINITION = "imgt"
 SADIE_DOMAIN_BITSCORE_THRESHOLD = 80.0
 SADIE_DOMAIN_LIMIT = 4
+IMGT_CDR_RANGES = {
+    "cdr1": (27, 38),
+    "cdr2": (56, 65),
+    "cdr3": (105, 117),
+}
 CHAIN_CODE_DESCRIPTION_HINTS = {
     "H": ("heavy chain",),
     "K": ("kappa",),
@@ -46,6 +51,7 @@ class VariableDomainAnnotation:
     bitscore: float
     evalue: float
     species: str | None = None
+    cdr_regions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -330,9 +336,57 @@ def _number_selected_domains(
                 bitscore=float(matched_hit["bitscore"]) if matched_hit is not None else 0.0,
                 evalue=float(matched_hit["evalue"]) if matched_hit is not None else 0.0,
                 species=str(item["hmm_species"]) if item.get("hmm_species") else None,
+                cdr_regions=_cdr_regions_from_numbering(item, int(item["seqstart_index"])),
             )
         )
     return domains
+
+
+def _cdr_regions_from_numbering(item: dict[str, Any], domain_seq_start: int) -> list[dict[str, Any]]:
+    numbering = item.get("Numbering")
+    numbered_sequence = item.get("Numbered_Sequence")
+    insertions = item.get("Insertion")
+    if not isinstance(numbering, list) or not isinstance(numbered_sequence, list):
+        return []
+    if not isinstance(insertions, list):
+        insertions = [""] * len(numbering)
+
+    query_position = int(domain_seq_start)
+    cdr_positions: dict[str, list[int]] = {name: [] for name in IMGT_CDR_RANGES}
+    cdr_numbering: dict[str, list[str]] = {name: [] for name in IMGT_CDR_RANGES}
+    for number, insertion, amino_acid in zip(numbering, insertions, numbered_sequence, strict=False):
+        if str(amino_acid) == "-":
+            continue
+        query_position += 1
+        try:
+            numeric_number = int(number)
+        except (TypeError, ValueError):
+            continue
+        numbering_label = f"{numeric_number}{str(insertion or '')}"
+        for cdr_name, (start, end) in IMGT_CDR_RANGES.items():
+            if start <= numeric_number <= end:
+                cdr_positions[cdr_name].append(query_position)
+                cdr_numbering[cdr_name].append(numbering_label)
+
+    regions: list[dict[str, Any]] = []
+    for cdr_name in ("cdr1", "cdr2", "cdr3"):
+        positions = cdr_positions[cdr_name]
+        if not positions:
+            continue
+        labels = cdr_numbering[cdr_name]
+        regions.append(
+            {
+                "name": cdr_name,
+                "seq_start": min(positions),
+                "seq_end": max(positions),
+                "length": len(positions),
+                "numbering_start": labels[0],
+                "numbering_end": labels[-1],
+                "numbering_scheme": SADIE_SCHEME,
+                "region_definition": SADIE_REGION_DEFINITION,
+            }
+        )
+    return regions
 
 
 def analyze_immune_sequence(

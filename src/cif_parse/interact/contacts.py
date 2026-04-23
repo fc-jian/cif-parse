@@ -47,6 +47,7 @@ class ChainGeometry:
     instance_id: str
     label_asym_id: str
     sym_id: int
+    assembly_id: str | None
     atom_array: AtomArray
     atom_coords: np.ndarray
     residue_rep_coords: np.ndarray
@@ -54,6 +55,7 @@ class ChainGeometry:
     bbox_min: np.ndarray
     bbox_max: np.ndarray
     centroid: np.ndarray
+    residue_atom_ranges: list[tuple[int, int]] | None = None
 
 
 def _prepare_atom_array_for_area(atom_array: AtomArray) -> tuple[AtomArray, dict[str, int]]:
@@ -143,6 +145,7 @@ def build_chain_geometries(
 
         residue_rep_coords: list[np.ndarray] = []
         residue_ids: list[tuple[int, str, str]] = []
+        residue_atom_ranges: list[tuple[int, int]] = []
         residue_start = 0
         for atom_index in range(1, chain_atoms.array_length() + 1):
             is_boundary = atom_index == chain_atoms.array_length()
@@ -169,6 +172,7 @@ def build_chain_geometries(
                     str(residue_slice.res_name[0]),
                 )
             )
+            residue_atom_ranges.append((residue_start, atom_index))
             residue_start = atom_index
 
         residue_coords = np.asarray(residue_rep_coords, dtype=np.float32)
@@ -176,10 +180,12 @@ def build_chain_geometries(
             instance_id=label_asym_id,
             label_asym_id=label_asym_id,
             sym_id=0,
+            assembly_id=None,
             atom_array=chain_atoms,
             atom_coords=atom_coords,
             residue_rep_coords=residue_coords,
             residue_ids=residue_ids,
+            residue_atom_ranges=residue_atom_ranges,
             bbox_min=atom_coords.min(axis=0),
             bbox_max=atom_coords.max(axis=0),
             centroid=atom_coords.mean(axis=0),
@@ -215,6 +221,7 @@ def build_instance_geometries(
 
         residue_rep_coords: list[np.ndarray] = []
         residue_ids: list[tuple[int, str, str]] = []
+        residue_atom_ranges: list[tuple[int, int]] = []
         residue_start = 0
         for atom_index in range(1, chain_atoms.array_length() + 1):
             is_boundary = atom_index == chain_atoms.array_length()
@@ -241,6 +248,7 @@ def build_instance_geometries(
                     str(residue_slice.res_name[0]),
                 )
             )
+            residue_atom_ranges.append((residue_start, atom_index))
             residue_start = atom_index
 
         residue_coords = np.asarray(residue_rep_coords, dtype=np.float32)
@@ -249,10 +257,12 @@ def build_instance_geometries(
             instance_id=instance_id,
             label_asym_id=label_asym_id,
             sym_id=sym_id,
+            assembly_id=None,
             atom_array=chain_atoms,
             atom_coords=atom_coords,
             residue_rep_coords=residue_coords,
             residue_ids=residue_ids,
+            residue_atom_ranges=residue_atom_ranges,
             bbox_min=atom_coords.min(axis=0),
             bbox_max=atom_coords.max(axis=0),
             centroid=atom_coords.mean(axis=0),
@@ -301,7 +311,53 @@ def _residue_contact_metrics(
         "interface_residue_count_1": int(np.count_nonzero(contact_mask.any(axis=1))),
         "interface_residue_count_2": int(np.count_nonzero(contact_mask.any(axis=0))),
         "residue_min_distance": float(np.sqrt(distance_sq.min())),
+        "contact_mask": contact_mask,
     }
+
+
+def _format_residue_id(residue_id: tuple[int, str, str]) -> str:
+    res_id, ins_code, res_name = residue_id
+    suffix = str(ins_code).strip()
+    return f"{res_name}:{res_id}{suffix}"
+
+
+def _closest_residue_atom_pairs(
+    geometry_1: ChainGeometry,
+    geometry_2: ChainGeometry,
+    contact_mask: np.ndarray,
+) -> list[list[Any]]:
+    if contact_mask.size == 0:
+        return []
+    if geometry_1.residue_atom_ranges is None or geometry_2.residue_atom_ranges is None:
+        return []
+    atom_pairs: list[list[Any]] = []
+    residue_pairs = np.argwhere(contact_mask)
+    for residue_index_1, residue_index_2 in residue_pairs.tolist():
+        start_1, end_1 = geometry_1.residue_atom_ranges[residue_index_1]
+        start_2, end_2 = geometry_2.residue_atom_ranges[residue_index_2]
+        residue_atoms_1 = geometry_1.atom_array[start_1:end_1]
+        residue_atoms_2 = geometry_2.atom_array[start_2:end_2]
+        if residue_atoms_1.array_length() == 0 or residue_atoms_2.array_length() == 0:
+            continue
+        deltas = np.asarray(residue_atoms_1.coord, dtype=np.float32)[:, None, :] - np.asarray(
+            residue_atoms_2.coord,
+            dtype=np.float32,
+        )[None, :, :]
+        distance_sq = np.sum(deltas * deltas, axis=2)
+        flat_index = int(distance_sq.argmin())
+        atom_index_1, atom_index_2 = np.unravel_index(flat_index, distance_sq.shape)
+        atom_pairs.append(
+            [
+                geometry_1.instance_id,
+                _format_residue_id(geometry_1.residue_ids[residue_index_1]),
+                str(residue_atoms_1.atom_name[atom_index_1]),
+                geometry_2.instance_id,
+                _format_residue_id(geometry_2.residue_ids[residue_index_2]),
+                str(residue_atoms_2.atom_name[atom_index_2]),
+                round(float(np.sqrt(distance_sq[atom_index_1, atom_index_2])), 4),
+            ]
+        )
+    return atom_pairs
 
 
 def _interface_area_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeometry) -> dict[str, Any]:
@@ -452,6 +508,11 @@ def compute_interface_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeomet
     interface_residue_count_2 = int(residue_metrics["interface_residue_count_2"])
     mean_interface_residue_count = (interface_residue_count_1 + interface_residue_count_2) / 2.0
     buried_area = float(area_metrics["buried_area"])
+    contacting_atom_pairs = _closest_residue_atom_pairs(
+        geometry_1,
+        geometry_2,
+        np.asarray(residue_metrics["contact_mask"], dtype=bool),
+    )
     return {
         "num_residue_contacts": residue_contacts,
         "num_atom_contacts": atom_contacts,
@@ -476,4 +537,5 @@ def compute_interface_metrics(geometry_1: ChainGeometry, geometry_2: ChainGeomet
         "residue_contacts_per_interface_residue": (
             residue_contacts / mean_interface_residue_count if mean_interface_residue_count > 0.0 else 0.0
         ),
+        "contacting_atom_pairs": contacting_atom_pairs,
     }

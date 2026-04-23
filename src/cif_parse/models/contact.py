@@ -46,6 +46,7 @@ class DimerInterfaceRecord:
     buried_area_per_interface_residue: float = 0.0
     atom_contacts_per_interface_residue: float = 0.0
     residue_contacts_per_interface_residue: float = 0.0
+    contacting_atom_pairs: list[list[Any]] = field(default_factory=list)
     evidence: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -85,6 +86,7 @@ class DimerInterfaceRecord:
             "buried_area_per_interface_residue": self.buried_area_per_interface_residue,
             "atom_contacts_per_interface_residue": self.atom_contacts_per_interface_residue,
             "residue_contacts_per_interface_residue": self.residue_contacts_per_interface_residue,
+            "contacting_atom_pairs": _json_cell(self.contacting_atom_pairs),
             "is_same_entity": self.is_same_entity,
             "interface_label": self.interface_label,
             "contains_antibody_unit": self.contains_antibody_unit,

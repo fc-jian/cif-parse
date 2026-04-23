@@ -320,8 +320,8 @@ def identify_antibody_antigen_complexes(
                     "contact_score_metric": "sum_buried_area_over_antibody_antigen_dimers",
                     "source_interface_stage": "dimer_interface_v2_assembly_instances",
                     "source_chain_annotation_files": [
-                        "final/protein_chains.json",
-                        "final/chain_inventory.json",
+                        "protein_chains",
+                        "chain_inventory",
                     ],
                     "antigen_entity_grouping_rule": (
                         "collapse_same_entity_antigen_copies_to_representative_chain_for_top_level_fields"

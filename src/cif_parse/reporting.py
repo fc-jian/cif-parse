@@ -6,11 +6,12 @@ import html
 import json
 from pathlib import Path
 
-from cif_parse.export import load_json
+from cif_parse.export import load_case_output_bundle
 
 
 ANTIBODY_CHAIN_TYPES = frozenset({"antibody heavy chain", "antibody light chain"})
 LOW_CONFIDENCE_ANTIBODY_THRESHOLD = 0.8
+HTML_SKIPPED_TARGET_DETAIL_LIMIT = 100
 COVERAGE_WARNING_CODES = frozenset(
     {
         "coverage skipped because atom array extraction failed",
@@ -19,10 +20,6 @@ COVERAGE_WARNING_CODES = frozenset(
         "coverage owner not found within the nearest-distance threshold",
     }
 )
-
-
-def _read_json(path: Path) -> dict | list:
-    return load_json(path)
 
 
 def _antibody_analysis(chain: dict[str, object]) -> dict[str, object]:
@@ -95,10 +92,11 @@ def collect_case_review_metrics(case_outdir: str | Path) -> dict[str, object]:
     """Collect the per-case metrics used by `review.json`."""
 
     case_outdir = Path(case_outdir)
-    chain_inventory = _read_json(case_outdir / "final" / "chain_inventory.json")
-    tight_multimers = _read_json(case_outdir / "final" / "tight_multimers.json")
-    antibody_antigen_complexes = _read_json(case_outdir / "final" / "antibody_antigen_complexes.json")
-    tcr_pmhc_complexes = _read_json(case_outdir / "final" / "tcr_pmhc_complexes.json")
+    payload = load_case_output_bundle(case_outdir)
+    chain_inventory = payload["chain_inventory"]
+    tight_multimers = payload["tight_multimers"]
+    antibody_antigen_complexes = payload["antibody_antigen_complexes"]
+    tcr_pmhc_complexes = payload["tcr_pmhc_complexes"]
 
     antibody_chains = [
         chain for chain in chain_inventory if chain.get("chain_type") in ANTIBODY_CHAIN_TYPES
@@ -385,6 +383,18 @@ def _render_record_details(items: list[dict[str, object]], *, empty_message: str
     return "".join(blocks)
 
 
+def _render_limited_record_details(
+    items: list[dict[str, object]],
+    *,
+    empty_message: str,
+    limit: int,
+    omitted_message: str,
+) -> str:
+    if len(items) > limit:
+        return f"<p class='muted'>{html.escape(omitted_message)}</p>"
+    return _render_record_details(items, empty_message=empty_message)
+
+
 def _render_priority_groups(priority_cases: dict[str, object]) -> str:
     groups = []
     for group_name, raw_items in priority_cases.items():
@@ -428,6 +438,17 @@ def build_batch_html_report(
     skipped_reason_counts = review.get("skipped_target_counts_by_reason", {})
     skipped_reason_table = _render_metric_table(
         skipped_reason_counts if isinstance(skipped_reason_counts, dict) else {}
+    )
+    skipped_target_items = skipped_targets if isinstance(skipped_targets, list) else []
+    skipped_target_details = _render_limited_record_details(
+        skipped_target_items,
+        empty_message="No skipped targets.",
+        limit=HTML_SKIPPED_TARGET_DETAIL_LIMIT,
+        omitted_message=(
+            f"Skipped target details omitted because {len(skipped_target_items)} targets exceed "
+            f"the HTML detail limit of {HTML_SKIPPED_TARGET_DETAIL_LIMIT}. "
+            "Use review.json.gz for the full skipped target list."
+        ),
     )
 
     return f"""<!DOCTYPE html>
@@ -578,7 +599,7 @@ def build_batch_html_report(
     </details>
     <details class="section">
       <summary>Skipped Targets <span class="count">{len(skipped_targets) if isinstance(skipped_targets, list) else 0}</span></summary>
-      {_render_record_details(skipped_targets if isinstance(skipped_targets, list) else [], empty_message="No skipped targets.")}
+      {skipped_target_details}
     </details>
     <details class="section">
       <summary>Failed Targets <span class="count">{len(failed_targets) if isinstance(failed_targets, list) else 0}</span></summary>

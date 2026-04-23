@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["biological_assembly", "asymmetric_unit"],
+        default=["largest_assembly", "asymmetric_unit"],
         help="Assembly modes to run sequentially",
     )
     return parser

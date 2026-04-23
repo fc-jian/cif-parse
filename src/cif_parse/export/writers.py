@@ -7,12 +7,19 @@ from pathlib import Path
 from typing import Any
 
 
-def dump_json(path: str | Path, payload: Any, *, indent: int = 2) -> Path:
+def dump_json(path: str | Path, payload: Any, *, indent: int | None = 2) -> Path:
     """Write one JSON document and return the resolved output path."""
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, ensure_ascii=False, indent=indent) + "\n"
+    text = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=indent,
+        separators=(",", ":") if indent is None else None,
+    )
+    if indent is not None:
+        text += "\n"
     if output_path.suffix == ".gz":
         with gzip.open(output_path, "wt", encoding="utf-8") as handle:
             handle.write(text)

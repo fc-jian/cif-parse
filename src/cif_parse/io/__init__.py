@@ -7,6 +7,7 @@ from .cif_reader import (
     read_assembly_copy_numbers,
     read_chain_inventory,
     read_cif_file,
+    select_largest_polymer_assembly_id,
     read_structure_preflight,
     read_structure_summary,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "read_assembly_copy_numbers",
     "read_chain_inventory",
     "read_cif_file",
+    "select_largest_polymer_assembly_id",
     "read_structure_preflight",
     "read_structure_summary",
 ]

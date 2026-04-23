@@ -214,6 +214,55 @@ def count_oper_expression_copies(oper_expression: str | None) -> int:
     return len(expand_oper_expression(oper_expression))
 
 
+def _assembly_sort_key(assembly_id: str) -> tuple[int, int | str]:
+    if assembly_id.isdigit():
+        return (0, int(assembly_id))
+    return (1, assembly_id)
+
+
+def select_largest_polymer_assembly_id(cif_file: CIFFile) -> str | None:
+    rows = _category_rows(cif_file, "pdbx_struct_assembly_gen")
+    available_assembly_ids = sorted(
+        {
+            row["assembly_id"]
+            for row in rows
+            if row.get("assembly_id") is not None
+        },
+        key=_assembly_sort_key,
+    )
+    if not available_assembly_ids:
+        return None
+
+    entity_map = _build_entity_map(cif_file)
+    polymer_asym_ids = {
+        row["id"]
+        for row in _category_rows(cif_file, "struct_asym")
+        if row.get("id")
+        and row.get("entity_id")
+        and str(entity_map.get(str(row["entity_id"]), {}).get("entity_type") or "").lower() == "polymer"
+    }
+    if not polymer_asym_ids:
+        return available_assembly_ids[0]
+
+    polymer_counts = {assembly_id: 0 for assembly_id in available_assembly_ids}
+    for row in rows:
+        assembly_id = row.get("assembly_id")
+        asym_id_list = row.get("asym_id_list")
+        if assembly_id is None or asym_id_list is None:
+            continue
+        polymer_member_count = sum(
+            1
+            for asym_id in (part.strip() for part in asym_id_list.split(","))
+            if asym_id and asym_id in polymer_asym_ids
+        )
+        polymer_counts[assembly_id] += polymer_member_count * count_oper_expression_copies(row.get("oper_expression"))
+
+    return sorted(
+        available_assembly_ids,
+        key=lambda assembly_id: (-polymer_counts.get(assembly_id, 0), _assembly_sort_key(assembly_id)),
+    )[0]
+
+
 def read_assembly_chain_operations(
     path: str | Path,
     assembly_id: str | None = None,
@@ -230,7 +279,7 @@ def read_assembly_chain_operations(
         for row in rows
         if row.get("assembly_id") is not None
     ]
-    selected_assembly_id = assembly_id or (sorted(set(available_assembly_ids))[0] if available_assembly_ids else None)
+    selected_assembly_id = assembly_id or select_largest_polymer_assembly_id(cif_file)
     if selected_assembly_id is None:
         return None, {}
 

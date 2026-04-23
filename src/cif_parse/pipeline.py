@@ -13,7 +13,7 @@ from cif_parse.assemble import (
     identify_tight_multimers,
     identify_tcr_pmhc_complexes,
 )
-from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
+from cif_parse.export import build_single_json_bundle, dump_csv_rows, dump_json, dump_jsonl, dump_single_json_bundle
 from cif_parse.io import (
     read_assembly_chain_operations,
     read_assembly_copy_numbers,
@@ -148,6 +148,7 @@ def write_single_outputs(
     if settings.output_format == "json":
         return _write_single_outputs_json(
             output_dir,
+            settings,
             summary,
             chain_inventory,
             partitions,
@@ -248,10 +249,14 @@ def process_single_structure(
         chain_inventory,
         dimer_interfaces,
         assembly_mode=settings.assembly_mode,
-        assembly_copy_numbers=assembly_copy_numbers if settings.assembly_mode == "biological_assembly" else {},
+        assembly_copy_numbers=assembly_copy_numbers if settings.assembly_mode == "largest_assembly" else {},
         assembly_chain_operations=(
-            assembly_chain_operations if settings.assembly_mode == "biological_assembly" else {}
+            assembly_chain_operations if settings.assembly_mode == "largest_assembly" else {}
         ),
+        min_buried_area=settings.tight_multimer_min_buried_area,
+        louvain_resolution=settings.tight_multimer_louvain_resolution,
+        min_member_instances=settings.tight_multimer_min_member_instances,
+        large_component_warning_size=settings.tight_multimer_large_component_warning_size,
     )
     antibody_antigen_complexes = identify_antibody_antigen_complexes(
         chain_inventory,
@@ -298,6 +303,7 @@ def process_single_structure(
 
 def _write_single_outputs_json(
     outdir: Path,
+    settings: AppSettings,
     summary: Any,
     chain_inventory: list[Any],
     partitions: dict[str, list[Any]],
@@ -306,41 +312,47 @@ def _write_single_outputs_json(
     antibody_antigen_complexes: list[Any],
     tcr_pmhc_complexes: list[Any],
 ) -> list[str]:
+    if not settings.debug:
+        bundle = build_single_json_bundle(
+            summary=summary,
+            chain_inventory=chain_inventory,
+            partitions=partitions,
+            dimer_interfaces=dimer_interfaces,
+            tight_multimers=tight_multimers,
+            antibody_antigen_complexes=antibody_antigen_complexes,
+            tcr_pmhc_complexes=tcr_pmhc_complexes,
+        )
+        return [str(dump_single_json_bundle(outdir / "result.json.gz", bundle))]
+
     output_paths = [
-        str(dump_json(outdir / "final" / "structure_summary.json", summary.to_dict())),
+        str(dump_json(outdir / "structure_summary.json", summary.to_dict())),
         str(
             dump_json(
-                outdir / "final" / "chain_inventory.json",
-                [chain.to_dict() for chain in chain_inventory],
-            )
-        ),
-        str(
-            dump_jsonl(
-                outdir / "debug" / "chain_annotations.jsonl",
+                outdir / "chain_inventory.json",
                 [chain.to_dict() for chain in chain_inventory],
             )
         ),
         str(
             dump_json(
-                outdir / "final" / "dimer_interfaces.json",
+                outdir / "dimer_interfaces.json",
                 [dimer.to_dict() for dimer in dimer_interfaces],
             )
         ),
         str(
             dump_json(
-                outdir / "final" / "tight_multimers.json",
+                outdir / "tight_multimers.json",
                 [multimer.to_dict() for multimer in tight_multimers],
             )
         ),
         str(
             dump_json(
-                outdir / "final" / "antibody_antigen_complexes.json",
+                outdir / "antibody_antigen_complexes.json",
                 [complex_record.to_dict() for complex_record in antibody_antigen_complexes],
             )
         ),
         str(
             dump_json(
-                outdir / "final" / "tcr_pmhc_complexes.json",
+                outdir / "tcr_pmhc_complexes.json",
                 [complex_record.to_dict() for complex_record in tcr_pmhc_complexes],
             )
         ),
@@ -349,7 +361,7 @@ def _write_single_outputs_json(
         output_paths.append(
             str(
                 dump_json(
-                    outdir / "final" / f"{output_name}.json",
+                    outdir / f"{output_name}.json",
                     [chain.to_dict() for chain in chains],
                 )
             )

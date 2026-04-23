@@ -471,8 +471,8 @@ def identify_tcr_pmhc_complexes(
                         "contact_score_metric": "sum_buried_area_over_direct_tcr_pmhc_dimers",
                         "source_interface_stage": "dimer_interface_v2_assembly_instances",
                         "source_chain_annotation_files": [
-                            "final/protein_chains.json",
-                            "final/chain_inventory.json",
+                            "protein_chains",
+                            "chain_inventory",
                         ],
                         "contextual_peptide_chain_ids": contextual_peptide_chain_ids,
                         "supporting_multimer_ids": _supporting_multimer_ids(

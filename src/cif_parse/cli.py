@@ -156,7 +156,7 @@ def _add_runtime_args(
     parser.add_argument(
         "--assembly-mode",
         choices=sorted(SUPPORTED_ASSEMBLY_MODES),
-        default=str(settings_defaults.get("assembly_mode", "biological_assembly")),
+        default=str(settings_defaults.get("assembly_mode", "asymmetric_unit")),
         help="Assembly mode recorded in settings metadata",
     )
     parser.add_argument(
@@ -164,6 +164,12 @@ def _add_runtime_args(
         choices=sorted(SUPPORTED_COVERAGE_MODES),
         default=str(settings_defaults.get("coverage_mode", "nearest")),
         help="Coverage mode recorded in settings metadata",
+    )
+    parser.add_argument(
+        "--debug",
+        action=argparse.BooleanOptionalAction,
+        default=bool(settings_defaults.get("debug", False)),
+        help="For JSON output, keep split per-artifact JSON files instead of one compact result.json.gz bundle",
     )
     parser.add_argument(
         "--log-level",
@@ -184,6 +190,32 @@ def _add_runtime_args(
         help="Skip structures unless at least one polymer chain has length > this threshold",
     )
     parser.add_argument(
+        "--tight-multimer-min-buried-area",
+        type=float,
+        default=float(settings_defaults.get("tight_multimer_min_buried_area", 500.0)),
+        help="Minimum buried area required to keep a dimer edge in the tight-multimer graph",
+    )
+    parser.add_argument(
+        "--tight-multimer-louvain-resolution",
+        "--tight-multimer-leiden-resolution",
+        dest="tight_multimer_louvain_resolution",
+        type=float,
+        default=float(settings_defaults.get("tight_multimer_louvain_resolution", 1.0)),
+        help="Resolution parameter for tight-multimer Louvain community detection",
+    )
+    parser.add_argument(
+        "--tight-multimer-min-member-instances",
+        type=int,
+        default=int(settings_defaults.get("tight_multimer_min_member_instances", 2)),
+        help="Minimum Louvain community size in instance nodes for exporting a tight multimer",
+    )
+    parser.add_argument(
+        "--tight-multimer-large-component-warning-size",
+        type=int,
+        default=int(settings_defaults.get("tight_multimer_large_component_warning_size", 8)),
+        help="Add a large-component warning when a tight multimer reaches this many instance nodes",
+    )
+    parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
         default=bool(settings_defaults.get("verbose", False)),
@@ -198,6 +230,7 @@ def _settings_from_args(args: argparse.Namespace) -> AppSettings:
         output_format=args.format,
         assembly_mode=args.assembly_mode,
         coverage_mode=args.coverage_mode,
+        debug=args.debug,
         log_level=args.log_level,
         verbose=args.verbose,
         model=args.model,
@@ -205,6 +238,10 @@ def _settings_from_args(args: argparse.Namespace) -> AppSettings:
         drop_hydrogens_for_analysis=args.drop_hydrogens_for_analysis,
         max_polymer_chains=args.max_polymer_chains,
         min_polymer_chain_length=args.min_polymer_chain_length,
+        tight_multimer_min_buried_area=args.tight_multimer_min_buried_area,
+        tight_multimer_louvain_resolution=args.tight_multimer_louvain_resolution,
+        tight_multimer_min_member_instances=args.tight_multimer_min_member_instances,
+        tight_multimer_large_component_warning_size=args.tight_multimer_large_component_warning_size,
     )
 
 
@@ -358,12 +395,17 @@ def _print_single_result(settings: AppSettings, outdir: Path, result: dict[str, 
                         "output_format": settings.output_format,
                         "assembly_mode": settings.assembly_mode,
                         "coverage_mode": settings.coverage_mode,
+                        "debug": settings.debug,
                         "log_level": settings.log_level,
                         "max_polymer_chains": settings.max_polymer_chains,
                         "min_polymer_chain_length": settings.min_polymer_chain_length,
                         "model": settings.model,
                         "use_author_fields": settings.use_author_fields,
                         "drop_hydrogens_for_analysis": settings.drop_hydrogens_for_analysis,
+                        "tight_multimer_min_buried_area": settings.tight_multimer_min_buried_area,
+                        "tight_multimer_louvain_resolution": settings.tight_multimer_louvain_resolution,
+                        "tight_multimer_min_member_instances": settings.tight_multimer_min_member_instances,
+                        "tight_multimer_large_component_warning_size": settings.tight_multimer_large_component_warning_size,
                     },
                     **result,
                 },
@@ -394,12 +436,17 @@ def _print_batch_result(
                         "output_format": settings.output_format,
                         "assembly_mode": settings.assembly_mode,
                         "coverage_mode": settings.coverage_mode,
+                        "debug": settings.debug,
                         "log_level": settings.log_level,
                         "max_polymer_chains": settings.max_polymer_chains,
                         "min_polymer_chain_length": settings.min_polymer_chain_length,
                         "model": settings.model,
                         "use_author_fields": settings.use_author_fields,
                         "drop_hydrogens_for_analysis": settings.drop_hydrogens_for_analysis,
+                        "tight_multimer_min_buried_area": settings.tight_multimer_min_buried_area,
+                        "tight_multimer_louvain_resolution": settings.tight_multimer_louvain_resolution,
+                        "tight_multimer_min_member_instances": settings.tight_multimer_min_member_instances,
+                        "tight_multimer_large_component_warning_size": settings.tight_multimer_large_component_warning_size,
                     },
                     "manifest_path": str(manifest_path),
                     "summary_path": str(summary_path),
@@ -480,6 +527,7 @@ def main(argv: list[str] | None = None) -> int:
         "output_format": settings.output_format,
         "assembly_mode": settings.assembly_mode,
         "coverage_mode": settings.coverage_mode,
+        "debug": settings.debug,
         "log_level": settings.log_level,
         "verbose": settings.verbose,
         "model": settings.model,
@@ -487,6 +535,10 @@ def main(argv: list[str] | None = None) -> int:
         "drop_hydrogens_for_analysis": settings.drop_hydrogens_for_analysis,
         "max_polymer_chains": settings.max_polymer_chains,
         "min_polymer_chain_length": settings.min_polymer_chain_length,
+        "tight_multimer_min_buried_area": settings.tight_multimer_min_buried_area,
+        "tight_multimer_louvain_resolution": settings.tight_multimer_louvain_resolution,
+        "tight_multimer_min_member_instances": settings.tight_multimer_min_member_instances,
+        "tight_multimer_large_component_warning_size": settings.tight_multimer_large_component_warning_size,
     }
     tasks = [
         {

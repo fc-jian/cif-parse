@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+import networkx as nx
+
 from cif_parse.models import TightMultimerRecord
 
 
@@ -24,6 +26,14 @@ def _multimer_type(member_entity_ids: list[str], num_member_instances: int) -> s
     if len(set(member_entity_ids)) == 1:
         return "homomultimer"
     return "heteromultimer"
+
+
+def _instance_assembly_id(instance_id: str, fallback: str | None) -> str | None:
+    if ":" in instance_id:
+        prefix, _ = instance_id.split(":", 1)
+        if prefix:
+            return prefix
+    return fallback
 
 
 def _contains_antibody_unit(member_chain_types: list[str]) -> bool:
@@ -101,6 +111,31 @@ def _deduplicate_tight_multimers(multimers: list[TightMultimerRecord]) -> list[T
     )
 
 
+def _detect_communities(
+    graph: nx.Graph,
+    *,
+    resolution: float,
+    min_member_instances: int,
+) -> tuple[list[list[str]], str]:
+    if graph.number_of_edges() == 0:
+        return [], "none"
+
+    communities = nx.community.louvain_communities(
+        graph,
+        weight="weight",
+        resolution=resolution,
+        seed=0,
+    )
+
+    normalized = [
+        sorted(community)
+        for community in communities
+        if len(community) >= min_member_instances
+    ]
+    normalized.sort(key=tuple)
+    return normalized, "louvain_communities"
+
+
 def identify_tight_multimers(
     chain_inventory: list,
     dimer_interfaces: list,
@@ -108,21 +143,21 @@ def identify_tight_multimers(
     assembly_mode: str,
     assembly_copy_numbers: dict[str, int] | None = None,
     assembly_chain_operations: dict[str, list[str]] | None = None,
+    min_buried_area: float = 500.0,
+    louvain_resolution: float = 1.0,
+    min_member_instances: int = 2,
+    large_component_warning_size: int = 8,
 ) -> list[TightMultimerRecord]:
     chain_map = {chain.label_asym_id: chain for chain in chain_inventory}
     assembly_copy_numbers = assembly_copy_numbers or {}
     assembly_chain_operations = assembly_chain_operations or {}
-    adjacency: dict[str, set[str]] = defaultdict(set)
+    graph = nx.Graph()
     edge_map: dict[tuple[str, str], object] = {}
     instance_metadata: dict[str, dict[str, object]] = {}
 
     for dimer in dimer_interfaces:
         instance_id_1 = dimer.instance_id_1 or dimer.label_asym_id_1
         instance_id_2 = dimer.instance_id_2 or dimer.label_asym_id_2
-        edge = tuple(sorted((instance_id_1, instance_id_2)))
-        edge_map[edge] = dimer
-        adjacency[edge[0]].add(edge[1])
-        adjacency[edge[1]].add(edge[0])
         instance_metadata[instance_id_1] = {
             "instance_id": instance_id_1,
             "label_asym_id": dimer.label_asym_id_1,
@@ -130,7 +165,7 @@ def identify_tight_multimers(
             "entity_id": dimer.entity_id_1,
             "chain_type": dimer.chain_type_1,
             "sym_id": dimer.sym_id_1,
-            "assembly_id": dimer.assembly_id,
+            "assembly_id": _instance_assembly_id(instance_id_1, dimer.assembly_id),
         }
         instance_metadata[instance_id_2] = {
             "instance_id": instance_id_2,
@@ -139,29 +174,25 @@ def identify_tight_multimers(
             "entity_id": dimer.entity_id_2,
             "chain_type": dimer.chain_type_2,
             "sym_id": dimer.sym_id_2,
-            "assembly_id": dimer.assembly_id,
+            "assembly_id": _instance_assembly_id(instance_id_2, dimer.assembly_id),
         }
-
-    visited: set[str] = set()
-    components: list[list[str]] = []
-    for start in sorted(adjacency):
-        if start in visited:
+        buried_area = float(dimer.buried_area or 0.0)
+        if buried_area < min_buried_area:
             continue
+        edge = tuple(sorted((instance_id_1, instance_id_2)))
+        edge_map[edge] = dimer
+        graph.add_edge(
+            edge[0],
+            edge[1],
+            weight=buried_area / 1000.0,
+            buried_area=buried_area,
+        )
 
-        stack = [start]
-        component: list[str] = []
-        visited.add(start)
-        while stack:
-            current = stack.pop()
-            component.append(current)
-            for neighbor in sorted(adjacency[current]):
-                if neighbor in visited:
-                    continue
-                visited.add(neighbor)
-                stack.append(neighbor)
-
-        if len(component) >= 2:
-            components.append(sorted(component))
+    components, clustering_method = _detect_communities(
+        graph,
+        resolution=louvain_resolution,
+        min_member_instances=min_member_instances,
+    )
 
     multimers: list[TightMultimerRecord] = []
     for index, component in enumerate(components, start=1):
@@ -222,12 +253,13 @@ def identify_tight_multimers(
                         "auth_asym_id": chain.auth_asym_id,
                         "entity_id": chain.entity_id,
                         "chain_type": chain.chain_type,
+                        "assembly_id": instance.get("assembly_id"),
                         "operation_id": operation_id,
                         "copy_ordinal": copy_ordinal,
                     }
                 )
         warnings: list[str] = []
-        if len(component) >= 8:
+        if len(component) >= large_component_warning_size:
             warnings.append("large_component_without_bridge_pruning")
 
         support_score = (
@@ -259,16 +291,23 @@ def identify_tight_multimers(
                 contains_antibody_unit=_contains_antibody_unit(member_chain_types),
                 contains_tcr_pmhc_unit=_contains_tcr_pmhc_unit(member_chain_types),
                 evidence={
-                    "stage": "tight_multimer_v1",
-                    "graph_rule": "connected_components_over_instance_level_dimer_interfaces",
+                    "stage": "tight_multimer_v2",
+                    "graph_rule": "weighted_instance_level_dimer_graph_with_louvain_communities",
                     "source_interface_stage": "dimer_interface_v2_assembly_instances",
                     "support_score_metric": "average_atom_contacts_per_internal_edge",
+                    "edge_min_buried_area": min_buried_area,
+                    "edge_weight_metric": "buried_area / 1000.0",
+                    "community_detection_method": clustering_method,
+                    "community_detection_resolution": louvain_resolution,
                     "bridge_pruning_applied": False,
+                    "min_member_instances": min_member_instances,
+                    "large_component_warning_size": large_component_warning_size,
                     "member_instance_source": "dimer_interface_instances",
                     "member_copy_number_source": (
                         "pdbx_struct_assembly_gen" if assembly_copy_numbers else "default_one"
                     ),
                     "component_assembly_ids": component_assembly_ids,
+                    "graph_edge_count_after_buried_area_filter": graph.number_of_edges(),
                     "internal_edges": [list(edge) for edge in sorted(internal_edges)],
                 },
                 warnings=warnings,

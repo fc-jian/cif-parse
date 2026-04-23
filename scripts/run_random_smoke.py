@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import shutil
 from collections import Counter
@@ -12,8 +11,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from cif_parse.cli import main as cli_main
-from cif_parse.export import dump_json
+from cif_parse.export import dump_json, load_case_output_bundle
 from cif_parse.reporting import build_batch_html_report
+from cif_parse.settings import SUPPORTED_ASSEMBLY_MODES
 
 
 PROTEIN_CHAIN_TYPES = frozenset(
@@ -72,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=20260416,
         help="Random seed for reproducible sampling",
     )
+    parser.add_argument(
+        "--assembly-mode",
+        choices=sorted(SUPPORTED_ASSEMBLY_MODES),
+        default="asymmetric_unit",
+        help="Assembly mode forwarded to cif-parse single",
+    )
     return parser
 
 
@@ -90,10 +96,6 @@ def _resolve_input_path(input_dir: Path, pdb_id: str) -> Path | None:
         if candidate.exists():
             return candidate
     return None
-
-
-def _read_json(path: Path) -> dict | list:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _antibody_analysis(chain: dict[str, object]) -> dict[str, object]:
@@ -175,12 +177,13 @@ def _warning_counts(records: list[dict[str, object]]) -> dict[str, int]:
 
 
 def _case_metrics(case_outdir: Path) -> dict[str, object]:
-    summary = _read_json(case_outdir / "final" / "structure_summary.json")
-    chain_inventory = _read_json(case_outdir / "final" / "chain_inventory.json")
-    dimers = _read_json(case_outdir / "final" / "dimer_interfaces.json")
-    multimers = _read_json(case_outdir / "final" / "tight_multimers.json")
-    antibody_antigen_complexes = _read_json(case_outdir / "final" / "antibody_antigen_complexes.json")
-    tcr_pmhc_complexes = _read_json(case_outdir / "final" / "tcr_pmhc_complexes.json")
+    payload = load_case_output_bundle(case_outdir)
+    summary = payload["structure_summary"]
+    chain_inventory = payload["chain_inventory"]
+    dimers = payload["dimer_interfaces"]
+    multimers = payload["tight_multimers"]
+    antibody_antigen_complexes = payload["antibody_antigen_complexes"]
+    tcr_pmhc_complexes = payload["tcr_pmhc_complexes"]
 
     num_dimers = len(dimers)
     num_multimers = len(multimers)
@@ -822,6 +825,7 @@ def main() -> int:
         "count": len(sampled_files),
         "input_dir": str(args.input_dir.resolve()),
         "id_list": str(args.id_list.resolve()) if args.id_list is not None else None,
+        "assembly_mode": args.assembly_mode,
         "requested_ids": list_ids or [],
         "missing_ids": missing_ids if args.id_list is not None else [],
         "sampled_files": [str(path.resolve()) for path in sampled_files],
@@ -840,6 +844,8 @@ def main() -> int:
                     str(case_outdir),
                     "--format",
                     "json",
+                    "--assembly-mode",
+                    args.assembly_mode,
                 ]
             )
             result = {
