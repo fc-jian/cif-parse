@@ -156,7 +156,7 @@ def _add_runtime_args(
     parser.add_argument(
         "--assembly-mode",
         choices=sorted(SUPPORTED_ASSEMBLY_MODES),
-        default=str(settings_defaults.get("assembly_mode", "asymmetric_unit")),
+        default=str(settings_defaults.get("assembly_mode", "largest_assembly")),
         help="Assembly mode recorded in settings metadata",
     )
     parser.add_argument(

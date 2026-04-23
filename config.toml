@@ -13,7 +13,7 @@ output_format = "json"
 # - "asymmetric_unit": analyze the deposited asymmetric unit directly.
 # - "largest_assembly": choose the assembly containing the most polymer chain
 #   instances; ties are resolved by the lowest/earliest assembly id.
-assembly_mode = "asymmetric_unit"
+assembly_mode = "largest_assembly"
 
 # Method for assigning observed coordinates to polymer sequence positions.
 # Options:
@@ -37,16 +37,6 @@ log_level = "INFO"
 # Print verbose JSON summaries from CLI commands instead of only output paths.
 # Options: true, false.
 verbose = false
-
-# 1-based model index to read from multi-model mmCIF files.
-# Allowed values: integer >= 1.
-model = 1
-
-# Use author coordinate identifiers when reading atom arrays.
-# Options:
-# - false: use label_asym_id/label_seq_id internally; recommended default.
-# - true: use auth_asym_id/auth_seq_id when constructing structure arrays.
-use_author_fields = false
 
 # Remove hydrogen atoms before downstream coverage/interface calculations.
 # Options:
