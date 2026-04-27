@@ -12,7 +12,7 @@ conda activate cif-parse
 pip install -e .
 ```
 
-The clustering workflow expects `USalign` on `PATH` when structure clustering is enabled. Protein sequence clustering with `--protein-sequence-mode mmseqs2` also expects `mmseqs` on `PATH`.
+The clustering workflow uses `USalign` for structure refinement and `mmseqs` for the default protein sequence clustering mode. Both are included in the recommended Conda environment.
 
 ## Parse mmCIF Files
 
