@@ -13,6 +13,7 @@ dependencies:
   - networkx>=3.6,<4
   - mmseqs2
   - usalign
+  - tqdm
   - biopython>=1.85,<2
   - pyhmmer>=0.11,<1
   - rdkit>=2026.03

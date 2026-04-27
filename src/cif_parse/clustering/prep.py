@@ -127,24 +127,28 @@ def _ensure_schema(db_path: Path) -> sqlite3.Connection:
 
 def _ingest_one_case(
     case_dir: Path,
-    conn: sqlite3.Connection,
+    db_path: Path,
     cif_files_directory: str | None = None,
 ) -> dict[str, Any]:
     """Ingest a single case-output directory into the database.
 
-    Returns a summary dict with counts, or raises on fatal errors.
+    Each call opens its own SQLite connection so that it is safe to use
+    across threads.  Returns a summary dict with counts, or raises on fatal errors.
     """
     case_id = case_dir.name
     content_hash = _hash_case_dir(case_dir)
+    conn = sqlite3.connect(str(db_path))
 
     # Check if already ingested with the same hash → skip
     cur = conn.execute("SELECT content_hash FROM prep_meta WHERE case_dir = ?", (str(case_dir.resolve()),))
     row = cur.fetchone()
     if row is not None and row[0] == content_hash:
+        conn.close()
         return {"case_id": case_id, "status": "skipped", "reason": "unchanged"}
 
     bundles = load_case_output_bundles(case_dir)
     if not bundles:
+        conn.close()
         return {"case_id": case_id, "status": "skipped", "reason": "no_bundles"}
 
     ingested_bundles = 0
@@ -176,6 +180,8 @@ def _ingest_one_case(
         "INSERT OR REPLACE INTO prep_meta(case_dir, content_hash, ingested_at) VALUES (?, ?, ?)",
         (str(case_dir.resolve()), content_hash, time.time()),
     )
+    conn.commit()
+    conn.close()
 
     return {
         "case_id": case_id,
@@ -214,7 +220,7 @@ def build_prep_database(
     case_dirs = discover_case_output_dirs(inputs)
     LOGGER.info("Prepping %d case directories into %s", len(case_dirs), db_path)
 
-    conn = _ensure_schema(db_path)
+    _ensure_schema(db_path)  # ensure schema exists, then close (each worker opens its own)
 
     # Phase 1: ingest all case bundles into `bundles` table
     all_source_paths: set[str] = set()
@@ -225,7 +231,7 @@ def build_prep_database(
     if prep_jobs <= 1 or len(case_dirs) <= 1:
         for case_dir in tqdm(case_dirs, desc="Ingesting case bundles", unit="case"):
             try:
-                result = _ingest_one_case(case_dir, conn, cif_files_directory)
+                result = _ingest_one_case(case_dir, db_path, cif_files_directory)
                 if result["status"] == "ingested":
                     stats["ingested"] += 1
                     all_source_paths.update(result.get("source_paths", []))
@@ -241,7 +247,7 @@ def build_prep_database(
 
         def _ingest(case_dir: Path) -> dict[str, Any]:
             try:
-                return _ingest_one_case(case_dir, conn, cif_files_directory)
+                return _ingest_one_case(case_dir, db_path, cif_files_directory)
             except Exception as exc:
                 LOGGER.warning("Failed to ingest case %s: %s", case_dir, exc)
                 return {"case_id": case_dir.name, "status": "error", "error": str(exc)}
@@ -257,8 +263,6 @@ def build_prep_database(
                 failures.append({"case_dir": result.get("case_id", ""), "error": result.get("error", "")})
             else:
                 stats["skipped_no_bundles"] += 1
-
-    conn.commit()
     LOGGER.info(
         "Phase 1 complete (%.1fs): %d ingested, %d skipped (unchanged), %d no-bundles, %d unique source paths",
         time.monotonic() - t0,
@@ -274,12 +278,14 @@ def build_prep_database(
         t1 = time.monotonic()
         LOGGER.info("Phase 2: caching %d mmCIF source files", len(all_source_paths))
 
+        conn2 = sqlite3.connect(str(db_path))
         # collect all (source_path, assembly_id) pairs needed
-        cur = conn.execute("SELECT DISTINCT source_path, assembly_id FROM bundles WHERE source_path != ''")
+        cur = conn2.execute("SELECT DISTINCT source_path, assembly_id FROM bundles WHERE source_path != ''")
         cache_keys: set[tuple[str, str]] = set()
         for source_path, assembly_id in cur.fetchall():
             if source_path in all_source_paths:
                 cache_keys.add((source_path, assembly_id or None))
+        conn2.close()
 
         if cache_keys:
             from biotite.structure.io.pdbx import get_assembly, get_structure
@@ -289,9 +295,11 @@ def build_prep_database(
                 source_path, assembly_id = args
                 cache_key = f"{source_path}__{assembly_id or ''}"
                 source_hash = _hash_source_mtime(source_path)
-                cur2 = conn.execute("SELECT source_hash FROM cif_cache WHERE cache_key = ?", (cache_key,))
+                tconn = sqlite3.connect(str(db_path))
+                cur2 = tconn.execute("SELECT source_hash FROM cif_cache WHERE cache_key = ?", (cache_key,))
                 row = cur2.fetchone()
                 if row is not None and row[0] == source_hash:
+                    tconn.close()
                     return {"cache_key": cache_key, "status": "skipped"}
                 try:
                     cif_file = read_cif_file(source_path)
@@ -300,21 +308,27 @@ def build_prep_database(
                         atom_array = get_assembly(cif_file, assembly_id=assembly_id, model=1, use_author_fields=False)
                     else:
                         atom_array = get_structure(cif_file, model=1, use_author_fields=False)
-                    # Only cache if atom_array is non-empty
                     if atom_array is not None and len(atom_array) > 0:
                         atom_blob = pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL)
                         chain_ops_json = _read_chain_ops_json(source_path, assembly_id)
-                        conn.execute(
+                        tconn.execute(
                             "INSERT OR REPLACE INTO cif_cache(source_path, assembly_id, cache_key, source_hash, "
                             "atom_array_blob, quality_json, chain_ops_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (source_path, assembly_id, cache_key, source_hash, atom_blob,
                              json.dumps(quality_metadata) if quality_metadata else None,
                              chain_ops_json),
                         )
+                        tconn.commit()
+                        tconn.close()
                         return {"cache_key": cache_key, "status": "cached"}
+                    tconn.close()
                     return {"cache_key": cache_key, "status": "empty"}
                 except Exception as exc:
                     LOGGER.warning("Failed to cache mmCIF %s (assembly=%s): %s", source_path, assembly_id, exc)
+                    try:
+                        tconn.close()
+                    except Exception:
+                        pass
                     return {"cache_key": cache_key, "status": "error", "error": str(exc)}
 
             cache_items = sorted(cache_keys)
@@ -334,18 +348,17 @@ def build_prep_database(
                         cif_stats["cached"] += 1
                     else:
                         cif_stats["skipped"] += 1
-                conn.commit()
 
         LOGGER.info("Phase 2 complete (%.1fs): %d cached, %d skipped",
                     time.monotonic() - t1, cif_stats["cached"], cif_stats["skipped"])
 
-    conn.commit()
-
     # Final manifest
-    cur = conn.execute("SELECT COUNT(*) FROM bundles")
+    conn_final = sqlite3.connect(str(db_path))
+    cur = conn_final.execute("SELECT COUNT(*) FROM bundles")
     total_bundles = cur.fetchone()[0]
-    cur = conn.execute("SELECT COUNT(DISTINCT source_path) FROM bundles WHERE source_path != ''")
+    cur = conn_final.execute("SELECT COUNT(DISTINCT source_path) FROM bundles WHERE source_path != ''")
     total_source_paths = cur.fetchone()[0]
+    conn_final.close()
 
     elapsed = time.monotonic() - t0
     LOGGER.info("Prep database built (%.1fs): %d bundles, %d source paths, %d failures",

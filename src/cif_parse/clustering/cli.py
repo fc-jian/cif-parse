@@ -90,7 +90,7 @@ def build_parser(
         "--inputs",
         nargs="+",
         type=Path,
-        required=True,
+        default=None,
         help="One or more case-output directories or parents containing case-output directories",
     )
     parser.add_argument(
@@ -302,6 +302,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         LOGGER.info("Prep complete: %s", result)
         return 0
+
+    if args.inputs is None:
+        parser = build_parser(config_defaults=config_defaults, config_path=config_path)
+        parser.error("--inputs is required for clustering mode (or use 'prep' subcommand)")
 
     for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
         if getattr(args, field_name) < 1:

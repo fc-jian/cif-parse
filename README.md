@@ -58,6 +58,30 @@ Use `--debug` when you need split JSON artifacts for manual inspection. CSV outp
 
 Clustering consumes parsed case outputs, preferably from `--assembly-mode all`. Monomer chains are deduplicated by `(pdb_id, label_asym_id)`, while dimer and higher-level observations keep their assembly-level observations and are clustered afterward.
 
+### Pre-processing (recommended for large inputs)
+
+For large batch outputs (thousands of cases), first build a prep database that consolidates all case bundles and pre-caches mmCIF structures into a single SQLite file:
+
+```bash
+cif-parse-cluster prep \
+  --inputs batch_outputs/cases \
+  --db-path clustering_prep.db \
+  --prep-jobs 8
+```
+
+The prep database uses content hashing for incremental updates — re-running `prep` only processes new or changed cases. Pass `--prep-db` to the clustering command to read from the database instead of individual files:
+
+```bash
+cif-parse-cluster \
+  --inputs batch_outputs/cases \
+  --prep-db clustering_prep.db \
+  --outdir cluster_outputs
+```
+
+When `--prep-db` is not provided, clustering falls back to reading individual `result.json.gz` files directly.
+
+### Running Clustering
+
 Run monomer-only clustering:
 
 ```bash
@@ -93,6 +117,8 @@ Key clustering defaults:
 3. Protein monomer alignment coverage requires `aligned_length / shorter_length >= 0.80`.
 4. Dimer, multimer, antibody-antigen, and TCR-pMHC complex clustering default to signature clustering plus overall `USalign -mm 1 -ter 1` refinement with TM-score threshold `0.50`.
 5. Parallel clustering controls are `--jobs`, `--mmseqs-threads`, `--sequence-cluster-jobs`, and `--usalign-jobs`.
+6. Use `--cif-files-directory` to override the location of original mmCIF files during structure extraction.
+7. Use `--prep-db` to read case bundles from a pre-built SQLite database (built with `cif-parse-cluster prep`).
 
 ## Configuration
 
@@ -121,14 +147,23 @@ The main sections are:
 ## Typical Workflow
 
 ```bash
+# 1. Parse all mmCIF files
 cif-parse batch \
   --input-list input_list.txt \
   --outdir batch_outputs \
   --assembly-mode all \
   --jobs 8
 
+# 2. (Optional but recommended) Build prep database for fast I/O
+cif-parse-cluster prep \
+  --inputs batch_outputs/cases \
+  --db-path clustering_prep.db \
+  --prep-jobs 8
+
+# 3. Run clustering (with prep database if available)
 cif-parse-cluster \
   --inputs batch_outputs/cases \
+  --prep-db clustering_prep.db \
   --outdir cluster_outputs \
   --dimer-mode signature \
   --multimer-mode signature \
