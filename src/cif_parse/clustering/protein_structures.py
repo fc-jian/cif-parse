@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -16,6 +17,7 @@ from biotite.structure.io.pdb import PDBFile
 from biotite.structure.io.pdbx import CIFBlock, CIFCategory, get_structure
 
 from cif_parse.clustering.monomers import MonomerSample
+from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.io import read_cif_file
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
@@ -435,6 +437,8 @@ def greedy_cluster_protein_structures(
     min_alignment_coverage_ratio: float = 0.80,
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
+    sequence_cluster_jobs: int = 1,
+    pairwise_alignment_jobs: int = 1,
 ) -> dict[str, Any]:
     """Perform quality-directed greedy structural clustering inside protein sequence buckets."""
 
@@ -444,7 +448,6 @@ def greedy_cluster_protein_structures(
     outdir.mkdir(parents=True, exist_ok=True)
     runner = alignment_runner or run_usalign_alignment
 
-    alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}
     alignment_rows: list[dict[str, Any]] = []
     membership_out_rows: list[dict[str, Any]] = []
     representative_rows: list[dict[str, Any]] = []
@@ -456,7 +459,21 @@ def greedy_cluster_protein_structures(
     total_sequence_fallback_assignments = 0
     total_all_failure_cluster_collapses = 0
 
-    for sequence_cluster_id, member_ids in sequence_groups.items():
+    pairwise_alignment_jobs = normalize_worker_count(pairwise_alignment_jobs)
+
+    def process_sequence_group(sequence_group: tuple[str, list[str]]) -> dict[str, Any]:
+        sequence_cluster_id, member_ids = sequence_group
+        local_alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}
+        local_alignment_rows: list[dict[str, Any]] = []
+        local_membership_rows: list[dict[str, Any]] = []
+        local_representative_rows: list[dict[str, Any]] = []
+        local_warning_rows: list[dict[str, Any]] = []
+        local_struct_clusters = 0
+        local_alignments = 0
+        local_alignment_failures = 0
+        local_sequence_fallback_assignments = 0
+        local_all_failure_cluster_collapses = 0
+
         candidates = [
             extracted_structures[member_id]
             for member_id in member_ids
@@ -465,9 +482,9 @@ def greedy_cluster_protein_structures(
         if not candidates:
             structure_cluster_id = _protein_structure_cluster_id(sequence_cluster_id, 1)
             representative_monomer_id = member_ids[0]
-            total_struct_clusters += 1
-            total_sequence_fallback_assignments += len(member_ids)
-            warning_rows.append(
+            local_struct_clusters += 1
+            local_sequence_fallback_assignments += len(member_ids)
+            local_warning_rows.append(
                 {
                     "warning_code": "no_extracted_structures_in_sequence_cluster",
                     "sequence_cluster_id": sequence_cluster_id,
@@ -477,7 +494,7 @@ def greedy_cluster_protein_structures(
                 }
             )
             for member_id in member_ids:
-                membership_out_rows.append(
+                local_membership_rows.append(
                     {
                         "polymer_class": "protein",
                         "sequence_cluster_id": sequence_cluster_id,
@@ -491,7 +508,7 @@ def greedy_cluster_protein_structures(
                         "alignment_coverage_shorter": "",
                     }
                 )
-            representative_rows.append(
+            local_representative_rows.append(
                 {
                     "sequence_cluster_id": sequence_cluster_id,
                     "structure_cluster_id": structure_cluster_id,
@@ -505,7 +522,17 @@ def greedy_cluster_protein_structures(
                     "resolution": "",
                 }
             )
-            continue
+            return {
+                "alignment_rows": local_alignment_rows,
+                "membership_rows": local_membership_rows,
+                "representative_rows": local_representative_rows,
+                "warning_rows": local_warning_rows,
+                "num_structure_clusters": local_struct_clusters,
+                "num_alignment_runs": local_alignments,
+                "num_alignment_failures": local_alignment_failures,
+                "num_sequence_fallback_assignments": local_sequence_fallback_assignments,
+                "num_all_failure_sequence_cluster_collapses": local_all_failure_cluster_collapses,
+            }
 
         pending = sorted(candidates, key=lambda item: item.quality_sort_key())
         cluster_states: list[dict[str, Any]] = []
@@ -517,68 +544,90 @@ def greedy_cluster_protein_structures(
         while pending:
             representative = pending[0]
             local_cluster_index += 1
-            total_struct_clusters += 1
+            local_struct_clusters += 1
             structure_cluster_id = _protein_structure_cluster_id(
                 sequence_cluster_id,
                 local_cluster_index,
             )
             assigned = [representative]
             remaining: list[ExtractedMonomerStructure] = []
+
+            alignment_tasks: list[AlignmentTask] = []
             for candidate in pending[1:]:
                 pair_key = tuple(sorted((representative.monomer_id, candidate.monomer_id)))
-                if pair_key not in alignment_cache:
-                    try:
-                        result = runner(
-                            representative,
-                            candidate,
-                            usalign_executable=usalign_executable,
-                            tm_score_threshold=tm_score_threshold,
-                            min_alignment_coverage_ratio=min_alignment_coverage_ratio,
+                if pair_key not in local_alignment_cache:
+                    alignment_tasks.append(
+                        AlignmentTask(
+                            key=pair_key,
+                            query=representative,
+                            target=candidate,
+                            context={"candidate": candidate},
                         )
-                    except Exception as exc:
-                        total_alignment_failures += 1
-                        failed_candidates.append(
-                            {
-                                "candidate": candidate,
-                                "failed_against_representative": representative.monomer_id,
-                                "error": str(exc),
-                            }
-                        )
-                        warning_rows.append(
-                            {
-                                "warning_code": "usalign_failed_sequence_fallback",
-                                "sequence_cluster_id": sequence_cluster_id,
-                                "candidate_monomer_id": candidate.monomer_id,
-                                "representative_monomer_id": representative.monomer_id,
-                                "error": str(exc),
-                            }
-                        )
-                        continue
-                    alignment_cache[pair_key] = result
-                    alignment_rows.append(
+                    )
+
+            successes, failures = run_alignment_tasks(
+                alignment_tasks,
+                runner,
+                max_workers=pairwise_alignment_jobs,
+                usalign_executable=usalign_executable,
+                tm_score_threshold=tm_score_threshold,
+                min_alignment_coverage_ratio=min_alignment_coverage_ratio,
+            )
+            failure_by_candidate_id: dict[str, Exception] = {
+                task.context["candidate"].monomer_id: exc for task, exc in failures
+            }
+            for task, result in successes:
+                local_alignment_cache[task.key] = result
+            success_keys = {task.key for task, _ in successes}
+
+            for candidate in pending[1:]:
+                pair_key = tuple(sorted((representative.monomer_id, candidate.monomer_id)))
+                if candidate.monomer_id in failure_by_candidate_id:
+                    exc = failure_by_candidate_id[candidate.monomer_id]
+                    local_alignment_failures += 1
+                    failed_candidates.append(
                         {
-                            "sequence_cluster_id": sequence_cluster_id,
-                            "query_monomer_id": result.query_monomer_id,
-                            "target_monomer_id": result.target_monomer_id,
-                            "aligned_length": result.aligned_length,
-                            "rmsd": result.rmsd,
-                            "tm_score_query": result.tm_score_query,
-                            "tm_score_target": result.tm_score_target,
-                            "tm_score_min": result.min_tm_score,
-                            "tm_score_max": result.max_tm_score,
-                            "tm_score_for_clustering": result.max_tm_score,
-                            "alignment_coverage_shorter": result.shorter_length_coverage,
-                            "meets_tm_threshold": result.meets_tm_threshold,
-                            "meets_coverage_threshold": result.meets_coverage_threshold,
+                            "candidate": candidate,
+                            "failed_against_representative": representative.monomer_id,
+                            "error": str(exc),
                         }
                     )
-                    total_alignments += 1
-                    alignment_success_count += 1
-                result = alignment_cache[pair_key]
-                if result.meets_tm_threshold and result.meets_coverage_threshold:
-                    assigned.append(candidate)
-                else:
-                    remaining.append(candidate)
+                    local_warning_rows.append(
+                        {
+                            "warning_code": "usalign_failed_sequence_fallback",
+                            "sequence_cluster_id": sequence_cluster_id,
+                            "candidate_monomer_id": candidate.monomer_id,
+                            "representative_monomer_id": representative.monomer_id,
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                if pair_key in local_alignment_cache:
+                    result = local_alignment_cache[pair_key]
+                    if pair_key in success_keys:
+                        local_alignment_rows.append(
+                            {
+                                "sequence_cluster_id": sequence_cluster_id,
+                                "query_monomer_id": result.query_monomer_id,
+                                "target_monomer_id": result.target_monomer_id,
+                                "aligned_length": result.aligned_length,
+                                "rmsd": result.rmsd,
+                                "tm_score_query": result.tm_score_query,
+                                "tm_score_target": result.tm_score_target,
+                                "tm_score_min": result.min_tm_score,
+                                "tm_score_max": result.max_tm_score,
+                                "tm_score_for_clustering": result.max_tm_score,
+                                "alignment_coverage_shorter": result.shorter_length_coverage,
+                                "meets_tm_threshold": result.meets_tm_threshold,
+                                "meets_coverage_threshold": result.meets_coverage_threshold,
+                            }
+                        )
+                        local_alignments += 1
+                        alignment_success_count += 1
+                    if result.meets_tm_threshold and result.meets_coverage_threshold:
+                        assigned.append(candidate)
+                    else:
+                        remaining.append(candidate)
             cluster_states.append(
                 {
                     "structure_cluster_id": structure_cluster_id,
@@ -590,9 +639,9 @@ def greedy_cluster_protein_structures(
             pending = remaining
 
         if failed_candidates and alignment_success_count == 0:
-            total_all_failure_cluster_collapses += 1
-            total_struct_clusters -= len(cluster_states)
-            total_struct_clusters += 1
+            local_all_failure_cluster_collapses += 1
+            local_struct_clusters -= len(cluster_states)
+            local_struct_clusters += 1
             representative = min(candidates, key=lambda item: item.quality_sort_key())
             structure_cluster_id = _protein_structure_cluster_id(sequence_cluster_id, 1)
             cluster_states = [
@@ -603,7 +652,7 @@ def greedy_cluster_protein_structures(
                     "fallback_member_ids": [],
                 }
             ]
-            warning_rows.append(
+            local_warning_rows.append(
                 {
                     "warning_code": "all_usalign_failed_sequence_cluster_collapsed",
                     "sequence_cluster_id": sequence_cluster_id,
@@ -628,8 +677,8 @@ def greedy_cluster_protein_structures(
                     ),
                 )
                 target_cluster["members"].append(candidate)
-                total_sequence_fallback_assignments += 1
-                warning_rows.append(
+                local_sequence_fallback_assignments += 1
+                local_warning_rows.append(
                     {
                         "warning_code": "usalign_failed_assigned_by_sequence_similarity",
                         "sequence_cluster_id": sequence_cluster_id,
@@ -661,8 +710,8 @@ def greedy_cluster_protein_structures(
                     ),
                 )
                 target_cluster["fallback_member_ids"].append(member_id)
-                total_sequence_fallback_assignments += 1
-                warning_rows.append(
+                local_sequence_fallback_assignments += 1
+                local_warning_rows.append(
                     {
                         "warning_code": "structure_extraction_failed_assigned_by_sequence_similarity",
                         "sequence_cluster_id": sequence_cluster_id,
@@ -691,8 +740,8 @@ def greedy_cluster_protein_structures(
                 alignment_coverage_shorter: float | str = ""
                 if member.monomer_id != representative.monomer_id:
                     pair_key = tuple(sorted((representative.monomer_id, member.monomer_id)))
-                    if pair_key in alignment_cache:
-                        result = alignment_cache[pair_key]
+                    if pair_key in local_alignment_cache:
+                        result = local_alignment_cache[pair_key]
                         assignment_reason = "representative_alignment"
                         tm_score_min = result.min_tm_score
                         tm_score_max = result.max_tm_score
@@ -700,7 +749,7 @@ def greedy_cluster_protein_structures(
                         alignment_coverage_shorter = result.shorter_length_coverage
                     elif failed_candidates:
                         assignment_reason = "tm_failure_sequence_fallback"
-                membership_out_rows.append(
+                local_membership_rows.append(
                     {
                         "polymer_class": "protein",
                         "sequence_cluster_id": sequence_cluster_id,
@@ -716,7 +765,7 @@ def greedy_cluster_protein_structures(
                 )
 
             for member_id in sorted(cluster_state["fallback_member_ids"]):
-                membership_out_rows.append(
+                local_membership_rows.append(
                     {
                         "polymer_class": "protein",
                         "sequence_cluster_id": sequence_cluster_id,
@@ -731,7 +780,7 @@ def greedy_cluster_protein_structures(
                     }
                 )
 
-            representative_rows.append(
+            local_representative_rows.append(
                 {
                     "sequence_cluster_id": sequence_cluster_id,
                     "structure_cluster_id": structure_cluster_id,
@@ -750,6 +799,38 @@ def greedy_cluster_protein_structures(
                 }
             )
 
+        return {
+            "alignment_rows": local_alignment_rows,
+            "membership_rows": local_membership_rows,
+            "representative_rows": local_representative_rows,
+            "warning_rows": local_warning_rows,
+            "num_structure_clusters": local_struct_clusters,
+            "num_alignment_runs": local_alignments,
+            "num_alignment_failures": local_alignment_failures,
+            "num_sequence_fallback_assignments": local_sequence_fallback_assignments,
+            "num_all_failure_sequence_cluster_collapses": local_all_failure_cluster_collapses,
+        }
+
+    sequence_group_items = list(sequence_groups.items())
+    sequence_cluster_jobs = min(normalize_worker_count(sequence_cluster_jobs), max(1, len(sequence_group_items)))
+    if sequence_cluster_jobs <= 1:
+        group_results = [process_sequence_group(item) for item in sequence_group_items]
+    else:
+        with ThreadPoolExecutor(max_workers=sequence_cluster_jobs) as executor:
+            futures = [executor.submit(process_sequence_group, item) for item in sequence_group_items]
+            group_results = [future.result() for future in futures]
+
+    for group_result in group_results:
+        alignment_rows.extend(group_result["alignment_rows"])
+        membership_out_rows.extend(group_result["membership_rows"])
+        representative_rows.extend(group_result["representative_rows"])
+        warning_rows.extend(group_result["warning_rows"])
+        total_struct_clusters += group_result["num_structure_clusters"]
+        total_alignments += group_result["num_alignment_runs"]
+        total_alignment_failures += group_result["num_alignment_failures"]
+        total_sequence_fallback_assignments += group_result["num_sequence_fallback_assignments"]
+        total_all_failure_cluster_collapses += group_result["num_all_failure_sequence_cluster_collapses"]
+
     dump_csv_rows(outdir / "protein_structure_cluster_membership.csv", membership_out_rows)
     dump_csv_rows(outdir / "protein_structure_cluster_representatives.csv", representative_rows)
     dump_jsonl(outdir / "protein_structure_pairwise_alignments.jsonl", alignment_rows)
@@ -764,6 +845,8 @@ def greedy_cluster_protein_structures(
         "num_membership_rows": len(membership_out_rows),
         "tm_score_threshold": tm_score_threshold,
         "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
+        "sequence_cluster_jobs": sequence_cluster_jobs,
+        "pairwise_alignment_jobs": pairwise_alignment_jobs,
     }
     dump_json(outdir / "protein_structure_cluster_manifest.json", manifest, indent=2)
     return {

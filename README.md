@@ -92,10 +92,11 @@ Key clustering defaults:
 2. Protein monomer structure clustering uses `max(TM(query,target), TM(target,query)) >= 0.50`.
 3. Protein monomer alignment coverage requires `aligned_length / shorter_length >= 0.80`.
 4. Dimer, multimer, antibody-antigen, and TCR-pMHC complex clustering default to signature clustering plus overall `USalign -mm 1 -ter 1` refinement with TM-score threshold `0.50`.
+5. Parallel clustering controls are `--jobs`, `--mmseqs-threads`, `--sequence-cluster-jobs`, and `--usalign-jobs`.
 
 ## Configuration
 
-The default configuration file is `config.toml`. CLI arguments always override values from the config file.
+The parser default configuration file is `config.toml`. The clustering default configuration file is `config_clustering.toml`. CLI arguments always override values from the config file.
 
 Use the default file:
 
@@ -106,7 +107,7 @@ cif-parse --config config.toml batch path/to/mmcif_dir --outdir batch_outputs
 Use the same config for clustering:
 
 ```bash
-cif-parse-cluster --config config.toml --inputs batch_outputs/cases --outdir cluster_outputs
+cif-parse-cluster --config config_clustering.toml --inputs batch_outputs/cases --outdir cluster_outputs
 ```
 
 The main sections are:
@@ -114,7 +115,7 @@ The main sections are:
 1. `[settings]`: parser behavior, assembly mode, contact thresholds, immune annotation thresholds.
 2. `[single]`: default single-run output directory.
 3. `[batch]`: default batch output directory and worker count.
-4. `[clustering]`: clustering modes, sequence thresholds, TM-score thresholds, USalign settings.
+4. `[clustering]` in `config_clustering.toml`: clustering modes, sequence thresholds, TM-score thresholds, USalign settings, and parallel worker counts.
 
 ## Typical Workflow
 

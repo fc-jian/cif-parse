@@ -20,7 +20,7 @@ from cif_parse.settings import (
     SUPPORTED_CLUSTERING_SEQUENCE_MODES,
     SUPPORTED_CLUSTERING_STRUCTURE_MODES,
     SUPPORTED_LOG_LEVELS,
-    load_cli_config,
+    load_clustering_cli_config,
 )
 from cif_parse.utils.logging_utils import configure_logging
 
@@ -38,7 +38,7 @@ def build_parser(
         "--config",
         type=Path,
         default=config_path,
-        help="Optional config.toml path; CLI arguments override [clustering] values",
+        help="Optional config_clustering.toml path; CLI arguments override [clustering] values",
     )
     parser.add_argument(
         "--inputs",
@@ -185,6 +185,30 @@ def build_parser(
         help="USalign executable name or absolute path",
     )
     parser.add_argument(
+        "--jobs",
+        type=int,
+        default=int(clustering_defaults.get("jobs", 1)),
+        help="Default worker count for clustering parallel sections",
+    )
+    parser.add_argument(
+        "--mmseqs-threads",
+        type=int,
+        default=int(clustering_defaults.get("mmseqs_threads", clustering_defaults.get("jobs", 1))),
+        help="Thread count passed to mmseqs easy-cluster",
+    )
+    parser.add_argument(
+        "--sequence-cluster-jobs",
+        type=int,
+        default=int(clustering_defaults.get("sequence_cluster_jobs", clustering_defaults.get("jobs", 1))),
+        help="Number of protein sequence clusters processed concurrently during monomer structure clustering",
+    )
+    parser.add_argument(
+        "--usalign-jobs",
+        type=int,
+        default=int(clustering_defaults.get("usalign_jobs", clustering_defaults.get("jobs", 1))),
+        help="Maximum concurrent USalign subprocesses per clustering refinement stage",
+    )
+    parser.add_argument(
         "--log-level",
         choices=sorted(SUPPORTED_LOG_LEVELS),
         default=str(clustering_defaults.get("log_level", "INFO")),
@@ -198,11 +222,16 @@ def main(argv: list[str] | None = None) -> int:
     bootstrap_parser.add_argument("--config", type=Path, default=None)
     bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
     try:
-        config_path, config_defaults = load_cli_config(bootstrap_args.config)
+        config_path, config_defaults = load_clustering_cli_config(bootstrap_args.config)
     except (FileNotFoundError, ValueError, TypeError, tomllib.TOMLDecodeError) as exc:
         bootstrap_parser.error(str(exc))
 
     args = build_parser(config_defaults=config_defaults, config_path=config_path).parse_args(argv)
+    for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
+        if getattr(args, field_name) < 1:
+            build_parser(config_defaults=config_defaults, config_path=config_path).error(
+                f"--{field_name.replace('_', '-')} must be >= 1"
+            )
     configure_logging(args.log_level)
     sequence_dataset = build_monomer_sequence_dataset(
         inputs=args.inputs,
@@ -211,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
         protein_min_seq_id=args.protein_min_seq_id,
         protein_coverage=args.protein_coverage,
         protein_cov_mode=args.protein_cov_mode,
+        mmseqs_threads=args.mmseqs_threads,
     )
     if args.protein_structure_mode == "greedy":
         structure_outdir = args.outdir / "protein_structures"
@@ -228,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
             tm_score_threshold=args.tm_score_threshold,
             min_alignment_coverage_ratio=args.min_alignment_coverage_ratio,
             usalign_executable=args.usalign_executable,
+            sequence_cluster_jobs=args.sequence_cluster_jobs,
+            pairwise_alignment_jobs=args.usalign_jobs,
         )
     if args.dimer_mode == "signature":
         build_dimer_signature_clusters(
@@ -239,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             drop_hydrogens=not args.keep_hydrogens,
             usalign_executable=args.usalign_executable,
+            alignment_jobs=args.usalign_jobs,
         )
     if args.multimer_mode == "signature":
         build_multimer_signature_clusters(
@@ -250,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             drop_hydrogens=not args.keep_hydrogens,
             usalign_executable=args.usalign_executable,
+            alignment_jobs=args.usalign_jobs,
         )
     if args.antibody_complex_mode == "signature":
         build_antibody_complex_signature_clusters(
@@ -261,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             drop_hydrogens=not args.keep_hydrogens,
             usalign_executable=args.usalign_executable,
+            alignment_jobs=args.usalign_jobs,
         )
     if args.tcr_complex_mode == "signature":
         build_tcr_complex_signature_clusters(
@@ -272,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             drop_hydrogens=not args.keep_hydrogens,
             usalign_executable=args.usalign_executable,
+            alignment_jobs=args.usalign_jobs,
         )
     return 0
 

@@ -395,6 +395,7 @@ def run_mmseqs_sequence_clustering(
     min_seq_id: float = 0.40,
     coverage: float = 0.80,
     cov_mode: int = 5,
+    threads: int = 1,
 ) -> Path:
     """Run `mmseqs easy-cluster` and return the generated cluster TSV path."""
 
@@ -418,8 +419,10 @@ def run_mmseqs_sequence_clustering(
         f"{coverage:.4f}",
         "--cov-mode",
         str(cov_mode),
+        "--threads",
+        str(max(1, int(threads))),
     ]
-    LOGGER.info("Running mmseqs easy-cluster on %s", fasta_path)
+    LOGGER.info("Running mmseqs easy-cluster on %s with %d threads", fasta_path, max(1, int(threads)))
     subprocess.run(command, check=True)
     cluster_tsv = Path(f"{result_prefix}{MMSEQS_CLUSTER_TSV_SUFFIX}")
     if not cluster_tsv.exists():
@@ -472,6 +475,7 @@ def build_monomer_sequence_dataset(
     protein_min_seq_id: float = 0.40,
     protein_coverage: float = 0.80,
     protein_cov_mode: int = 5,
+    mmseqs_threads: int = 1,
 ) -> dict[str, Any]:
     """Build canonical monomer inventory and sequence-level grouping artifacts."""
 
@@ -508,6 +512,7 @@ def build_monomer_sequence_dataset(
                     min_seq_id=protein_min_seq_id,
                     coverage=protein_coverage,
                     cov_mode=protein_cov_mode,
+                    threads=mmseqs_threads,
                 )
                 copied_tsv = outdir / "sequence_clusters" / "protein_mmseqs_cluster.tsv"
                 copied_tsv.parent.mkdir(parents=True, exist_ok=True)
@@ -540,6 +545,7 @@ def build_monomer_sequence_dataset(
             "min_seq_id": protein_min_seq_id,
             "coverage": protein_coverage,
             "cov_mode": protein_cov_mode,
+            "threads": max(1, int(mmseqs_threads)),
         },
         "output_dir": str(outdir.resolve()),
         "fasta_paths": {key: str(path.resolve()) for key, path in sorted(fasta_paths.items())},

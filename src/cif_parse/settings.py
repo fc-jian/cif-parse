@@ -18,6 +18,7 @@ SUPPORTED_CLUSTERING_STRUCTURE_MODES = frozenset({"skip", "greedy"})
 SUPPORTED_CLUSTERING_OBJECT_MODES = frozenset({"skip", "signature"})
 
 DEFAULT_CONFIG_PATH = Path("config.toml")
+DEFAULT_CLUSTERING_CONFIG_PATH = Path("config_clustering.toml")
 DEFAULT_SINGLE_OUTDIR = Path("outputs")
 DEFAULT_BATCH_OUTDIR = Path("batch_outputs")
 DEFAULT_CLUSTERING_OUTDIR = Path("cluster_outputs")
@@ -126,6 +127,10 @@ class ClusteringSettings:
     tm_score_threshold: float = 0.50
     min_alignment_coverage_ratio: float = 0.80
     usalign_executable: str = "USalign"
+    jobs: int = _DEFAULT_JOB_COUNT
+    mmseqs_threads: int | None = None
+    sequence_cluster_jobs: int | None = None
+    usalign_jobs: int | None = None
     log_level: str = "INFO"
 
     def __post_init__(self) -> None:
@@ -172,6 +177,20 @@ class ClusteringSettings:
             raise ValueError("clustering.min_alignment_coverage_ratio must be in [0, 1]")
         if not self.usalign_executable:
             raise ValueError("clustering.usalign_executable must not be empty")
+        if self.jobs < 1:
+            raise ValueError("clustering.jobs must be >= 1")
+        if self.mmseqs_threads is None:
+            self.mmseqs_threads = self.jobs
+        if self.sequence_cluster_jobs is None:
+            self.sequence_cluster_jobs = self.jobs
+        if self.usalign_jobs is None:
+            self.usalign_jobs = self.jobs
+        if self.mmseqs_threads < 1:
+            raise ValueError("clustering.mmseqs_threads must be >= 1")
+        if self.sequence_cluster_jobs < 1:
+            raise ValueError("clustering.sequence_cluster_jobs must be >= 1")
+        if self.usalign_jobs < 1:
+            raise ValueError("clustering.usalign_jobs must be >= 1")
 
 
 def default_cli_config() -> dict[str, Any]:
@@ -235,6 +254,10 @@ def default_cli_config() -> dict[str, Any]:
             "tm_score_threshold": 0.50,
             "min_alignment_coverage_ratio": 0.80,
             "usalign_executable": "USalign",
+            "jobs": _DEFAULT_JOB_COUNT,
+            "mmseqs_threads": _DEFAULT_JOB_COUNT,
+            "sequence_cluster_jobs": _DEFAULT_JOB_COUNT,
+            "usalign_jobs": _DEFAULT_JOB_COUNT,
             "log_level": "INFO",
         },
     }
@@ -246,6 +269,26 @@ def load_cli_config(config_path: str | Path | None = None) -> tuple[Path | None,
     resolved_path: Path | None
     if config_path is None:
         resolved_path = DEFAULT_CONFIG_PATH if DEFAULT_CONFIG_PATH.exists() else None
+    else:
+        resolved_path = Path(config_path)
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"config file not found: {resolved_path}")
+
+    config = default_cli_config()
+    if resolved_path is None:
+        return None, config
+
+    parsed = tomllib.loads(resolved_path.read_text(encoding="utf-8"))
+    _merge_toml_config(config, parsed)
+    return resolved_path, config
+
+
+def load_clustering_cli_config(config_path: str | Path | None = None) -> tuple[Path | None, dict[str, Any]]:
+    """Load defaults for the independent clustering CLI from `config_clustering.toml`."""
+
+    resolved_path: Path | None
+    if config_path is None:
+        resolved_path = DEFAULT_CLUSTERING_CONFIG_PATH if DEFAULT_CLUSTERING_CONFIG_PATH.exists() else None
     else:
         resolved_path = Path(config_path)
         if not resolved_path.exists():
@@ -336,6 +379,10 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "tm_score_threshold",
             "min_alignment_coverage_ratio",
             "usalign_executable",
+            "jobs",
+            "mmseqs_threads",
+            "sequence_cluster_jobs",
+            "usalign_jobs",
             "log_level",
         },
         "clustering",
@@ -394,6 +441,10 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "tm_score_threshold": validated_clustering.tm_score_threshold,
         "min_alignment_coverage_ratio": validated_clustering.min_alignment_coverage_ratio,
         "usalign_executable": validated_clustering.usalign_executable,
+        "jobs": validated_clustering.jobs,
+        "mmseqs_threads": validated_clustering.mmseqs_threads,
+        "sequence_cluster_jobs": validated_clustering.sequence_cluster_jobs,
+        "usalign_jobs": validated_clustering.usalign_jobs,
         "log_level": validated_clustering.log_level,
     }
 

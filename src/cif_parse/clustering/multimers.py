@@ -22,6 +22,7 @@ from cif_parse.clustering.protein_structures import (
     USalignAlignmentResult,
     parse_usalign_output,
 )
+from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl, load_case_output_bundles
 from cif_parse.io import read_assembly_chain_operations, read_cif_file
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
@@ -499,8 +500,10 @@ def refine_multimer_signature_clusters(
     tm_score_threshold: float = 0.50,
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
+    alignment_jobs: int = 1,
 ) -> dict[str, Any]:
     runner = alignment_runner or run_multimer_usalign_alignment
+    alignment_jobs = normalize_worker_count(alignment_jobs)
     alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}
     alignment_rows: list[dict[str, Any]] = []
     warning_rows: list[dict[str, Any]] = []
@@ -524,6 +527,7 @@ def refine_multimer_signature_clusters(
                 representative = pending[0]
                 assigned = [representative]
                 remaining: list[MultimerObservation] = []
+                alignment_tasks: list[AlignmentTask] = []
                 for candidate in pending[1:]:
                     pair_key = tuple(
                         sorted(
@@ -534,27 +538,47 @@ def refine_multimer_signature_clusters(
                         )
                     )
                     if pair_key not in alignment_cache:
-                        try:
-                            result = runner(
-                                extracted_structures[representative.multimer_observation_id],
-                                extracted_structures[candidate.multimer_observation_id],
-                                usalign_executable=usalign_executable,
-                                tm_score_threshold=tm_score_threshold,
+                        alignment_tasks.append(
+                            AlignmentTask(
+                                key=pair_key,
+                                query=extracted_structures[representative.multimer_observation_id],
+                                target=extracted_structures[candidate.multimer_observation_id],
+                                context={"candidate": candidate},
                             )
-                        except Exception as exc:
-                            num_alignment_failures += 1
-                            warning_rows.append(
-                                {
-                                    "warning_code": "multimer_usalign_failed",
-                                    "signature_cluster_id": signature_cluster_id,
-                                    "representative_multimer_observation_id": representative.multimer_observation_id,
-                                    "candidate_multimer_observation_id": candidate.multimer_observation_id,
-                                    "error": str(exc),
-                                }
-                            )
-                            remaining.append(candidate)
-                            continue
-                        alignment_cache[pair_key] = result
+                        )
+                successes, failures = run_alignment_tasks(
+                    alignment_tasks,
+                    runner,
+                    max_workers=alignment_jobs,
+                    usalign_executable=usalign_executable,
+                    tm_score_threshold=tm_score_threshold,
+                )
+                failure_by_candidate_id = {
+                    task.context["candidate"].multimer_observation_id: exc for task, exc in failures
+                }
+                for task, result in successes:
+                    alignment_cache[task.key] = result
+                success_keys = {task.key for task, _ in successes}
+                for candidate in pending[1:]:
+                    pair_key = tuple(
+                        sorted((representative.multimer_observation_id, candidate.multimer_observation_id))
+                    )
+                    if candidate.multimer_observation_id in failure_by_candidate_id:
+                        exc = failure_by_candidate_id[candidate.multimer_observation_id]
+                        num_alignment_failures += 1
+                        warning_rows.append(
+                            {
+                                "warning_code": "multimer_usalign_failed",
+                                "signature_cluster_id": signature_cluster_id,
+                                "representative_multimer_observation_id": representative.multimer_observation_id,
+                                "candidate_multimer_observation_id": candidate.multimer_observation_id,
+                                "error": str(exc),
+                            }
+                        )
+                        remaining.append(candidate)
+                        continue
+                    result = alignment_cache[pair_key]
+                    if pair_key in success_keys:
                         alignment_rows.append(
                             {
                                 "signature_cluster_id": signature_cluster_id,
@@ -570,7 +594,6 @@ def refine_multimer_signature_clusters(
                             }
                         )
                         num_alignment_runs += 1
-                    result = alignment_cache[pair_key]
                     if result.max_tm_score >= tm_score_threshold:
                         assigned.append(candidate)
                     else:
@@ -701,6 +724,7 @@ def refine_multimer_signature_clusters(
         "num_alignment_failures": num_alignment_failures,
         "num_signature_clusters_split": num_signature_clusters_split,
         "multimer_tm_score_threshold": tm_score_threshold,
+        "alignment_jobs": alignment_jobs,
     }
     return {
         "manifest": manifest,
@@ -723,6 +747,7 @@ def build_multimer_signature_clusters(
     drop_hydrogens: bool = True,
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
+    alignment_jobs: int = 1,
 ) -> dict[str, Any]:
     monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
     observations = collect_multimer_observations(case_dirs, monomer_assignments)
@@ -763,6 +788,7 @@ def build_multimer_signature_clusters(
             tm_score_threshold=multimer_tm_score_threshold,
             usalign_executable=usalign_executable,
             alignment_runner=alignment_runner,
+            alignment_jobs=alignment_jobs,
         )
         membership_rows = refined["membership_rows"]
         representative_rows = refined["representative_rows"]
@@ -785,6 +811,7 @@ def build_multimer_signature_clusters(
             "num_signature_clusters_split": refined["manifest"]["num_signature_clusters_split"],
             "multimer_tm_score_threshold": multimer_tm_score_threshold,
             "structure_refinement_mode": structure_refinement_mode,
+            "alignment_jobs": refined["manifest"]["alignment_jobs"],
             **extraction_manifest,
         }
     else:
