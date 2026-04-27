@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 from cif_parse.constants import POLYMER_CHAIN_TYPES, PROTEIN_CHAIN_TYPES
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl, load_case_output_bundles
+from cif_parse.settings import resolve_source_path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -162,7 +163,10 @@ class MonomerInventoryResult:
     manifest: dict[str, Any]
 
 
-def collect_canonical_monomers(case_dirs: Iterable[str | Path]) -> MonomerInventoryResult:
+def collect_canonical_monomers(
+    case_dirs: Iterable[str | Path],
+    cif_files_directory: str | None = None,
+) -> MonomerInventoryResult:
     """Collect canonical monomer samples, deduplicated by `(pdb_id, label_asym_id)`."""
 
     case_paths = [Path(path).resolve() for path in case_dirs]
@@ -188,7 +192,10 @@ def collect_canonical_monomers(case_dirs: Iterable[str | Path]) -> MonomerInvent
                 for item in summary.get("assembly_ids", [])
                 if str(item)
             ]
-            source_path = str(summary.get("source_path", "") or "")
+            source_path = resolve_source_path(
+                str(summary.get("source_path", "") or ""),
+                cif_files_directory,
+            )
             bundle_pdb_id = str(summary.get("pdb_id", "") or "")
             for chain_payload in chain_inventory:
                 if not isinstance(chain_payload, dict) or not _is_polymer_chain(chain_payload):
@@ -476,11 +483,12 @@ def build_monomer_sequence_dataset(
     protein_coverage: float = 0.80,
     protein_cov_mode: int = 5,
     mmseqs_threads: int = 1,
+    cif_files_directory: str | None = None,
 ) -> dict[str, Any]:
     """Build canonical monomer inventory and sequence-level grouping artifacts."""
 
     case_dirs = discover_case_output_dirs(inputs)
-    inventory = collect_canonical_monomers(case_dirs)
+    inventory = collect_canonical_monomers(case_dirs, cif_files_directory=cif_files_directory)
     monomers = inventory.monomers
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

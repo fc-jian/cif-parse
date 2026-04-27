@@ -7,7 +7,7 @@ import math
 import re
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -374,35 +374,76 @@ def extract_protein_monomer_structures(
     outdir: str | Path,
     model: int = 1,
     drop_hydrogens: bool = True,
+    extraction_jobs: int = 1,
 ) -> tuple[dict[str, ExtractedMonomerStructure], dict[str, Any]]:
-    """Extract analyzable PDB files for all protein monomers."""
+    """Extract analyzable PDB files for all protein monomers.
+
+    *extraction_jobs* controls how many monomers are extracted concurrently.
+    Cached mmCIF reads and quality lookups are protected by a lock so that the
+    same source file is only opened once.
+    """
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     structures: dict[str, ExtractedMonomerStructure] = {}
     failures: list[dict[str, str]] = []
-    quality_cache: dict[str, EntryQualityMetadata] = {}
-    atom_array_cache: dict[str, AtomArray] = {}
 
     protein_monomers = sorted(
         (monomer for monomer in monomers if monomer.polymer_class == "protein"),
         key=lambda item: item.monomer_id,
     )
-    for monomer in protein_monomers:
-        if monomer.source_path not in quality_cache:
-            quality_cache[monomer.source_path] = read_entry_quality_metadata(
-                monomer.source_path,
-                pdb_id=monomer.pdb_id,
-            )
-        if monomer.source_path not in atom_array_cache:
-            cif_file = read_cif_file(monomer.source_path)
-            atom_array_cache[monomer.source_path] = get_structure(
-                cif_file,
-                model=model,
-                use_author_fields=False,
-            )
-        try:
-            extracted = extract_protein_monomer_structure(
+
+    extraction_jobs = normalize_worker_count(extraction_jobs)
+    if extraction_jobs <= 1 or len(protein_monomers) <= 1:
+        quality_cache: dict[str, EntryQualityMetadata] = {}
+        atom_array_cache: dict[str, AtomArray] = {}
+        for monomer in protein_monomers:
+            if monomer.source_path not in quality_cache:
+                quality_cache[monomer.source_path] = read_entry_quality_metadata(
+                    monomer.source_path,
+                    pdb_id=monomer.pdb_id,
+                )
+            if monomer.source_path not in atom_array_cache:
+                cif_file = read_cif_file(monomer.source_path)
+                atom_array_cache[monomer.source_path] = get_structure(
+                    cif_file,
+                    model=model,
+                    use_author_fields=False,
+                )
+            try:
+                structures[monomer.monomer_id] = extract_protein_monomer_structure(
+                    monomer,
+                    outdir=outdir,
+                    model=model,
+                    drop_hydrogens=drop_hydrogens,
+                    quality_metadata=quality_cache[monomer.source_path],
+                    atom_array=atom_array_cache[monomer.source_path],
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to extract protein monomer %s: %s", monomer.monomer_id, exc)
+                failures.append({"monomer_id": monomer.monomer_id, "error": str(exc)})
+    else:
+        import threading
+
+        quality_cache: dict[str, EntryQualityMetadata] = {}
+        atom_array_cache: dict[str, AtomArray] = {}
+        cache_lock = threading.Lock()
+
+        def _extract_one(monomer: MonomerSample) -> ExtractedMonomerStructure | None:
+            with cache_lock:
+                if monomer.source_path not in quality_cache:
+                    quality_cache[monomer.source_path] = read_entry_quality_metadata(
+                        monomer.source_path,
+                        pdb_id=monomer.pdb_id,
+                    )
+                if monomer.source_path not in atom_array_cache:
+                    cif_file = read_cif_file(monomer.source_path)
+                    atom_array_cache[monomer.source_path] = get_structure(
+                        cif_file,
+                        model=model,
+                        use_author_fields=False,
+                    )
+            return extract_protein_monomer_structure(
                 monomer,
                 outdir=outdir,
                 model=model,
@@ -410,11 +451,21 @@ def extract_protein_monomer_structures(
                 quality_metadata=quality_cache[monomer.source_path],
                 atom_array=atom_array_cache[monomer.source_path],
             )
-        except Exception as exc:
-            LOGGER.warning("Failed to extract protein monomer %s: %s", monomer.monomer_id, exc)
-            failures.append({"monomer_id": monomer.monomer_id, "error": str(exc)})
-            continue
-        structures[monomer.monomer_id] = extracted
+
+        with ThreadPoolExecutor(max_workers=min(extraction_jobs, len(protein_monomers))) as executor:
+            future_to_monomer = {
+                executor.submit(_extract_one, monomer): monomer
+                for monomer in protein_monomers
+            }
+            for future in as_completed(future_to_monomer):
+                monomer = future_to_monomer[future]
+                try:
+                    extracted = future.result()
+                    if extracted is not None:
+                        structures[monomer.monomer_id] = extracted
+                except Exception as exc:
+                    LOGGER.warning("Failed to extract protein monomer %s: %s", monomer.monomer_id, exc)
+                    failures.append({"monomer_id": monomer.monomer_id, "error": str(exc)})
 
     dump_jsonl(outdir / "protein_structure_extraction_failures.jsonl", failures)
     dump_jsonl(outdir / "protein_structures.jsonl", [item.to_dict() for item in structures.values()])
@@ -422,6 +473,7 @@ def extract_protein_monomer_structures(
         "num_protein_monomers": len(protein_monomers),
         "num_extracted_protein_structures": len(structures),
         "num_failed_protein_structure_extractions": len(failures),
+        "extraction_jobs": extraction_jobs,
     }
     dump_json(outdir / "protein_structure_manifest.json", manifest, indent=2)
     return structures, manifest

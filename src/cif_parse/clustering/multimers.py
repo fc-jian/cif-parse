@@ -4,6 +4,7 @@ import json
 import logging
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -25,6 +26,7 @@ from cif_parse.clustering.protein_structures import (
 from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl, load_case_output_bundles
 from cif_parse.io import read_assembly_chain_operations, read_cif_file
+from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
 
 
@@ -144,6 +146,7 @@ class ExtractedMultimerStructure:
 def collect_multimer_observations(
     case_dirs: Iterable[str | Path],
     monomer_cluster_assignments: dict[str, dict[str, str]],
+    cif_files_directory: str | None = None,
 ) -> list[MultimerObservation]:
     observations: list[MultimerObservation] = []
     for case_dir in sorted(Path(path).resolve() for path in case_dirs):
@@ -151,7 +154,10 @@ def collect_multimer_observations(
         for payload in payloads:
             summary = payload.get("structure_summary", {})
             pdb_id = str(summary.get("pdb_id", "") or "")
-            source_path = str(summary.get("source_path", "") or "")
+            source_path = resolve_source_path(
+                str(summary.get("source_path", "") or ""),
+                cif_files_directory,
+            )
             assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
             default_assembly_id = assembly_ids[0] if len(assembly_ids) == 1 else None
             multimers = payload.get("tight_multimers", [])
@@ -394,61 +400,93 @@ def extract_multimer_structures(
     outdir: str | Path,
     model: int = 1,
     drop_hydrogens: bool = True,
+    extraction_jobs: int = 1,
 ) -> tuple[dict[str, ExtractedMultimerStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     structures: dict[str, ExtractedMultimerStructure] = {}
     failures: list[dict[str, str]] = []
-    atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
-    chain_ops_cache: dict[tuple[str, str | None], dict[str, list[str]]] = {}
 
     sorted_observations = sorted(observations, key=lambda item: item.multimer_observation_id)
-    for observation in sorted_observations:
+    extraction_jobs = normalize_worker_count(extraction_jobs)
+
+    import threading as _threading
+
+    atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
+    chain_ops_cache: dict[tuple[str, str | None], dict[str, list[str]]] = {}
+    _lock = _threading.Lock()
+
+    def _load_caches(observation: MultimerObservation) -> tuple[AtomArray, dict[str, list[str]]]:
         cache_key = (observation.source_path, observation.assembly_id)
-        if cache_key not in atom_array_cache:
-            cif_file = read_cif_file(observation.source_path)
-            if observation.assembly_id:
-                atom_array_cache[cache_key] = get_assembly(
-                    cif_file,
+        with _lock:
+            if cache_key not in atom_array_cache:
+                cif_file = read_cif_file(observation.source_path)
+                if observation.assembly_id:
+                    atom_array_cache[cache_key] = get_assembly(
+                        cif_file,
+                        assembly_id=observation.assembly_id,
+                        model=model,
+                        use_author_fields=False,
+                    )
+                else:
+                    atom_array_cache[cache_key] = get_structure(
+                        cif_file,
+                        model=model,
+                        use_author_fields=False,
+                    )
+            if cache_key not in chain_ops_cache:
+                _, chain_ops = read_assembly_chain_operations(
+                    observation.source_path,
                     assembly_id=observation.assembly_id,
-                    model=model,
-                    use_author_fields=False,
                 )
-            else:
-                atom_array_cache[cache_key] = get_structure(
-                    cif_file,
-                    model=model,
-                    use_author_fields=False,
+                chain_ops_cache[cache_key] = chain_ops
+        return atom_array_cache[cache_key], chain_ops_cache[cache_key]
+
+    def _process_one(observation: MultimerObservation) -> ExtractedMultimerStructure | None:
+        atom_array, chain_ops = _load_caches(observation)
+        return extract_multimer_structure(
+            observation,
+            outdir=outdir,
+            model=model,
+            drop_hydrogens=drop_hydrogens,
+            atom_array=atom_array,
+            assembly_chain_operations=chain_ops,
+        )
+
+    if extraction_jobs <= 1 or len(sorted_observations) <= 1:
+        for observation in sorted_observations:
+            try:
+                structures[observation.multimer_observation_id] = _process_one(observation)
+            except Exception as exc:
+                LOGGER.warning(
+                    "Failed to extract multimer %s: %s",
+                    observation.multimer_observation_id,
+                    exc,
                 )
-        if cache_key not in chain_ops_cache:
-            _, chain_ops = read_assembly_chain_operations(
-                observation.source_path,
-                assembly_id=observation.assembly_id,
-            )
-            chain_ops_cache[cache_key] = chain_ops
-        try:
-            extracted = extract_multimer_structure(
-                observation,
-                outdir=outdir,
-                model=model,
-                drop_hydrogens=drop_hydrogens,
-                atom_array=atom_array_cache[cache_key],
-                assembly_chain_operations=chain_ops_cache[cache_key],
-            )
-        except Exception as exc:
-            LOGGER.warning(
-                "Failed to extract multimer %s: %s",
-                observation.multimer_observation_id,
-                exc,
-            )
-            failures.append(
-                {
-                    "multimer_observation_id": observation.multimer_observation_id,
-                    "error": str(exc),
-                }
-            )
-            continue
-        structures[observation.multimer_observation_id] = extracted
+                failures.append(
+                    {"multimer_observation_id": observation.multimer_observation_id, "error": str(exc)}
+                )
+    else:
+        with ThreadPoolExecutor(max_workers=min(extraction_jobs, len(sorted_observations))) as executor:
+            future_to_obs = {
+                executor.submit(_process_one, observation): observation
+                for observation in sorted_observations
+            }
+            for future in as_completed(future_to_obs):
+                observation = future_to_obs[future]
+                try:
+                    extracted = future.result()
+                    if extracted is not None:
+                        structures[observation.multimer_observation_id] = extracted
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Failed to extract multimer %s: %s",
+                        observation.multimer_observation_id,
+                        exc,
+                    )
+                    failures.append(
+                        {"multimer_observation_id": observation.multimer_observation_id, "error": str(exc)}
+                    )
 
     dump_jsonl(outdir / "multimer_structure_extraction_failures.jsonl", failures)
     dump_jsonl(outdir / "multimer_structures.jsonl", [item.to_dict() for item in structures.values()])
@@ -456,6 +494,7 @@ def extract_multimer_structures(
         "num_multimer_observations": len(sorted_observations),
         "num_extracted_multimer_structures": len(structures),
         "num_failed_multimer_structure_extractions": len(failures),
+        "extraction_jobs": extraction_jobs,
     }
     dump_json(outdir / "multimer_structure_manifest.json", manifest, indent=2)
     return structures, manifest
@@ -748,9 +787,12 @@ def build_multimer_signature_clusters(
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
+    cif_files_directory: str | None = None,
 ) -> dict[str, Any]:
     monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
-    observations = collect_multimer_observations(case_dirs, monomer_assignments)
+    observations = collect_multimer_observations(
+        case_dirs, monomer_assignments, cif_files_directory=cif_files_directory
+    )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -779,6 +821,7 @@ def build_multimer_signature_clusters(
             outdir=outdir / "structures",
             model=model,
             drop_hydrogens=drop_hydrogens,
+            extraction_jobs=alignment_jobs,
         )
 
     if structure_refinement_mode == "greedy":

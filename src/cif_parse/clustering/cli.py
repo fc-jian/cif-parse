@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -21,8 +22,11 @@ from cif_parse.settings import (
     SUPPORTED_CLUSTERING_STRUCTURE_MODES,
     SUPPORTED_LOG_LEVELS,
     load_clustering_cli_config,
+    resolve_source_path,
 )
 from cif_parse.utils.logging_utils import configure_logging
+
+LOGGER = logging.getLogger(__name__)
 
 
 def build_parser(
@@ -46,6 +50,13 @@ def build_parser(
         type=Path,
         required=True,
         help="One or more case-output directories or parents containing case-output directories",
+    )
+    parser.add_argument(
+        "--cif-files-directory",
+        type=Path,
+        default=None,
+        help="Optional override directory for original mmCIF files; when set, the basename "
+        "of each source_path recorded in case bundles is resolved inside this directory",
     )
     parser.add_argument(
         "--outdir",
@@ -233,6 +244,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"--{field_name.replace('_', '-')} must be >= 1"
             )
     configure_logging(args.log_level)
+
+    if args.cif_files_directory is not None:
+        LOGGER.warning(
+            "Using --cif-files-directory=%s to override source mmCIF paths. "
+            "Mismatched CIF files between clustering and the original cif-parse "
+            "pipeline may produce incorrect results. If in doubt, re-run cif-parse "
+            "with the same CIF file set.",
+            args.cif_files_directory,
+        )
+
+    cif_files_directory: str | None = str(args.cif_files_directory) if args.cif_files_directory is not None else None
     sequence_dataset = build_monomer_sequence_dataset(
         inputs=args.inputs,
         outdir=args.outdir,
@@ -241,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         protein_coverage=args.protein_coverage,
         protein_cov_mode=args.protein_cov_mode,
         mmseqs_threads=args.mmseqs_threads,
+        cif_files_directory=cif_files_directory,
     )
     if args.protein_structure_mode == "greedy":
         structure_outdir = args.outdir / "protein_structures"
@@ -249,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             outdir=structure_outdir,
             model=args.model,
             drop_hydrogens=not args.keep_hydrogens,
+            extraction_jobs=args.usalign_jobs,
         )
         greedy_cluster_protein_structures(
             sequence_dataset["monomers"],
@@ -261,54 +285,88 @@ def main(argv: list[str] | None = None) -> int:
             sequence_cluster_jobs=args.sequence_cluster_jobs,
             pairwise_alignment_jobs=args.usalign_jobs,
         )
+
+    # Steps 4-7 are independent of each other — run them concurrently.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    build_specs: list[tuple[str, str, str, str, str, dict[str, Any]]] = []
     if args.dimer_mode == "signature":
-        build_dimer_signature_clusters(
-            case_dirs=sequence_dataset["case_dirs"],
-            clustering_outdir=args.outdir,
-            outdir=args.outdir / "dimer_clusters",
-            structure_refinement_mode=args.dimer_structure_mode,
-            dimer_tm_score_threshold=args.dimer_tm_score_threshold,
-            model=args.model,
-            drop_hydrogens=not args.keep_hydrogens,
-            usalign_executable=args.usalign_executable,
-            alignment_jobs=args.usalign_jobs,
-        )
+        build_specs.append(("dimer", "signature", args.dimer_structure_mode, "dimer_tm_score_threshold", "dimer_clusters", {
+            "case_dirs": sequence_dataset["case_dirs"],
+            "clustering_outdir": args.outdir,
+            "outdir": args.outdir / "dimer_clusters",
+            "structure_refinement_mode": args.dimer_structure_mode,
+            "dimer_tm_score_threshold": args.dimer_tm_score_threshold,
+            "model": args.model,
+            "drop_hydrogens": not args.keep_hydrogens,
+            "usalign_executable": args.usalign_executable,
+            "alignment_jobs": args.usalign_jobs,
+            "cif_files_directory": cif_files_directory,
+        }))
     if args.multimer_mode == "signature":
-        build_multimer_signature_clusters(
-            case_dirs=sequence_dataset["case_dirs"],
-            clustering_outdir=args.outdir,
-            outdir=args.outdir / "multimer_clusters",
-            structure_refinement_mode=args.multimer_structure_mode,
-            multimer_tm_score_threshold=args.multimer_tm_score_threshold,
-            model=args.model,
-            drop_hydrogens=not args.keep_hydrogens,
-            usalign_executable=args.usalign_executable,
-            alignment_jobs=args.usalign_jobs,
-        )
+        build_specs.append(("multimer", "signature", args.multimer_structure_mode, "multimer_tm_score_threshold", "multimer_clusters", {
+            "case_dirs": sequence_dataset["case_dirs"],
+            "clustering_outdir": args.outdir,
+            "outdir": args.outdir / "multimer_clusters",
+            "structure_refinement_mode": args.multimer_structure_mode,
+            "multimer_tm_score_threshold": args.multimer_tm_score_threshold,
+            "model": args.model,
+            "drop_hydrogens": not args.keep_hydrogens,
+            "usalign_executable": args.usalign_executable,
+            "alignment_jobs": args.usalign_jobs,
+            "cif_files_directory": cif_files_directory,
+        }))
     if args.antibody_complex_mode == "signature":
-        build_antibody_complex_signature_clusters(
-            case_dirs=sequence_dataset["case_dirs"],
-            clustering_outdir=args.outdir,
-            outdir=args.outdir / "antibody_complex_clusters",
-            structure_refinement_mode=args.antibody_complex_structure_mode,
-            antibody_complex_tm_score_threshold=args.antibody_complex_tm_score_threshold,
-            model=args.model,
-            drop_hydrogens=not args.keep_hydrogens,
-            usalign_executable=args.usalign_executable,
-            alignment_jobs=args.usalign_jobs,
-        )
+        build_specs.append(("antibody_complex", "signature", args.antibody_complex_structure_mode, "antibody_complex_tm_score_threshold", "antibody_complex_clusters", {
+            "case_dirs": sequence_dataset["case_dirs"],
+            "clustering_outdir": args.outdir,
+            "outdir": args.outdir / "antibody_complex_clusters",
+            "structure_refinement_mode": args.antibody_complex_structure_mode,
+            "antibody_complex_tm_score_threshold": args.antibody_complex_tm_score_threshold,
+            "model": args.model,
+            "drop_hydrogens": not args.keep_hydrogens,
+            "usalign_executable": args.usalign_executable,
+            "alignment_jobs": args.usalign_jobs,
+            "cif_files_directory": cif_files_directory,
+        }))
     if args.tcr_complex_mode == "signature":
-        build_tcr_complex_signature_clusters(
-            case_dirs=sequence_dataset["case_dirs"],
-            clustering_outdir=args.outdir,
-            outdir=args.outdir / "tcr_complex_clusters",
-            structure_refinement_mode=args.tcr_complex_structure_mode,
-            tcr_complex_tm_score_threshold=args.tcr_complex_tm_score_threshold,
-            model=args.model,
-            drop_hydrogens=not args.keep_hydrogens,
-            usalign_executable=args.usalign_executable,
-            alignment_jobs=args.usalign_jobs,
-        )
+        build_specs.append(("tcr_complex", "signature", args.tcr_complex_structure_mode, "tcr_complex_tm_score_threshold", "tcr_complex_clusters", {
+            "case_dirs": sequence_dataset["case_dirs"],
+            "clustering_outdir": args.outdir,
+            "outdir": args.outdir / "tcr_complex_clusters",
+            "structure_refinement_mode": args.tcr_complex_structure_mode,
+            "tcr_complex_tm_score_threshold": args.tcr_complex_tm_score_threshold,
+            "model": args.model,
+            "drop_hydrogens": not args.keep_hydrogens,
+            "usalign_executable": args.usalign_executable,
+            "alignment_jobs": args.usalign_jobs,
+            "cif_files_directory": cif_files_directory,
+        }))
+
+    build_funcs = {
+        "dimer": build_dimer_signature_clusters,
+        "multimer": build_multimer_signature_clusters,
+        "antibody_complex": build_antibody_complex_signature_clusters,
+        "tcr_complex": build_tcr_complex_signature_clusters,
+    }
+
+    if len(build_specs) <= 1:
+        for kind, _, _, _, _, kwargs in build_specs:
+            build_funcs[kind](**kwargs)
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(build_specs), 4)) as executor:
+            futures = {
+                executor.submit(build_funcs[kind], **kwargs): kind
+                for kind, _, _, _, _, kwargs in build_specs
+            }
+            for future in as_completed(futures):
+                kind = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    LOGGER.exception("Higher-order clustering step %s failed", kind)
+                    raise
+
     return 0
 
 

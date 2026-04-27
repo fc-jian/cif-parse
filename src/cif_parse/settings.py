@@ -264,40 +264,42 @@ def default_cli_config() -> dict[str, Any]:
 
 
 def load_cli_config(config_path: str | Path | None = None) -> tuple[Path | None, dict[str, Any]]:
-    """Load `config.toml` defaults for the CLI if a config file is available."""
+    """Load `config.toml` if *config_path* is explicitly provided; otherwise return built-in defaults.
 
-    resolved_path: Path | None
+    The caller is responsible for passing ``--config`` from the CLI.  When the user
+    does not supply ``--config`` the function simply returns the hard-coded defaults
+    without attempting any file-system auto-discovery.
+    """
+
     if config_path is None:
-        resolved_path = DEFAULT_CONFIG_PATH if DEFAULT_CONFIG_PATH.exists() else None
-    else:
-        resolved_path = Path(config_path)
-        if not resolved_path.exists():
-            raise FileNotFoundError(f"config file not found: {resolved_path}")
+        return None, default_cli_config()
+
+    resolved_path = Path(config_path)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"config file not found: {resolved_path}")
 
     config = default_cli_config()
-    if resolved_path is None:
-        return None, config
-
     parsed = tomllib.loads(resolved_path.read_text(encoding="utf-8"))
     _merge_toml_config(config, parsed)
     return resolved_path, config
 
 
 def load_clustering_cli_config(config_path: str | Path | None = None) -> tuple[Path | None, dict[str, Any]]:
-    """Load defaults for the independent clustering CLI from `config_clustering.toml`."""
+    """Load `config_clustering.toml` if *config_path* is explicitly provided; otherwise return built-in defaults.
 
-    resolved_path: Path | None
+    The caller is responsible for passing ``--config`` from the CLI.  When the user
+    does not supply ``--config`` the function simply returns the hard-coded defaults
+    without attempting any file-system auto-discovery.
+    """
+
     if config_path is None:
-        resolved_path = DEFAULT_CLUSTERING_CONFIG_PATH if DEFAULT_CLUSTERING_CONFIG_PATH.exists() else None
-    else:
-        resolved_path = Path(config_path)
-        if not resolved_path.exists():
-            raise FileNotFoundError(f"config file not found: {resolved_path}")
+        return None, default_cli_config()
+
+    resolved_path = Path(config_path)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"config file not found: {resolved_path}")
 
     config = default_cli_config()
-    if resolved_path is None:
-        return None, config
-
     parsed = tomllib.loads(resolved_path.read_text(encoding="utf-8"))
     _merge_toml_config(config, parsed)
     return resolved_path, config
@@ -482,6 +484,25 @@ def _normalize_legacy_setting_aliases(source: dict[str, Any]) -> dict[str, Any]:
             )
         normalized[current_key] = normalized.pop(legacy_key)
     return normalized
+
+
+def resolve_source_path(source_path: str, cif_files_directory: str | Path | None = None) -> str:
+    """Remap *source_path* when an explicit ``--cif-files-directory`` is provided.
+
+    When *cif_files_directory* is ``None`` the original *source_path* is returned
+    unchanged.  Otherwise the basename of *source_path* is joined with
+    *cif_files_directory* and the resulting path must exist.
+    """
+
+    if cif_files_directory is None:
+        return source_path
+    resolved = Path(cif_files_directory) / Path(source_path).name
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"Source file not found in cif directory: {resolved} "
+            f"(original: {source_path})"
+        )
+    return str(resolved)
 
 
 def _require_mapping(section_name: str, value: Any) -> None:

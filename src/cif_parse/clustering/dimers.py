@@ -4,6 +4,7 @@ import json
 import logging
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -25,6 +26,7 @@ from cif_parse.clustering.protein_structures import (
 from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl, load_case_output_bundles
 from cif_parse.io import read_cif_file
+from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
 
 
@@ -193,6 +195,7 @@ def _resolve_monomer_cluster(
 def collect_dimer_observations(
     case_dirs: Iterable[str | Path],
     monomer_cluster_assignments: dict[str, dict[str, str]],
+    cif_files_directory: str | None = None,
 ) -> list[DimerObservation]:
     """Collect dimer observations from case-output bundles."""
 
@@ -202,7 +205,10 @@ def collect_dimer_observations(
         for payload in payloads:
             summary = payload.get("structure_summary", {})
             pdb_id = str(summary.get("pdb_id", "") or "")
-            source_path = str(summary.get("source_path", "") or "")
+            source_path = resolve_source_path(
+                str(summary.get("source_path", "") or ""),
+                cif_files_directory,
+            )
             assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
             default_assembly_id = assembly_ids[0] if len(assembly_ids) == 1 else None
             dimers = payload.get("dimer_interfaces", [])
@@ -389,49 +395,87 @@ def extract_dimer_structures(
     outdir: str | Path,
     model: int = 1,
     drop_hydrogens: bool = True,
+    extraction_jobs: int = 1,
 ) -> tuple[dict[str, ExtractedDimerStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     structures: dict[str, ExtractedDimerStructure] = {}
     failures: list[dict[str, str]] = []
-    atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
 
     sorted_observations = sorted(observations, key=lambda item: item.dimer_observation_id)
-    for observation in sorted_observations:
+    extraction_jobs = normalize_worker_count(extraction_jobs)
+
+    def _load_atom_array(observation: DimerObservation, cache: dict, lock) -> AtomArray:
         cache_key = (observation.source_path, observation.assembly_id)
-        try:
-            if cache_key not in atom_array_cache:
+        with lock:
+            if cache_key not in cache:
                 cif_file = read_cif_file(observation.source_path)
                 if observation.assembly_id:
-                    atom_array_cache[cache_key] = get_assembly(
+                    cache[cache_key] = get_assembly(
                         cif_file,
                         assembly_id=observation.assembly_id,
                         model=model,
                         use_author_fields=False,
                     )
                 else:
-                    atom_array_cache[cache_key] = get_structure(
+                    cache[cache_key] = get_structure(
                         cif_file,
                         model=model,
                         use_author_fields=False,
                     )
-            extracted = extract_dimer_structure(
+        return cache[cache_key]
+
+    if extraction_jobs <= 1 or len(sorted_observations) <= 1:
+        atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
+        import threading as _threading
+        _lock = _threading.Lock()
+        for observation in sorted_observations:
+            try:
+                atom_array = _load_atom_array(observation, atom_array_cache, _lock)
+                structures[observation.dimer_observation_id] = extract_dimer_structure(
+                    observation,
+                    outdir=outdir,
+                    model=model,
+                    drop_hydrogens=drop_hydrogens,
+                    atom_array=atom_array,
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to extract dimer %s: %s", observation.dimer_observation_id, exc)
+                failures.append(
+                    {"dimer_observation_id": observation.dimer_observation_id, "error": str(exc)}
+                )
+    else:
+        import threading as _threading
+
+        atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
+        cache_lock = _threading.Lock()
+
+        def _extract_one(observation: DimerObservation) -> ExtractedDimerStructure | None:
+            atom_array = _load_atom_array(observation, atom_array_cache, cache_lock)
+            return extract_dimer_structure(
                 observation,
                 outdir=outdir,
                 model=model,
                 drop_hydrogens=drop_hydrogens,
-                atom_array=atom_array_cache[cache_key],
+                atom_array=atom_array,
             )
-        except Exception as exc:
-            LOGGER.warning("Failed to extract dimer %s: %s", observation.dimer_observation_id, exc)
-            failures.append(
-                {
-                    "dimer_observation_id": observation.dimer_observation_id,
-                    "error": str(exc),
-                }
-            )
-            continue
-        structures[observation.dimer_observation_id] = extracted
+
+        with ThreadPoolExecutor(max_workers=min(extraction_jobs, len(sorted_observations))) as executor:
+            future_to_obs = {
+                executor.submit(_extract_one, observation): observation
+                for observation in sorted_observations
+            }
+            for future in as_completed(future_to_obs):
+                observation = future_to_obs[future]
+                try:
+                    extracted = future.result()
+                    if extracted is not None:
+                        structures[observation.dimer_observation_id] = extracted
+                except Exception as exc:
+                    LOGGER.warning("Failed to extract dimer %s: %s", observation.dimer_observation_id, exc)
+                    failures.append(
+                        {"dimer_observation_id": observation.dimer_observation_id, "error": str(exc)}
+                    )
 
     dump_jsonl(outdir / "dimer_structure_extraction_failures.jsonl", failures)
     dump_jsonl(outdir / "dimer_structures.jsonl", [item.to_dict() for item in structures.values()])
@@ -439,6 +483,7 @@ def extract_dimer_structures(
         "num_dimer_observations": len(sorted_observations),
         "num_extracted_dimer_structures": len(structures),
         "num_failed_dimer_structure_extractions": len(failures),
+        "extraction_jobs": extraction_jobs,
     }
     dump_json(outdir / "dimer_structure_manifest.json", manifest, indent=2)
     return structures, manifest
@@ -736,11 +781,14 @@ def build_dimer_signature_clusters(
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
+    cif_files_directory: str | None = None,
 ) -> dict[str, Any]:
     """Build dimer clusters from monomer assignments and optional structure refinement."""
 
     monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
-    observations = collect_dimer_observations(case_dirs, monomer_assignments)
+    observations = collect_dimer_observations(
+        case_dirs, monomer_assignments, cif_files_directory=cif_files_directory
+    )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -769,6 +817,7 @@ def build_dimer_signature_clusters(
             outdir=outdir / "structures",
             model=model,
             drop_hydrogens=drop_hydrogens,
+            extraction_jobs=alignment_jobs,
         )
 
     if structure_refinement_mode == "greedy":

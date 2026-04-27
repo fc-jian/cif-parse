@@ -96,15 +96,16 @@ Key clustering defaults:
 
 ## Configuration
 
-The parser default configuration file is `config.toml`. The clustering default configuration file is `config_clustering.toml`. CLI arguments always override values from the config file.
+Configuration files must be explicitly provided via `--config`. Without `--config` the CLI uses built-in defaults for every setting.
 
-Use the default file:
+- Parser CLI: `cif-parse --config config.toml ...`
+- Clustering CLI: `cif-parse-cluster --config config_clustering.toml ...`
+
+CLI arguments always override values from the config file.
 
 ```bash
 cif-parse --config config.toml batch path/to/mmcif_dir --outdir batch_outputs
 ```
-
-Use the same config for clustering:
 
 ```bash
 cif-parse-cluster --config config_clustering.toml --inputs batch_outputs/cases --outdir cluster_outputs
@@ -112,10 +113,10 @@ cif-parse-cluster --config config_clustering.toml --inputs batch_outputs/cases -
 
 The main sections are:
 
-1. `[settings]`: parser behavior, assembly mode, contact thresholds, immune annotation thresholds.
-2. `[single]`: default single-run output directory.
-3. `[batch]`: default batch output directory and worker count.
-4. `[clustering]` in `config_clustering.toml`: clustering modes, sequence thresholds, TM-score thresholds, USalign settings, and parallel worker counts.
+1. `[settings]` (in `config.toml`): parser behavior, assembly mode, contact thresholds, immune annotation thresholds.
+2. `[single]` (in `config.toml`): default single-run output directory.
+3. `[batch]` (in `config.toml`): default batch output directory and worker count.
+4. `[clustering]` (in `config_clustering.toml`): clustering modes, sequence thresholds, TM-score thresholds, USalign settings, and parallel worker counts.
 
 ## Typical Workflow
 
