@@ -101,7 +101,9 @@ def discover_case_output_dirs(inputs: Iterable[str | Path]) -> list[Path]:
         for child in sorted(current.iterdir()):
             if child.is_dir():
                 pending.append(child.resolve())
-    return sorted(discovered)
+    discovered = sorted(discovered)
+    LOGGER.info("Discovered %d case output directory(s) from %d input(s)", len(discovered), len(list(inputs)))
+    return discovered
 
 
 @dataclass(slots=True)
@@ -299,6 +301,13 @@ def collect_canonical_monomers(
         "counts_by_polymer_class": dict(sorted(counts_by_polymer_class.items())),
         "input_case_dirs": [str(path) for path in case_paths],
     }
+    LOGGER.info(
+        "Collected %d canonical monomers from %d case bundles (%d polymer observations, %d duplicates removed)",
+        len(monomers),
+        num_case_bundles,
+        polymer_observations,
+        eligible_observations - len(monomers),
+    )
     return MonomerInventoryResult(monomers=monomers, manifest=manifest)
 
 
@@ -560,6 +569,11 @@ def build_monomer_sequence_dataset(
         "num_sequence_membership_rows": len(membership_rows),
     }
     dump_json(outdir / "manifest.json.gz", manifest, indent=2)
+    LOGGER.info(
+        "Wrote sequence membership: %d rows, protein mode=%s",
+        len(membership_rows),
+        protein_sequence_mode,
+    )
     return {
         "case_dirs": case_dirs,
         "monomers": monomers,

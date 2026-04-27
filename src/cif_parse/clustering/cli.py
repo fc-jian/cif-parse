@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -255,6 +256,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     cif_files_directory: str | None = str(args.cif_files_directory) if args.cif_files_directory is not None else None
+
+    # --- Step 1: monomer sequence dataset ---
+    t0 = time.monotonic()
+    LOGGER.info("Step 1/4: Building monomer sequence dataset from %d input(s)", len(args.inputs))
     sequence_dataset = build_monomer_sequence_dataset(
         inputs=args.inputs,
         outdir=args.outdir,
@@ -265,14 +270,47 @@ def main(argv: list[str] | None = None) -> int:
         mmseqs_threads=args.mmseqs_threads,
         cif_files_directory=cif_files_directory,
     )
+    manifest = sequence_dataset.get("manifest", {})
+    LOGGER.info(
+        "Step 1 complete (%.1fs): %d case dirs, %d canonical monomers, %d sequence membership rows",
+        time.monotonic() - t0,
+        manifest.get("num_input_case_dirs", 0) if isinstance(manifest, dict) else 0,
+        manifest.get("num_canonical_monomers", 0) if isinstance(manifest, dict) else 0,
+        manifest.get("num_sequence_membership_rows", 0) if isinstance(manifest, dict) else 0,
+    )
+
+    # --- Step 2-3: protein monomer structure extraction + clustering ---
     if args.protein_structure_mode == "greedy":
+        t1 = time.monotonic()
+        protein_monomer_count = sum(
+            1 for m in sequence_dataset["monomers"] if m.polymer_class == "protein"
+        )
+        LOGGER.info(
+            "Step 2/4: Extracting protein monomer structures (%d monomers, %d workers)",
+            protein_monomer_count,
+            args.usalign_jobs,
+        )
         structure_outdir = args.outdir / "protein_structures"
-        extracted_structures, _ = extract_protein_monomer_structures(
+        extracted_structures, extraction_manifest = extract_protein_monomer_structures(
             sequence_dataset["monomers"],
             outdir=structure_outdir,
             model=args.model,
             drop_hydrogens=not args.keep_hydrogens,
             extraction_jobs=args.usalign_jobs,
+        )
+        LOGGER.info(
+            "Step 2 complete (%.1fs): %d structures extracted, %d failures",
+            time.monotonic() - t1,
+            extraction_manifest.get("num_extracted_protein_structures", 0),
+            extraction_manifest.get("num_failed_protein_structure_extractions", 0),
+        )
+
+        t2 = time.monotonic()
+        seq_cluster_count = len(set(row["sequence_cluster_id"] for row in sequence_dataset["membership_rows"] if row["polymer_class"] == "protein"))
+        LOGGER.info(
+            "Step 3/4: Clustering protein monomer structures (%d sequence clusters, %d workers)",
+            seq_cluster_count,
+            args.sequence_cluster_jobs,
         )
         greedy_cluster_protein_structures(
             sequence_dataset["monomers"],
@@ -285,8 +323,9 @@ def main(argv: list[str] | None = None) -> int:
             sequence_cluster_jobs=args.sequence_cluster_jobs,
             pairwise_alignment_jobs=args.usalign_jobs,
         )
+        LOGGER.info("Step 3 complete (%.1fs)", time.monotonic() - t2)
 
-    # Steps 4-7 are independent of each other — run them concurrently.
+    # --- Steps 4: higher-order clustering (run concurrently) ---
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     build_specs: list[tuple[str, str, str, str, str, dict[str, Any]]] = []
@@ -350,10 +389,20 @@ def main(argv: list[str] | None = None) -> int:
         "tcr_complex": build_tcr_complex_signature_clusters,
     }
 
+    if build_specs:
+        step_names = ", ".join(kind for kind, _, _, _, _, _ in build_specs)
+        t3 = time.monotonic()
+        LOGGER.info(
+            "Step 4/4: Building higher-order clusters [%s] (%d steps, %d parallel)",
+            step_names,
+            len(build_specs),
+            min(len(build_specs), 4),
+        )
     if len(build_specs) <= 1:
         for kind, _, _, _, _, kwargs in build_specs:
             build_funcs[kind](**kwargs)
-    else:
+            LOGGER.info("Higher-order step %s completed", kind)
+    elif build_specs:
         with ThreadPoolExecutor(max_workers=min(len(build_specs), 4)) as executor:
             futures = {
                 executor.submit(build_funcs[kind], **kwargs): kind
@@ -363,9 +412,13 @@ def main(argv: list[str] | None = None) -> int:
                 kind = futures[future]
                 try:
                     future.result()
+                    LOGGER.info("Higher-order step %s completed", kind)
                 except Exception:
                     LOGGER.exception("Higher-order clustering step %s failed", kind)
                     raise
+    if build_specs:
+        LOGGER.info("Step 4 complete (%.1fs)", time.monotonic() - t3)
+    LOGGER.info("Clustering pipeline finished (%.1fs total)", time.monotonic() - t0)
 
     return 0
 

@@ -266,6 +266,7 @@ def collect_multimer_observations(
                         signature_members=signature_members,
                     )
                 )
+    LOGGER.info("Collected %d multimer observations from %d case dir(s)", len(observations), len(list(case_dirs)))
     return observations
 
 
@@ -497,6 +498,7 @@ def extract_multimer_structures(
         "extraction_jobs": extraction_jobs,
     }
     dump_json(outdir / "multimer_structure_manifest.json", manifest, indent=2)
+    LOGGER.info("Extracted %d multimer structures (%d failures)", len(structures), len(failures))
     return structures, manifest
 
 
@@ -543,6 +545,13 @@ def refine_multimer_signature_clusters(
 ) -> dict[str, Any]:
     runner = alignment_runner or run_multimer_usalign_alignment
     alignment_jobs = normalize_worker_count(alignment_jobs)
+    total_observations = sum(len(members) for _, members in signature_groups)
+    LOGGER.info(
+        "Refining %d multimer signature clusters (%d observations, %d alignment workers)",
+        len(signature_groups),
+        total_observations,
+        alignment_jobs,
+    )
     alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}
     alignment_rows: list[dict[str, Any]] = []
     warning_rows: list[dict[str, Any]] = []
@@ -765,6 +774,14 @@ def refine_multimer_signature_clusters(
         "multimer_tm_score_threshold": tm_score_threshold,
         "alignment_jobs": alignment_jobs,
     }
+    LOGGER.info(
+        "Multimer refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits)",
+        len(signature_groups),
+        len(cluster_members),
+        num_alignment_runs,
+        num_alignment_failures,
+        num_signature_clusters_split,
+    )
     return {
         "manifest": manifest,
         "membership_rows": membership_rows,

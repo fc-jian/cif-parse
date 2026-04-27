@@ -306,6 +306,7 @@ def collect_dimer_observations(
                         cluster_source_2=cluster_source_2,
                     )
                 )
+    LOGGER.info("Collected %d dimer observations from %d case dir(s)", len(observations), len(list(case_dirs)))
     return observations
 
 
@@ -486,6 +487,7 @@ def extract_dimer_structures(
         "extraction_jobs": extraction_jobs,
     }
     dump_json(outdir / "dimer_structure_manifest.json", manifest, indent=2)
+    LOGGER.info("Extracted %d dimer structures (%d failures)", len(structures), len(failures))
     return structures, manifest
 
 
@@ -540,6 +542,13 @@ def refine_dimer_signature_clusters(
     num_alignment_failures = 0
     num_signature_clusters_split = 0
 
+    total_observations = sum(len(members) for _, members in signature_groups)
+    LOGGER.info(
+        "Refining %d dimer signature clusters (%d observations, %d alignment workers)",
+        len(signature_groups),
+        total_observations,
+        alignment_jobs,
+    )
     for signature_cluster_id, members in signature_groups:
         extracted_members = [
             member for member in members if member.dimer_observation_id in extracted_structures
@@ -722,6 +731,14 @@ def refine_dimer_signature_clusters(
         "dimer_tm_score_threshold": tm_score_threshold,
         "alignment_jobs": alignment_jobs,
     }
+    LOGGER.info(
+        "Dimer refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits)",
+        len(signature_groups),
+        len(cluster_members),
+        num_alignment_runs,
+        num_alignment_failures,
+        num_signature_clusters_split,
+    )
     return {
         "manifest": manifest,
         "membership_rows": membership_rows,

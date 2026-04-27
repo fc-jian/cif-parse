@@ -500,6 +500,15 @@ def greedy_cluster_protein_structures(
     outdir.mkdir(parents=True, exist_ok=True)
     runner = alignment_runner or run_usalign_alignment
 
+    available_structures = len(extracted_structures)
+    LOGGER.info(
+        "Clustering protein monomers: %d sequence groups, %d available structures, %d seq-cluster workers, %d pairwise workers",
+        len(sequence_groups),
+        available_structures,
+        sequence_cluster_jobs,
+        pairwise_alignment_jobs,
+    )
+
     alignment_rows: list[dict[str, Any]] = []
     membership_out_rows: list[dict[str, Any]] = []
     representative_rows: list[dict[str, Any]] = []
@@ -901,6 +910,13 @@ def greedy_cluster_protein_structures(
         "pairwise_alignment_jobs": pairwise_alignment_jobs,
     }
     dump_json(outdir / "protein_structure_cluster_manifest.json", manifest, indent=2)
+    LOGGER.info(
+        "Protein monomer clustering: %d sequence clusters -> %d structure clusters (%d alignments, %d failures)",
+        len(sequence_groups),
+        total_struct_clusters,
+        total_alignments,
+        total_alignment_failures,
+    )
     return {
         "manifest": manifest,
         "membership_rows": membership_out_rows,
