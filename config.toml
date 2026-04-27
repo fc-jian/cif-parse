@@ -147,3 +147,135 @@ jobs = 8
 # Stop the batch run after the first failed input.
 # Options: true, false.
 fail_fast = false
+
+[clustering]
+# Default output directory for `cif-parse-cluster`.
+# Allowed values: any writable filesystem path.
+outdir = "cluster_outputs"
+
+# Protein sequence bucket strategy before structure clustering.
+# Options:
+# - "skip": do not assign protein sequence clusters.
+# - "exact": group identical protein sequences.
+# - "mmseqs2": run the external `mmseqs` executable with `protein_min_seq_id`.
+protein_sequence_mode = "mmseqs2"
+
+# Protein monomer structure clustering mode inside each sequence bucket.
+# Options:
+# - "skip": only export sequence-level clusters.
+# - "greedy": extract monomer coordinates and run USalign-based greedy clustering.
+protein_structure_mode = "greedy"
+
+# Dimer/interface clustering mode.
+# Options:
+# - "skip": do not cluster dimer/interface observations.
+# - "signature": cluster by member monomer cluster ids and interface metadata.
+dimer_mode = "signature"
+
+# Structure refinement mode for signature-matched dimer/interface observations.
+# Options:
+# - "skip": keep signature clusters as final clusters.
+# - "greedy": run overall dimer USalign and split low-TM members.
+dimer_structure_mode = "greedy"
+
+# Minimum overall max(TM(query,target), TM(target,query)) for keeping two
+# dimers in the same refined cluster.
+# Allowed values: float in [0, 1].
+dimer_tm_score_threshold = 0.50
+
+# Tight multimer clustering mode.
+# Options:
+# - "skip": do not cluster tight multimer observations.
+# - "signature": first cluster by member signature, then optionally refine by complex TM-score.
+multimer_mode = "signature"
+
+# Structure refinement mode for signature-matched tight multimers.
+# Options:
+# - "skip": keep signature clusters as final clusters.
+# - "greedy": run overall complex USalign and split low-TM members.
+multimer_structure_mode = "greedy"
+
+# Minimum overall max(TM(query,target), TM(target,query)) for keeping two
+# tight multimers in the same refined cluster.
+# Allowed values: float in [0, 1].
+multimer_tm_score_threshold = 0.50
+
+# Antibody-antigen complex clustering mode.
+# Options:
+# - "skip": do not cluster antibody-antigen complexes.
+# - "signature": first cluster by role-aware antibody/antigen signature, then
+#   optionally refine by complex TM-score.
+antibody_complex_mode = "signature"
+
+# Structure refinement mode for signature-matched antibody-antigen complexes.
+# Options:
+# - "skip": keep signature clusters as final clusters.
+# - "greedy": run overall complex USalign and split low-TM members.
+antibody_complex_structure_mode = "greedy"
+
+# Minimum overall max(TM(query,target), TM(target,query)) for keeping two
+# antibody-antigen complexes in the same refined cluster.
+# Allowed values: float in [0, 1].
+antibody_complex_tm_score_threshold = 0.50
+
+# TCR-pMHC complex clustering mode.
+# Options:
+# - "skip": do not cluster TCR-pMHC complexes.
+# - "signature": first cluster by role-aware TCR/MHC/peptide signature, then
+#   optionally refine by complex TM-score.
+tcr_complex_mode = "signature"
+
+# Structure refinement mode for signature-matched TCR-pMHC complexes.
+# Options:
+# - "skip": keep signature clusters as final clusters.
+# - "greedy": run overall complex USalign and split low-TM members.
+tcr_complex_structure_mode = "greedy"
+
+# Minimum overall max(TM(query,target), TM(target,query)) for keeping two
+# TCR-pMHC complexes in the same refined cluster.
+# Allowed values: float in [0, 1].
+tcr_complex_tm_score_threshold = 0.50
+
+# Protein sequence identity threshold used only when
+# `protein_sequence_mode = "mmseqs2"`.
+# Allowed values: float in [0, 1].
+protein_min_seq_id = 0.40
+
+# Protein sequence coverage threshold used only when
+# `protein_sequence_mode = "mmseqs2"`.
+# Allowed values: float in [0, 1].
+protein_coverage = 0.80
+
+# mmseqs2 coverage mode used only when `protein_sequence_mode = "mmseqs2"`.
+# Common options include 0, 1, 2, and 5; default 5 is the current project
+# choice for shorter-side style coverage behavior.
+# Allowed values: integer >= 0.
+protein_cov_mode = 5
+
+# 1-based model index used when extracting monomer or complex coordinates.
+# Allowed values: integer >= 1.
+model = 1
+
+# Keep hydrogen atoms in structures exported for USalign.
+# Options:
+# - false: heavy-atom-only extraction; recommended default.
+# - true: retain hydrogens where present.
+keep_hydrogens = false
+
+# Minimum max(TM(query,target), TM(target,query)) for protein monomer structure
+# clustering inside a sequence bucket.
+# Allowed values: float in [0, 1].
+tm_score_threshold = 0.50
+
+# Minimum aligned-length / shorter-sequence-length ratio for protein monomer
+# structure clustering.
+# Allowed values: float in [0, 1].
+min_alignment_coverage_ratio = 0.80
+
+# USalign executable name or absolute path.
+# Allowed values: executable available on PATH or absolute executable path.
+usalign_executable = "USalign"
+
+# Root logging level for clustering runs.
+# Options: "DEBUG", "INFO", "WARNING", "ERROR".
+log_level = "INFO"

@@ -13,10 +13,14 @@ SUPPORTED_FORMATS = frozenset({"json", "csv"})
 SUPPORTED_ASSEMBLY_MODES = frozenset({"largest_assembly", "asymmetric_unit", "all"})
 SUPPORTED_COVERAGE_MODES = frozenset({"nearest", "contact", "covalent"})
 SUPPORTED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR"})
+SUPPORTED_CLUSTERING_SEQUENCE_MODES = frozenset({"skip", "exact", "mmseqs2"})
+SUPPORTED_CLUSTERING_STRUCTURE_MODES = frozenset({"skip", "greedy"})
+SUPPORTED_CLUSTERING_OBJECT_MODES = frozenset({"skip", "signature"})
 
 DEFAULT_CONFIG_PATH = Path("config.toml")
 DEFAULT_SINGLE_OUTDIR = Path("outputs")
 DEFAULT_BATCH_OUTDIR = Path("batch_outputs")
+DEFAULT_CLUSTERING_OUTDIR = Path("cluster_outputs")
 
 _DEFAULT_JOB_COUNT = max(1, os.cpu_count() or 1)
 
@@ -95,6 +99,81 @@ class AppSettings:
             raise ValueError("low_confidence_antibody_threshold must be in [0, 1]")
 
 
+@dataclass(slots=True)
+class ClusteringSettings:
+    """Runtime settings for the independent clustering CLI."""
+
+    outdir: Path | str = DEFAULT_CLUSTERING_OUTDIR
+    protein_sequence_mode: str = "mmseqs2"
+    protein_structure_mode: str = "greedy"
+    dimer_mode: str = "signature"
+    dimer_structure_mode: str = "greedy"
+    dimer_tm_score_threshold: float = 0.50
+    multimer_mode: str = "signature"
+    multimer_structure_mode: str = "greedy"
+    multimer_tm_score_threshold: float = 0.50
+    antibody_complex_mode: str = "signature"
+    antibody_complex_structure_mode: str = "greedy"
+    antibody_complex_tm_score_threshold: float = 0.50
+    tcr_complex_mode: str = "signature"
+    tcr_complex_structure_mode: str = "greedy"
+    tcr_complex_tm_score_threshold: float = 0.50
+    protein_min_seq_id: float = 0.40
+    protein_coverage: float = 0.80
+    protein_cov_mode: int = 5
+    model: int = 1
+    keep_hydrogens: bool = False
+    tm_score_threshold: float = 0.50
+    min_alignment_coverage_ratio: float = 0.80
+    usalign_executable: str = "USalign"
+    log_level: str = "INFO"
+
+    def __post_init__(self) -> None:
+        self.outdir = Path(self.outdir)
+        if self.protein_sequence_mode not in SUPPORTED_CLUSTERING_SEQUENCE_MODES:
+            raise ValueError(f"Unsupported protein_sequence_mode: {self.protein_sequence_mode}")
+        if self.protein_structure_mode not in SUPPORTED_CLUSTERING_STRUCTURE_MODES:
+            raise ValueError(f"Unsupported protein_structure_mode: {self.protein_structure_mode}")
+        for field_name in (
+            "dimer_structure_mode",
+            "multimer_structure_mode",
+            "antibody_complex_structure_mode",
+            "tcr_complex_structure_mode",
+        ):
+            value = getattr(self, field_name)
+            if value not in SUPPORTED_CLUSTERING_STRUCTURE_MODES:
+                raise ValueError(f"Unsupported {field_name}: {value}")
+        for field_name in ("dimer_mode", "multimer_mode", "antibody_complex_mode", "tcr_complex_mode"):
+            value = getattr(self, field_name)
+            if value not in SUPPORTED_CLUSTERING_OBJECT_MODES:
+                raise ValueError(f"Unsupported {field_name}: {value}")
+        if self.log_level.upper() not in SUPPORTED_LOG_LEVELS:
+            raise ValueError(f"Unsupported clustering log_level: {self.log_level}")
+        self.log_level = self.log_level.upper()
+        if self.model < 1:
+            raise ValueError("clustering.model must be >= 1")
+        if self.dimer_tm_score_threshold < 0 or self.dimer_tm_score_threshold > 1:
+            raise ValueError("clustering.dimer_tm_score_threshold must be in [0, 1]")
+        if self.multimer_tm_score_threshold < 0 or self.multimer_tm_score_threshold > 1:
+            raise ValueError("clustering.multimer_tm_score_threshold must be in [0, 1]")
+        if self.antibody_complex_tm_score_threshold < 0 or self.antibody_complex_tm_score_threshold > 1:
+            raise ValueError("clustering.antibody_complex_tm_score_threshold must be in [0, 1]")
+        if self.tcr_complex_tm_score_threshold < 0 or self.tcr_complex_tm_score_threshold > 1:
+            raise ValueError("clustering.tcr_complex_tm_score_threshold must be in [0, 1]")
+        if self.protein_min_seq_id < 0 or self.protein_min_seq_id > 1:
+            raise ValueError("clustering.protein_min_seq_id must be in [0, 1]")
+        if self.protein_coverage < 0 or self.protein_coverage > 1:
+            raise ValueError("clustering.protein_coverage must be in [0, 1]")
+        if self.protein_cov_mode < 0:
+            raise ValueError("clustering.protein_cov_mode must be >= 0")
+        if self.tm_score_threshold < 0 or self.tm_score_threshold > 1:
+            raise ValueError("clustering.tm_score_threshold must be in [0, 1]")
+        if self.min_alignment_coverage_ratio < 0 or self.min_alignment_coverage_ratio > 1:
+            raise ValueError("clustering.min_alignment_coverage_ratio must be in [0, 1]")
+        if not self.usalign_executable:
+            raise ValueError("clustering.usalign_executable must not be empty")
+
+
 def default_cli_config() -> dict[str, Any]:
     """Return the built-in CLI defaults before loading config.toml."""
 
@@ -132,6 +211,32 @@ def default_cli_config() -> dict[str, Any]:
             "jobs": _DEFAULT_JOB_COUNT,
             "fail_fast": False,
         },
+        "clustering": {
+            "outdir": DEFAULT_CLUSTERING_OUTDIR,
+            "protein_sequence_mode": "mmseqs2",
+            "protein_structure_mode": "greedy",
+            "dimer_mode": "signature",
+            "dimer_structure_mode": "greedy",
+            "dimer_tm_score_threshold": 0.50,
+            "multimer_mode": "signature",
+            "multimer_structure_mode": "greedy",
+            "multimer_tm_score_threshold": 0.50,
+            "antibody_complex_mode": "signature",
+            "antibody_complex_structure_mode": "greedy",
+            "antibody_complex_tm_score_threshold": 0.50,
+            "tcr_complex_mode": "signature",
+            "tcr_complex_structure_mode": "greedy",
+            "tcr_complex_tm_score_threshold": 0.50,
+            "protein_min_seq_id": 0.40,
+            "protein_coverage": 0.80,
+            "protein_cov_mode": 5,
+            "model": 1,
+            "keep_hydrogens": False,
+            "tm_score_threshold": 0.50,
+            "min_alignment_coverage_ratio": 0.80,
+            "usalign_executable": "USalign",
+            "log_level": "INFO",
+        },
     }
 
 
@@ -158,7 +263,7 @@ def load_cli_config(config_path: str | Path | None = None) -> tuple[Path | None,
 def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
     """Merge TOML config data into the CLI defaults with basic validation."""
 
-    allowed_sections = {"settings", "single", "batch"}
+    allowed_sections = {"settings", "single", "batch", "clustering"}
     unknown_sections = sorted(set(parsed) - allowed_sections)
     if unknown_sections:
         raise ValueError(f"Unknown config section(s): {', '.join(unknown_sections)}")
@@ -166,9 +271,11 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
     settings_table = parsed.get("settings", {})
     single_table = parsed.get("single", {})
     batch_table = parsed.get("batch", {})
+    clustering_table = parsed.get("clustering", {})
     _require_mapping("settings", settings_table)
     _require_mapping("single", single_table)
     _require_mapping("batch", batch_table)
+    _require_mapping("clustering", clustering_table)
 
     _merge_section(
         config["settings"],
@@ -202,6 +309,37 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
     )
     _merge_section(config["single"], single_table, {"outdir"}, "single")
     _merge_section(config["batch"], batch_table, {"outdir", "jobs", "fail_fast"}, "batch")
+    _merge_section(
+        config["clustering"],
+        clustering_table,
+        {
+            "outdir",
+            "protein_sequence_mode",
+            "protein_structure_mode",
+            "dimer_mode",
+            "dimer_structure_mode",
+            "dimer_tm_score_threshold",
+            "multimer_mode",
+            "multimer_structure_mode",
+            "multimer_tm_score_threshold",
+            "antibody_complex_mode",
+            "antibody_complex_structure_mode",
+            "antibody_complex_tm_score_threshold",
+            "tcr_complex_mode",
+            "tcr_complex_structure_mode",
+            "tcr_complex_tm_score_threshold",
+            "protein_min_seq_id",
+            "protein_coverage",
+            "protein_cov_mode",
+            "model",
+            "keep_hydrogens",
+            "tm_score_threshold",
+            "min_alignment_coverage_ratio",
+            "usalign_executable",
+            "log_level",
+        },
+        "clustering",
+    )
 
     validated_settings = AppSettings(**config["settings"])
     config["settings"] = {
@@ -231,6 +369,33 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
     }
     config["single"]["outdir"] = Path(config["single"]["outdir"])
     config["batch"]["outdir"] = Path(config["batch"]["outdir"])
+    validated_clustering = ClusteringSettings(**config["clustering"])
+    config["clustering"] = {
+        "outdir": validated_clustering.outdir,
+        "protein_sequence_mode": validated_clustering.protein_sequence_mode,
+        "protein_structure_mode": validated_clustering.protein_structure_mode,
+        "dimer_mode": validated_clustering.dimer_mode,
+        "dimer_structure_mode": validated_clustering.dimer_structure_mode,
+        "dimer_tm_score_threshold": validated_clustering.dimer_tm_score_threshold,
+        "multimer_mode": validated_clustering.multimer_mode,
+        "multimer_structure_mode": validated_clustering.multimer_structure_mode,
+        "multimer_tm_score_threshold": validated_clustering.multimer_tm_score_threshold,
+        "antibody_complex_mode": validated_clustering.antibody_complex_mode,
+        "antibody_complex_structure_mode": validated_clustering.antibody_complex_structure_mode,
+        "antibody_complex_tm_score_threshold": validated_clustering.antibody_complex_tm_score_threshold,
+        "tcr_complex_mode": validated_clustering.tcr_complex_mode,
+        "tcr_complex_structure_mode": validated_clustering.tcr_complex_structure_mode,
+        "tcr_complex_tm_score_threshold": validated_clustering.tcr_complex_tm_score_threshold,
+        "protein_min_seq_id": validated_clustering.protein_min_seq_id,
+        "protein_coverage": validated_clustering.protein_coverage,
+        "protein_cov_mode": validated_clustering.protein_cov_mode,
+        "model": validated_clustering.model,
+        "keep_hydrogens": validated_clustering.keep_hydrogens,
+        "tm_score_threshold": validated_clustering.tm_score_threshold,
+        "min_alignment_coverage_ratio": validated_clustering.min_alignment_coverage_ratio,
+        "usalign_executable": validated_clustering.usalign_executable,
+        "log_level": validated_clustering.log_level,
+    }
 
     jobs = config["batch"]["jobs"]
     if not isinstance(jobs, int) or jobs < 1:
