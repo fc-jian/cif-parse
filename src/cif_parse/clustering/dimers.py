@@ -24,7 +24,7 @@ from cif_parse.clustering.protein_structures import (
     parse_usalign_output,
 )
 from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
-from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl, load_case_output_bundles
+from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.io import read_cif_file
 from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
@@ -196,12 +196,17 @@ def collect_dimer_observations(
     case_dirs: Iterable[str | Path],
     monomer_cluster_assignments: dict[str, dict[str, str]],
     cif_files_directory: str | None = None,
+    prep_db_path: str | Path | None = None,
 ) -> list[DimerObservation]:
     """Collect dimer observations from case-output bundles."""
 
     observations: list[DimerObservation] = []
-    for case_dir in sorted(Path(path).resolve() for path in case_dirs):
-        payloads = load_case_output_bundles(case_dir)
+    from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
+
+    sorted_dirs = sorted(Path(path).resolve() for path in case_dirs)
+    prep_bundles = load_bundles_for_collect(sorted_dirs, prep_db_path=prep_db_path)
+    for case_dir in sorted_dirs:
+        payloads = load_case_bundles(case_dir, prep_bundles=prep_bundles)
         for payload in payloads:
             summary = payload.get("structure_summary", {})
             pdb_id = str(summary.get("pdb_id", "") or "")
@@ -799,12 +804,15 @@ def build_dimer_signature_clusters(
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
     cif_files_directory: str | None = None,
+    prep_db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build dimer clusters from monomer assignments and optional structure refinement."""
 
     monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
     observations = collect_dimer_observations(
-        case_dirs, monomer_assignments, cif_files_directory=cif_files_directory
+        case_dirs, monomer_assignments,
+        cif_files_directory=cif_files_directory,
+        prep_db_path=prep_db_path,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

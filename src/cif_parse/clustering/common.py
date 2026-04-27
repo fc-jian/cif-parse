@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 def canonical_monomer_id(pdb_id: str, label_asym_id: str) -> str:
@@ -77,3 +77,40 @@ def resolve_monomer_cluster(
     if sequence_cluster_id is not None:
         return "sequence", sequence_cluster_id, sequence_cluster_id
     return "unclustered", f"monomer:{monomer_id}", None
+
+
+def _looks_like_case_output_dir(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if (path / "result.json").exists() or (path / "result.json.gz").exists():
+        return True
+    if (path / "structure_summary.json").exists() or (path / "structure_summary.json.gz").exists():
+        return True
+    if any(path.glob("result_assembly_*.json.gz")):
+        return True
+    return any(candidate.is_dir() and candidate.name.startswith("assembly_") for candidate in path.iterdir())
+
+
+def discover_case_output_dirs(inputs: Iterable[str | Path]) -> list[Path]:
+    """Discover case-output directories under the provided paths."""
+
+    discovered: list[Path] = []
+    discovered_keys: set[Path] = set()
+    visited: set[Path] = set()
+    pending = [Path(item).resolve() for item in inputs]
+    while pending:
+        current = pending.pop(0)
+        if current in visited or not current.exists():
+            continue
+        visited.add(current)
+        if current.is_file():
+            continue
+        if _looks_like_case_output_dir(current):
+            if current not in discovered_keys:
+                discovered_keys.add(current)
+                discovered.append(current)
+            continue
+        for child in sorted(current.iterdir()):
+            if child.is_dir():
+                pending.append(child.resolve())
+    return sorted(discovered)

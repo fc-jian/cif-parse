@@ -39,6 +39,47 @@ def build_parser(
     parser = argparse.ArgumentParser(
         description="Build monomer and higher-order clustering artifacts from cif-parse case outputs"
     )
+    subparsers = parser.add_subparsers(dest="subcommand")
+    # "prep" subcommand
+    prep_parser = subparsers.add_parser("prep", help="Build (or refresh) the clustering prep database")
+    prep_parser.add_argument(
+        "--inputs",
+        nargs="+",
+        type=Path,
+        required=True,
+        help="One or more case-output directories or parents containing case-output directories",
+    )
+    prep_parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=Path("clustering_prep.db"),
+        help="Path to the prep SQLite database",
+    )
+    prep_parser.add_argument(
+        "--cif-files-directory",
+        type=Path,
+        default=None,
+        help="Optional override directory for original mmCIF files",
+    )
+    prep_parser.add_argument(
+        "--prep-jobs",
+        type=int,
+        default=int(clustering_defaults.get("jobs", 4)),
+        help="Number of parallel workers for prep database ingestion",
+    )
+    prep_parser.add_argument(
+        "--no-cif-cache",
+        action="store_true",
+        default=False,
+        help="Skip pre-loading mmCIF atom arrays into the cif_cache table",
+    )
+    prep_parser.add_argument(
+        "--config",
+        type=Path,
+        default=config_path,
+        help="Optional config_clustering.toml path",
+    )
+    # default "cluster" mode arguments
     parser.add_argument(
         "--config",
         type=Path,
@@ -51,6 +92,13 @@ def build_parser(
         type=Path,
         required=True,
         help="One or more case-output directories or parents containing case-output directories",
+    )
+    parser.add_argument(
+        "--prep-db",
+        type=Path,
+        default=None,
+        help="Optional path to a prep database (built with `cif-parse-cluster prep`); "
+        "when provided, case bundles are read from the database instead of individual files",
     )
     parser.add_argument(
         "--cif-files-directory",
@@ -239,12 +287,27 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap_parser.error(str(exc))
 
     args = build_parser(config_defaults=config_defaults, config_path=config_path).parse_args(argv)
+    configure_logging(getattr(args, "log_level", "INFO"))
+
+    # --- prep subcommand ---
+    if getattr(args, "subcommand", None) == "prep":
+        from cif_parse.clustering.prep import build_prep_database
+        configure_logging("INFO")
+        result = build_prep_database(
+            inputs=args.inputs,
+            db_path=args.db_path,
+            cif_files_directory=str(args.cif_files_directory) if args.cif_files_directory else None,
+            prep_jobs=args.prep_jobs,
+            load_cif_cache=not args.no_cif_cache,
+        )
+        LOGGER.info("Prep complete: %s", result)
+        return 0
+
     for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
         if getattr(args, field_name) < 1:
             build_parser(config_defaults=config_defaults, config_path=config_path).error(
                 f"--{field_name.replace('_', '-')} must be >= 1"
             )
-    configure_logging(args.log_level)
 
     if args.cif_files_directory is not None:
         LOGGER.warning(
@@ -256,10 +319,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     cif_files_directory: str | None = str(args.cif_files_directory) if args.cif_files_directory is not None else None
+    prep_db_path: str | None = str(args.prep_db) if getattr(args, "prep_db", None) else None
 
     # --- Step 1: monomer sequence dataset ---
     t0 = time.monotonic()
     LOGGER.info("Step 1/4: Building monomer sequence dataset from %d input(s)", len(args.inputs))
+    if prep_db_path:
+        LOGGER.info("Using prep database: %s", prep_db_path)
     sequence_dataset = build_monomer_sequence_dataset(
         inputs=args.inputs,
         outdir=args.outdir,
@@ -269,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         protein_cov_mode=args.protein_cov_mode,
         mmseqs_threads=args.mmseqs_threads,
         cif_files_directory=cif_files_directory,
+        prep_db_path=prep_db_path,
     )
     manifest = sequence_dataset.get("manifest", {})
     LOGGER.info(
@@ -341,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
             "usalign_executable": args.usalign_executable,
             "alignment_jobs": args.usalign_jobs,
             "cif_files_directory": cif_files_directory,
+            "prep_db_path": prep_db_path,
         }))
     if args.multimer_mode == "signature":
         build_specs.append(("multimer", "signature", args.multimer_structure_mode, "multimer_tm_score_threshold", "multimer_clusters", {
@@ -354,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             "usalign_executable": args.usalign_executable,
             "alignment_jobs": args.usalign_jobs,
             "cif_files_directory": cif_files_directory,
+            "prep_db_path": prep_db_path,
         }))
     if args.antibody_complex_mode == "signature":
         build_specs.append(("antibody_complex", "signature", args.antibody_complex_structure_mode, "antibody_complex_tm_score_threshold", "antibody_complex_clusters", {
@@ -367,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
             "usalign_executable": args.usalign_executable,
             "alignment_jobs": args.usalign_jobs,
             "cif_files_directory": cif_files_directory,
+            "prep_db_path": prep_db_path,
         }))
     if args.tcr_complex_mode == "signature":
         build_specs.append(("tcr_complex", "signature", args.tcr_complex_structure_mode, "tcr_complex_tm_score_threshold", "tcr_complex_clusters", {
@@ -380,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
             "usalign_executable": args.usalign_executable,
             "alignment_jobs": args.usalign_jobs,
             "cif_files_directory": cif_files_directory,
+            "prep_db_path": prep_db_path,
         }))
 
     build_funcs = {

@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from tqdm import tqdm
+
 from biotite.structure import AtomArray, get_residues
 from biotite.structure.io.pdb import PDBFile
 from biotite.structure.io.pdbx import CIFBlock, CIFCategory, get_structure
@@ -397,7 +399,7 @@ def extract_protein_monomer_structures(
     if extraction_jobs <= 1 or len(protein_monomers) <= 1:
         quality_cache: dict[str, EntryQualityMetadata] = {}
         atom_array_cache: dict[str, AtomArray] = {}
-        for monomer in protein_monomers:
+        for monomer in tqdm(protein_monomers, desc="Extracting monomer structures", unit="monomer"):
             if monomer.source_path not in quality_cache:
                 quality_cache[monomer.source_path] = read_entry_quality_metadata(
                     monomer.source_path,
@@ -875,11 +877,19 @@ def greedy_cluster_protein_structures(
     sequence_group_items = list(sequence_groups.items())
     sequence_cluster_jobs = min(normalize_worker_count(sequence_cluster_jobs), max(1, len(sequence_group_items)))
     if sequence_cluster_jobs <= 1:
-        group_results = [process_sequence_group(item) for item in sequence_group_items]
+        group_results = [
+            process_sequence_group(item)
+            for item in tqdm(sequence_group_items, desc="Clustering protein structures", unit="seq-group")
+        ]
     else:
-        with ThreadPoolExecutor(max_workers=sequence_cluster_jobs) as executor:
-            futures = [executor.submit(process_sequence_group, item) for item in sequence_group_items]
-            group_results = [future.result() for future in futures]
+        from tqdm.contrib.concurrent import thread_map
+        group_results = thread_map(
+            process_sequence_group,
+            sequence_group_items,
+            max_workers=sequence_cluster_jobs,
+            desc="Clustering protein structures",
+            unit="seq-group",
+        )
 
     for group_result in group_results:
         alignment_rows.extend(group_result["alignment_rows"])

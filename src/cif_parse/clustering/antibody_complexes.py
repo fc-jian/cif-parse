@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from tqdm import tqdm
+
 import biotite.structure as struc
 from biotite.structure import AtomArray, get_residues
 from biotite.structure.io.pdb import PDBFile
@@ -25,7 +27,7 @@ from cif_parse.clustering.protein_structures import (
     parse_usalign_output,
 )
 from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
-from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl, load_case_output_bundles
+from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.io import read_cif_file
 from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
@@ -204,10 +206,15 @@ def collect_antibody_complex_observations(
     monomer_cluster_assignments: dict[str, dict[str, str]],
     monomer_inventory: dict[str, dict[str, Any]],
     cif_files_directory: str | None = None,
+    prep_db_path: str | Path | None = None,
 ) -> list[AntibodyComplexObservation]:
     observations: list[AntibodyComplexObservation] = []
-    for case_dir in sorted(Path(path).resolve() for path in case_dirs):
-        payloads = load_case_output_bundles(case_dir)
+    from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
+
+    sorted_dirs = sorted(Path(path).resolve() for path in case_dirs)
+    prep_bundles = load_bundles_for_collect(sorted_dirs, prep_db_path=prep_db_path)
+    for case_dir in tqdm(sorted_dirs, desc="Collecting antibody complexes", unit="case"):
+        payloads = load_case_bundles(case_dir, prep_bundles=prep_bundles)
         for payload in payloads:
             summary = payload.get("structure_summary", {})
             pdb_id = str(summary.get("pdb_id", "") or "")
@@ -562,7 +569,7 @@ def extract_antibody_complex_structures(
         )
 
     if extraction_jobs <= 1 or len(sorted_observations) <= 1:
-        for observation in sorted_observations:
+        for observation in tqdm(sorted_observations, desc="Extracting antibody complex structures", unit="complex"):
             try:
                 structures[observation.complex_observation_id] = _process_one(observation)
             except Exception as exc:
@@ -675,7 +682,7 @@ def refine_antibody_complex_signature_clusters(
     num_alignment_failures = 0
     num_signature_clusters_split = 0
 
-    for signature_cluster_id, members in signature_groups:
+    for signature_cluster_id, members in tqdm(signature_groups, desc="Refining antibody complex clusters", unit="sig-group"):
         extracted_members = [
             member for member in members if member.complex_observation_id in extracted_structures
         ]
@@ -919,6 +926,7 @@ def build_antibody_complex_signature_clusters(
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
     cif_files_directory: str | None = None,
+    prep_db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
     monomer_inventory = load_monomer_inventory(clustering_outdir)
@@ -927,6 +935,7 @@ def build_antibody_complex_signature_clusters(
         monomer_assignments,
         monomer_inventory,
         cif_files_directory=cif_files_directory,
+        prep_db_path=prep_db_path,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

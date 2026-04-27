@@ -10,8 +10,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from tqdm import tqdm
+
 from cif_parse.constants import POLYMER_CHAIN_TYPES, PROTEIN_CHAIN_TYPES
-from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl, load_case_output_bundles
+from cif_parse.clustering.common import discover_case_output_dirs
+from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
 
 
@@ -65,45 +68,6 @@ def _classify_polymer_class(chain_payload: dict[str, Any]) -> str | None:
         if "peptide" in polymer_type:
             return "protein"
     return None
-
-
-def _looks_like_case_output_dir(path: Path) -> bool:
-    if not path.is_dir():
-        return False
-    if (path / "result.json").exists() or (path / "result.json.gz").exists():
-        return True
-    if (path / "structure_summary.json").exists() or (path / "structure_summary.json.gz").exists():
-        return True
-    if any(path.glob("result_assembly_*.json.gz")):
-        return True
-    return any(candidate.is_dir() and candidate.name.startswith("assembly_") for candidate in path.iterdir())
-
-
-def discover_case_output_dirs(inputs: Iterable[str | Path]) -> list[Path]:
-    """Discover case-output directories under the provided paths."""
-
-    discovered: list[Path] = []
-    discovered_keys: set[Path] = set()
-    visited: set[Path] = set()
-    pending = [Path(item).resolve() for item in inputs]
-    while pending:
-        current = pending.pop(0)
-        if current in visited or not current.exists():
-            continue
-        visited.add(current)
-        if current.is_file():
-            continue
-        if _looks_like_case_output_dir(current):
-            if current not in discovered_keys:
-                discovered_keys.add(current)
-                discovered.append(current)
-            continue
-        for child in sorted(current.iterdir()):
-            if child.is_dir():
-                pending.append(child.resolve())
-    discovered = sorted(discovered)
-    LOGGER.info("Discovered %d case output directory(s) from %d input(s)", len(discovered), len(list(inputs)))
-    return discovered
 
 
 @dataclass(slots=True)
@@ -168,10 +132,14 @@ class MonomerInventoryResult:
 def collect_canonical_monomers(
     case_dirs: Iterable[str | Path],
     cif_files_directory: str | None = None,
+    prep_db_path: str | Path | None = None,
 ) -> MonomerInventoryResult:
     """Collect canonical monomer samples, deduplicated by `(pdb_id, label_asym_id)`."""
 
+    from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
+
     case_paths = [Path(path).resolve() for path in case_dirs]
+    prep_bundles = load_bundles_for_collect(case_paths, prep_db_path=prep_db_path)
     canonical: dict[tuple[str, str], MonomerSample] = {}
     counts_by_polymer_class: dict[str, int] = defaultdict(int)
     num_case_bundles = 0
@@ -181,8 +149,8 @@ def collect_canonical_monomers(
     skipped_unsupported_polymer_class = 0
     skipped_missing_identity = 0
 
-    for case_path in case_paths:
-        payloads = load_case_output_bundles(case_path)
+    for case_path in tqdm(case_paths, desc="Collecting canonical monomers", unit="case"):
+        payloads = load_case_bundles(case_path, prep_bundles=prep_bundles)
         num_case_bundles += len(payloads)
         for payload in payloads:
             summary = payload.get("structure_summary")
@@ -493,11 +461,16 @@ def build_monomer_sequence_dataset(
     protein_cov_mode: int = 5,
     mmseqs_threads: int = 1,
     cif_files_directory: str | None = None,
+    prep_db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build canonical monomer inventory and sequence-level grouping artifacts."""
 
     case_dirs = discover_case_output_dirs(inputs)
-    inventory = collect_canonical_monomers(case_dirs, cif_files_directory=cif_files_directory)
+    inventory = collect_canonical_monomers(
+        case_dirs,
+        cif_files_directory=cif_files_directory,
+        prep_db_path=prep_db_path,
+    )
     monomers = inventory.monomers
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
