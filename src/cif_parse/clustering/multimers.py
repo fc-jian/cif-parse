@@ -812,13 +812,13 @@ def build_multimer_signature_clusters(
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
     cif_files_directory: str | None = None,
-    prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
     observations = collect_multimer_observations(
         case_dirs, monomer_assignments,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_db_path,
+        prep_db_path=prep_dir,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

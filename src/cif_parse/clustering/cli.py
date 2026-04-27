@@ -50,10 +50,10 @@ def build_parser(
         help="One or more case-output directories or parents containing case-output directories",
     )
     prep_parser.add_argument(
-        "--db-path",
+        "--prep-dir",
         type=Path,
-        default=Path("clustering_prep.db"),
-        help="Path to the prep SQLite database",
+        default=Path("clustering_prep"),
+        help="Output directory for prep files (Parquet + cif_coords)",
     )
     prep_parser.add_argument(
         "--cif-files-directory",
@@ -94,11 +94,11 @@ def build_parser(
         help="One or more case-output directories or parents containing case-output directories",
     )
     parser.add_argument(
-        "--prep-db",
+        "--prep-dir",
         type=Path,
         default=None,
-        help="Optional path to a prep database (built with `cif-parse-cluster prep`); "
-        "when provided, case bundles are read from the database instead of individual files",
+        help="Optional path to a prep directory (built with `cif-parse-cluster prep`); "
+        "when provided, case data is read from Parquet files instead of individual bundles",
     )
     parser.add_argument(
         "--cif-files-directory",
@@ -295,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
         configure_logging("INFO")
         result = build_prep_database(
             inputs=args.inputs,
-            db_path=args.db_path,
+            prep_dir=args.prep_dir,
             cif_files_directory=str(args.cif_files_directory) if args.cif_files_directory else None,
             prep_jobs=args.prep_jobs,
             load_cif_cache=not args.no_cif_cache,
@@ -323,13 +323,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     cif_files_directory: str | None = str(args.cif_files_directory) if args.cif_files_directory is not None else None
-    prep_db_path: str | None = str(args.prep_db) if getattr(args, "prep_db", None) else None
+    prep_dir: str | None = str(args.prep_dir) if getattr(args, "prep_dir", None) else None
 
     # --- Step 1: monomer sequence dataset ---
     t0 = time.monotonic()
     LOGGER.info("Step 1/4: Building monomer sequence dataset from %d input(s)", len(args.inputs))
-    if prep_db_path:
-        LOGGER.info("Using prep database: %s", prep_db_path)
+    if prep_dir:
+        LOGGER.info("Using prep directory: %s", prep_dir)
     sequence_dataset = build_monomer_sequence_dataset(
         inputs=args.inputs,
         outdir=args.outdir,
@@ -339,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         protein_cov_mode=args.protein_cov_mode,
         mmseqs_threads=args.mmseqs_threads,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_db_path,
+        prep_dir=prep_dir,
     )
     manifest = sequence_dataset.get("manifest", {})
     LOGGER.info(
@@ -368,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             drop_hydrogens=not args.keep_hydrogens,
             extraction_jobs=args.usalign_jobs,
+            prep_dir=prep_dir,
         )
         LOGGER.info(
             "Step 2 complete (%.1fs): %d structures extracted, %d failures",
@@ -412,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
             "usalign_executable": args.usalign_executable,
             "alignment_jobs": args.usalign_jobs,
             "cif_files_directory": cif_files_directory,
-            "prep_db_path": prep_db_path,
+            "prep_dir": prep_dir,
         }))
     if args.multimer_mode == "signature":
         build_specs.append(("multimer", "signature", args.multimer_structure_mode, "multimer_tm_score_threshold", "multimer_clusters", {
@@ -426,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
             "usalign_executable": args.usalign_executable,
             "alignment_jobs": args.usalign_jobs,
             "cif_files_directory": cif_files_directory,
-            "prep_db_path": prep_db_path,
+            "prep_dir": prep_dir,
         }))
     if args.antibody_complex_mode == "signature":
         build_specs.append(("antibody_complex", "signature", args.antibody_complex_structure_mode, "antibody_complex_tm_score_threshold", "antibody_complex_clusters", {
@@ -440,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
             "usalign_executable": args.usalign_executable,
             "alignment_jobs": args.usalign_jobs,
             "cif_files_directory": cif_files_directory,
-            "prep_db_path": prep_db_path,
+            "prep_dir": prep_dir,
         }))
     if args.tcr_complex_mode == "signature":
         build_specs.append(("tcr_complex", "signature", args.tcr_complex_structure_mode, "tcr_complex_tm_score_threshold", "tcr_complex_clusters", {
@@ -454,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             "usalign_executable": args.usalign_executable,
             "alignment_jobs": args.usalign_jobs,
             "cif_files_directory": cif_files_directory,
-            "prep_db_path": prep_db_path,
+            "prep_dir": prep_dir,
         }))
 
     build_funcs = {

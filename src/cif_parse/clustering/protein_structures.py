@@ -377,18 +377,39 @@ def extract_protein_monomer_structures(
     model: int = 1,
     drop_hydrogens: bool = True,
     extraction_jobs: int = 1,
+    prep_dir: str | Path | None = None,
 ) -> tuple[dict[str, ExtractedMonomerStructure], dict[str, Any]]:
     """Extract analyzable PDB files for all protein monomers.
 
     *extraction_jobs* controls how many monomers are extracted concurrently.
-    Cached mmCIF reads and quality lookups are protected by a lock so that the
-    same source file is only opened once.
+    When *prep_dir* is provided, pre-parsed AtomArrays are fetched from the
+    binary index instead of re-reading the original mmCIF files.
     """
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    # Load cif_cache index + mmap when prep_dir is available
+    cif_idx: dict | None = None
+    cif_mmap = None
+    if prep_dir:
+        from cif_parse.clustering.prep import load_cif_coords_index, load_cif_from_prep
+        cif_idx = load_cif_coords_index(prep_dir)
+        if cif_idx is not None:
+            try:
+                import mmap as _mmap
+                bin_path = Path(prep_dir) / "cif_coords.bin"
+                if bin_path.exists():
+                    _fh = bin_path.open("rb")
+                    cif_mmap = _mmap.mmap(_fh.fileno(), 0, access=_mmap.ACCESS_READ)
+            except Exception:
+                cif_mmap = None
+
     structures: dict[str, ExtractedMonomerStructure] = {}
     failures: list[dict[str, str]] = []
+
+    def _load_cif_cache(_prep_dir, _source_path, _assembly_id, _idx, _mmap):
+        from cif_parse.clustering.prep import load_cif_from_prep as _lcfp
+        return _lcfp(_prep_dir, _source_path, _assembly_id, index=_idx, mmap=_mmap)
 
     protein_monomers = sorted(
         (monomer for monomer in monomers if monomer.polymer_class == "protein"),
@@ -400,6 +421,12 @@ def extract_protein_monomer_structures(
         quality_cache: dict[str, EntryQualityMetadata] = {}
         atom_array_cache: dict[str, AtomArray] = {}
         for monomer in tqdm(protein_monomers, desc="Extracting monomer structures", unit="monomer"):
+            if monomer.source_path not in atom_array_cache and cif_idx is not None:
+                _cached = _load_cif_cache(prep_dir, monomer.source_path, None, cif_idx, cif_mmap)
+                if _cached is not None:
+                    atom_array_cache[monomer.source_path] = _cached["atom_array"]
+                    if _cached.get("quality"):
+                        quality_cache[monomer.source_path] = _cached["quality"]
             if monomer.source_path not in quality_cache:
                 quality_cache[monomer.source_path] = read_entry_quality_metadata(
                     monomer.source_path,
@@ -433,6 +460,12 @@ def extract_protein_monomer_structures(
 
         def _extract_one(monomer: MonomerSample) -> ExtractedMonomerStructure | None:
             with cache_lock:
+                if monomer.source_path not in atom_array_cache and cif_idx is not None:
+                    _cached = _load_cif_cache(prep_dir, monomer.source_path, None, cif_idx, cif_mmap)
+                    if _cached is not None:
+                        atom_array_cache[monomer.source_path] = _cached["atom_array"]
+                        if _cached.get("quality"):
+                            quality_cache[monomer.source_path] = _cached["quality"]
                 if monomer.source_path not in quality_cache:
                     quality_cache[monomer.source_path] = read_entry_quality_metadata(
                         monomer.source_path,

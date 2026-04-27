@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from cif_parse.constants import POLYMER_CHAIN_TYPES, PROTEIN_CHAIN_TYPES
 from cif_parse.clustering.common import discover_case_output_dirs
+from cif_parse.clustering.prep import iter_parquet_rows, open_prep_parquet
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
 
@@ -132,14 +133,11 @@ class MonomerInventoryResult:
 def collect_canonical_monomers(
     case_dirs: Iterable[str | Path],
     cif_files_directory: str | None = None,
-    prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> MonomerInventoryResult:
     """Collect canonical monomer samples, deduplicated by `(pdb_id, label_asym_id)`."""
 
-    from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
-
     case_paths = [Path(path).resolve() for path in case_dirs]
-    prep_bundles = load_bundles_for_collect(case_paths, prep_db_path=prep_db_path)
     canonical: dict[tuple[str, str], MonomerSample] = {}
     counts_by_polymer_class: dict[str, int] = defaultdict(int)
     num_case_bundles = 0
@@ -149,108 +147,113 @@ def collect_canonical_monomers(
     skipped_unsupported_polymer_class = 0
     skipped_missing_identity = 0
 
-    for case_path in tqdm(case_paths, desc="Collecting canonical monomers", unit="case"):
-        payloads = load_case_bundles(case_path, prep_bundles=prep_bundles)
-        num_case_bundles += len(payloads)
-        for payload in payloads:
-            summary = payload.get("structure_summary")
-            chain_inventory = payload.get("chain_inventory")
-            if not isinstance(summary, dict) or not isinstance(chain_inventory, list):
-                raise TypeError(f"Invalid case bundle under {case_path}")
-            assembly_ids = [
-                str(item)
-                for item in summary.get("assembly_ids", [])
-                if str(item)
-            ]
-            source_path = resolve_source_path(
-                str(summary.get("source_path", "") or ""),
-                cif_files_directory,
-            )
-            bundle_pdb_id = str(summary.get("pdb_id", "") or "")
-            for chain_payload in chain_inventory:
-                if not isinstance(chain_payload, dict) or not _is_polymer_chain(chain_payload):
-                    continue
-                polymer_observations += 1
-                polymer_class = _classify_polymer_class(chain_payload)
-                if polymer_class is None:
-                    skipped_unsupported_polymer_class += 1
-                    continue
-                sequence = _normalize_sequence(chain_payload.get("sequence"))
-                if not sequence:
-                    skipped_missing_sequence += 1
-                    continue
-                pdb_id = str(chain_payload.get("pdb_id", "") or bundle_pdb_id)
-                label_asym_id = str(chain_payload.get("label_asym_id", "") or "")
-                if not pdb_id or not label_asym_id:
-                    skipped_missing_identity += 1
-                    LOGGER.warning(
-                        "Skipping chain without canonical identity in %s: pdb_id=%r label_asym_id=%r",
-                        case_path,
-                        pdb_id,
-                        label_asym_id,
-                    )
-                    continue
-                eligible_observations += 1
-                key = (pdb_id, label_asym_id)
-                if key not in canonical:
-                    sample = MonomerSample(
-                        monomer_id=_canonical_monomer_id(pdb_id, label_asym_id),
-                        pdb_id=pdb_id,
-                        label_asym_id=label_asym_id,
-                        auth_asym_id=(
-                            str(chain_payload.get("auth_asym_id"))
-                            if chain_payload.get("auth_asym_id") is not None
-                            else None
-                        ),
-                        entity_id=str(chain_payload.get("entity_id", "") or ""),
-                        entity_type=str(chain_payload.get("entity_type", "") or ""),
-                        entity_description=(
-                            str(chain_payload.get("entity_description"))
-                            if chain_payload.get("entity_description") is not None
-                            else None
-                        ),
-                        polymer_type=(
-                            str(chain_payload.get("polymer_type"))
-                            if chain_payload.get("polymer_type") is not None
-                            else None
-                        ),
-                        polymer_class=polymer_class,
-                        chain_type=str(chain_payload.get("chain_type", "") or ""),
-                        subtype=(
-                            str(chain_payload.get("subtype"))
-                            if chain_payload.get("subtype") is not None
-                            else None
-                        ),
-                        sequence=sequence,
-                        length=int(chain_payload.get("length", len(sequence)) or len(sequence)),
-                        residue_count=int(
-                            chain_payload.get("residue_count", chain_payload.get("length", len(sequence)))
-                            or len(sequence)
-                        ),
-                        atom_count=int(chain_payload.get("atom_count", 0) or 0),
-                        source_path=source_path,
-                        source_case_dir=str(case_path),
-                        parsed_coordinate_segments=list(
-                            chain_payload.get("parsed_coordinate_segments", []) or []
-                        ),
-                        unresolved_sequence_segments=list(
-                            chain_payload.get("unresolved_sequence_segments", []) or []
-                        ),
-                        special_residue_details=list(
-                            chain_payload.get("special_residue_details", []) or []
-                        ),
-                        special_component_details=list(
-                            chain_payload.get("special_component_details", []) or []
-                        ),
-                        observed_assembly_ids=[],
-                    )
-                    canonical[key] = sample
-                    counts_by_polymer_class[polymer_class] += 1
-                sample = canonical[key]
-                sample.observed_assembly_ids = sorted(
-                    {*(sample.observed_assembly_ids), *assembly_ids},
-                    key=_assembly_sort_key,
+    # Fast path: read pre-parsed Parquet
+    pf = open_prep_parquet(prep_dir, "monomers") if prep_dir else None
+    if pf is not None:
+        num_case_bundles = pf.metadata.num_rows
+        for row in tqdm(iter_parquet_rows(prep_dir, "monomers"), desc="Collecting canonical monomers", unit="monomer"):
+            polymer_observations += 1
+            pdb_id = str(row.get("pdb_id", "") or "")
+            label_asym_id = str(row.get("label_asym_id", "") or "")
+            if not pdb_id or not label_asym_id:
+                skipped_missing_identity += 1
+                continue
+            eligible_observations += 1
+            source_path = resolve_source_path(str(row.get("source_path", "") or ""), cif_files_directory)
+            key = (pdb_id, label_asym_id)
+            if key not in canonical:
+                canonical[key] = MonomerSample(
+                    monomer_id=_canonical_monomer_id(pdb_id, label_asym_id),
+                    pdb_id=pdb_id,
+                    label_asym_id=label_asym_id,
+                    auth_asym_id=row.get("auth_asym_id"),
+                    entity_id=str(row.get("entity_id", "") or ""),
+                    entity_type=str(row.get("entity_type", "") or ""),
+                    entity_description=row.get("entity_description"),
+                    polymer_type=row.get("polymer_type"),
+                    polymer_class=str(row.get("polymer_class", "") or ""),
+                    chain_type=str(row.get("chain_type", "") or ""),
+                    subtype=row.get("subtype"),
+                    sequence=str(row.get("sequence", "") or ""),
+                    length=int(row.get("length", 0) or 0),
+                    residue_count=int(row.get("residue_count", 0) or 0),
+                    atom_count=int(row.get("atom_count", 0) or 0),
+                    source_path=source_path,
+                    source_case_dir=str(row.get("source_case_dir", "") or ""),
+                    parsed_coordinate_segments=json.loads(row.get("parsed_coordinate_segments", "[]") or "[]"),
+                    unresolved_sequence_segments=json.loads(row.get("unresolved_sequence_segments", "[]") or "[]"),
+                    special_residue_details=json.loads(row.get("special_residue_details", "[]") or "[]"),
+                    special_component_details=json.loads(row.get("special_component_details", "[]") or "[]"),
+                    observed_assembly_ids=[],
                 )
+                counts_by_polymer_class[str(row.get("polymer_class", "") or "")] += 1
+            sample = canonical[key]
+            assembly_ids = json.loads(row.get("assembly_ids", "[]") or "[]")
+            sample.observed_assembly_ids = sorted(
+                {*(sample.observed_assembly_ids), *(str(a) for a in assembly_ids if str(a))},
+                key=_assembly_sort_key,
+            )
+    else:
+        # Slow path: read individual JSON bundles
+        from cif_parse.export import load_case_output_bundles as _load_bundles
+
+        for case_path in tqdm(case_paths, desc="Collecting canonical monomers", unit="case"):
+            payloads = _load_bundles(case_path)
+            num_case_bundles += len(payloads)
+            for payload in payloads:
+                summary = payload.get("structure_summary")
+                chain_inventory = payload.get("chain_inventory")
+                if not isinstance(summary, dict) or not isinstance(chain_inventory, list):
+                    raise TypeError(f"Invalid case bundle under {case_path}")
+                assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
+                source_path = resolve_source_path(str(summary.get("source_path", "") or ""), cif_files_directory)
+                bundle_pdb_id = str(summary.get("pdb_id", "") or "")
+                for chain_payload in chain_inventory:
+                    if not isinstance(chain_payload, dict) or not _is_polymer_chain(chain_payload):
+                        continue
+                    polymer_observations += 1
+                    polymer_class = _classify_polymer_class(chain_payload)
+                    if polymer_class is None:
+                        skipped_unsupported_polymer_class += 1
+                        continue
+                    sequence = _normalize_sequence(chain_payload.get("sequence"))
+                    if not sequence:
+                        skipped_missing_sequence += 1
+                        continue
+                    pdb_id = str(chain_payload.get("pdb_id", "") or bundle_pdb_id)
+                    label_asym_id = str(chain_payload.get("label_asym_id", "") or "")
+                    if not pdb_id or not label_asym_id:
+                        skipped_missing_identity += 1
+                        continue
+                    eligible_observations += 1
+                    key = (pdb_id, label_asym_id)
+                    if key not in canonical:
+                        sample = MonomerSample(
+                            monomer_id=_canonical_monomer_id(pdb_id, label_asym_id),
+                            pdb_id=pdb_id,
+                            label_asym_id=label_asym_id,
+                            auth_asym_id=str(chain_payload.get("auth_asym_id")) if chain_payload.get("auth_asym_id") is not None else None,
+                            entity_id=str(chain_payload.get("entity_id", "") or ""),
+                            entity_type=str(chain_payload.get("entity_type", "") or ""),
+                            entity_description=str(chain_payload.get("entity_description")) if chain_payload.get("entity_description") is not None else None,
+                            polymer_type=str(chain_payload.get("polymer_type")) if chain_payload.get("polymer_type") is not None else None,
+                            polymer_class=polymer_class,
+                            chain_type=str(chain_payload.get("chain_type", "") or ""),
+                            subtype=str(chain_payload.get("subtype")) if chain_payload.get("subtype") is not None else None,
+                            sequence=sequence, length=int(chain_payload.get("length", len(sequence)) or len(sequence)),
+                            residue_count=int(chain_payload.get("residue_count", chain_payload.get("length", len(sequence))) or len(sequence)),
+                            atom_count=int(chain_payload.get("atom_count", 0) or 0),
+                            source_path=source_path, source_case_dir=str(case_path),
+                            parsed_coordinate_segments=list(chain_payload.get("parsed_coordinate_segments", []) or []),
+                            unresolved_sequence_segments=list(chain_payload.get("unresolved_sequence_segments", []) or []),
+                            special_residue_details=list(chain_payload.get("special_residue_details", []) or []),
+                            special_component_details=list(chain_payload.get("special_component_details", []) or []),
+                            observed_assembly_ids=[],
+                        )
+                        canonical[key] = sample
+                        counts_by_polymer_class[polymer_class] += 1
+                    sample = canonical[key]
+                    sample.observed_assembly_ids = sorted({*(sample.observed_assembly_ids), *assembly_ids}, key=_assembly_sort_key)
 
     monomers = sorted(
         canonical.values(),
@@ -461,7 +464,7 @@ def build_monomer_sequence_dataset(
     protein_cov_mode: int = 5,
     mmseqs_threads: int = 1,
     cif_files_directory: str | None = None,
-    prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build canonical monomer inventory and sequence-level grouping artifacts."""
 
@@ -469,7 +472,7 @@ def build_monomer_sequence_dataset(
     inventory = collect_canonical_monomers(
         case_dirs,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_db_path,
+        prep_dir=prep_dir,
     )
     monomers = inventory.monomers
     outdir = Path(outdir)

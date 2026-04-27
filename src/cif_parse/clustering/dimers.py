@@ -804,7 +804,7 @@ def build_dimer_signature_clusters(
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
     cif_files_directory: str | None = None,
-    prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build dimer clusters from monomer assignments and optional structure refinement."""
 
@@ -812,7 +812,7 @@ def build_dimer_signature_clusters(
     observations = collect_dimer_observations(
         case_dirs, monomer_assignments,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_db_path,
+        prep_db_path=prep_dir,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

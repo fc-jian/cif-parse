@@ -926,7 +926,7 @@ def build_antibody_complex_signature_clusters(
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
     cif_files_directory: str | None = None,
-    prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
     monomer_inventory = load_monomer_inventory(clustering_outdir)
@@ -935,7 +935,7 @@ def build_antibody_complex_signature_clusters(
         monomer_assignments,
         monomer_inventory,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_db_path,
+        prep_db_path=prep_dir,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
