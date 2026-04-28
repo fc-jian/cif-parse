@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import logging
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from cif_parse.io import (
     read_structure_summary,
     read_structure_preflight,
 )
+from cif_parse.io.cif_reader import read_cif_file, select_largest_polymer_assembly_id
 from cif_parse.constants import (
     BRANCHED_CHAIN_TYPES,
     METAL_CHAIN_TYPES,
@@ -326,6 +328,76 @@ def _resolve_all_mode_output_target(
     return outdir / f"assembly_{assembly_id}", "result.json.gz"
 
 
+def _dump_atom_cache(
+    *,
+    outdir: Path,
+    input_path: Path,
+    assembly_mode: str,
+    selected_assembly_id: str | None,
+    model: int,
+) -> None:
+    """Save the parsed atom array(s) to ``outdir/atoms/`` so that downstream
+    clustering can consume them directly without re-reading the original mmCIF.
+
+    Always saves ``atoms/_none.pkl`` (asymmetric unit).  For assembly modes
+    ``largest_assembly`` and ``all`` also saves the assembly-expanded atom
+    array as ``atoms/{assembly_id}.pkl``.
+    """
+    atoms_dir = outdir / "atoms"
+    atoms_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from biotite.structure.io.pdbx import get_assembly, get_structure
+
+        cif_file = read_cif_file(input_path)
+
+        # Always cache asymmetric unit (needed by monomer extraction)
+        au_cache_path = atoms_dir / "_none.pkl"
+        if not au_cache_path.exists():
+            try:
+                atom_array = get_structure(cif_file, model=model, use_author_fields=False)
+                if atom_array is not None and len(atom_array) > 0:
+                    au_cache_path.write_bytes(
+                        pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL)
+                    )
+            except Exception:
+                LOGGER.debug("Failed to cache asymmetric unit for %s", input_path)
+
+        # Cache assembly-expanded coordinates when applicable
+        if assembly_mode in ("largest_assembly", "all"):
+            effective_assembly_id = selected_assembly_id
+            if effective_assembly_id is None and assembly_mode == "largest_assembly":
+                effective_assembly_id = select_largest_polymer_assembly_id(cif_file)
+
+            if effective_assembly_id:
+                asm_cache_path = atoms_dir / f"{effective_assembly_id}.pkl"
+                if not asm_cache_path.exists():
+                    try:
+                        atom_array = get_assembly(
+                            cif_file,
+                            assembly_id=effective_assembly_id,
+                            model=model,
+                            use_author_fields=False,
+                        )
+                        if atom_array is not None and len(atom_array) > 0:
+                            asm_cache_path.write_bytes(
+                                pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL)
+                            )
+                    except ValueError as exc:
+                        if str(exc) == "Array must contain at least one element":
+                            LOGGER.debug("Empty assembly %s for %s", effective_assembly_id, input_path)
+                        else:
+                            raise
+                    except Exception:
+                        LOGGER.debug(
+                            "Failed to cache assembly %s for %s",
+                            effective_assembly_id,
+                            input_path,
+                        )
+    except Exception:
+        LOGGER.debug("Failed to cache atom arrays for %s", input_path, exc_info=True)
+
+
 def _process_single_structure_for_mode(
     *,
     input_path: Path,
@@ -337,6 +409,13 @@ def _process_single_structure_for_mode(
     selected_assembly_id: str | None,
     bundle_name: str,
 ) -> dict[str, Any]:
+    _dump_atom_cache(
+        outdir=outdir,
+        input_path=input_path,
+        assembly_mode=analysis_assembly_mode,
+        selected_assembly_id=selected_assembly_id,
+        model=settings.model,
+    )
     working_chain_inventory = deepcopy(chain_inventory)
     dimer_interfaces = identify_dimer_interfaces(
         input_path,

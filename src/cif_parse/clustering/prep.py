@@ -328,21 +328,23 @@ def _ingest_cases_to_parquet(
 ) -> dict[str, Any]:
     """Process a batch of cases and write temp Parquet files directly.
 
-    Each worker writes ``temp_{batch_id}_{table}.parquet`` and
-    ``temp_{batch_id}_sources.txt`` (one source_path per line).
+    Each worker writes ``temp_{batch_id}_{table}.parquet``,
+    ``temp_{batch_id}_sources.txt``, and ``temp_{batch_id}_atoms.txt``
+    (mapping source_path → atoms_dir).
     Returns only file paths and stats — no row data through IPC.
-
-    Module-level so ThreadPoolExecutor/ProcessPoolExecutor can pickle it.
     """
     case_dirs, prep_dir, batch_id, cif_files_directory = args
     from cif_parse.export import load_case_output_bundles
 
     all_rows: dict[str, list[dict[str, Any]]] = {t: [] for t in PARQUET_TABLES}
     source_paths: set[str] = set()
+    atom_cache_map: dict[str, str] = {}  # source_path → atoms_dir
     stats = {"ingested": 0, "skipped_no_bundles": 0, "errors": 0}
 
     for case_dir in case_dirs:
         case_id = case_dir.name
+        atoms_dir = case_dir / "atoms"
+        has_atoms = atoms_dir.is_dir()
         try:
             bundles = load_case_output_bundles(case_dir)
             if not bundles:
@@ -354,21 +356,21 @@ def _ingest_cases_to_parquet(
                     sp = str(summary.get("source_path", "") or "")
                     if sp:
                         summary["source_path"] = str(Path(cif_files_directory) / Path(sp).name)
-                for row in all_rows["monomers"]:
-                    if row.get("source_path"):
-                        source_paths.add(row["source_path"])
                 rows = _extract_bundle_rows(bundle, case_id)
                 for table_name in PARQUET_TABLES:
                     all_rows[table_name].extend(rows[table_name])
                 for row in rows["monomers"]:
-                    if row.get("source_path"):
-                        source_paths.add(row["source_path"])
+                    sp = row.get("source_path", "")
+                    if sp:
+                        source_paths.add(sp)
+                        if has_atoms and sp not in atom_cache_map:
+                            atom_cache_map[sp] = str(atoms_dir)
             stats["ingested"] += 1
         except Exception:
             LOGGER.warning("Failed to ingest case %s", case_dir, exc_info=True)
             stats["errors"] += 1
 
-    # Write temp Parquet files and source_paths list
+    # Write temp files
     tmp_dir = Path(prep_dir) / ".tmp_phase1"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, str] = {}
@@ -380,6 +382,13 @@ def _ingest_cases_to_parquet(
     sources_path = tmp_dir / f"temp_{batch_id}_sources.txt"
     sources_path.write_text("\n".join(sorted(source_paths)), encoding="utf-8")
     paths["sources"] = str(sources_path)
+    # Serialize atom cache map as JSON lines
+    if atom_cache_map:
+        atoms_path = tmp_dir / f"temp_{batch_id}_atoms.jsonl"
+        with atoms_path.open("w", encoding="utf-8") as fh:
+            for sp, ad in sorted(atom_cache_map.items()):
+                fh.write(json.dumps({"source_path": sp, "atoms_dir": ad}, ensure_ascii=False) + "\n")
+        paths["atoms"] = str(atoms_path)
     return {"batch_id": batch_id, "paths": paths, "stats": stats}
 
 
@@ -387,14 +396,18 @@ def _ingest_cases_to_parquet(
 
 
 def _cache_sources_to_temp(
-    args: tuple[str, list[str | None], str, Path, int],
+    args: tuple[str, list[str | None], str, Path, int, dict[str, str] | None],
 ) -> dict[str, Any]:
     """Parse one mmCIF file and write cached atom arrays to temp bin+idx.
+
+    If *atom_cache_map* contains an ``atoms/`` directory for *source_path*,
+    pre-cached pickle files from the parsing stage are used directly (no
+    mmCIF re-read).  Otherwise the original mmCIF is read and parsed.
 
     Writes ``temp_{worker_id}.bin`` and ``temp_{worker_id}.idx`` directly,
     returning only metadata — no blob data through IPC.
     """
-    source_path, assembly_ids, cif_files_directory, tmp_dir, worker_id = args
+    source_path, assembly_ids, cif_files_directory, tmp_dir, worker_id, atom_cache_map = args
     resolved_path = source_path
     if cif_files_directory:
         resolved_path = str(Path(cif_files_directory) / Path(source_path).name)
@@ -406,6 +419,46 @@ def _cache_sources_to_temp(
     idx_path = tmp_dir / f"temp_{worker_id}.idx"
     entries: list[dict[str, Any]] = []
 
+    # Fast path: use atom cache from parsing stage
+    atoms_dir = atom_cache_map.get(source_path) if atom_cache_map else None
+    if atoms_dir:
+        atoms_dir = Path(atoms_dir)
+        try:
+            with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
+                for assembly_id in assembly_ids:
+                    cache_key = f"{source_path}__{assembly_id or ''}"
+                    pkl_name = f"{assembly_id or '_none'}.pkl"
+                    pkl_path = atoms_dir / pkl_name
+                    if not pkl_path.exists():
+                        if assembly_id is None:
+                            entries.append({"cache_key": cache_key, "status": "empty"})
+                            continue
+                        pkl_none = atoms_dir / "_none.pkl"
+                        if pkl_none.exists():
+                            pkl_path = pkl_none
+                        else:
+                            entries.append({"cache_key": cache_key, "status": "empty"})
+                            continue
+                    # Wrap raw AtomArray in same format as slow path
+                    raw = pickle.loads(pkl_path.read_bytes())
+                    wrapped = pickle.dumps(
+                        {"atom_array": raw, "quality": None, "chain_ops": None},
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
+                    offset = bin_fh.tell()
+                    bin_fh.write(wrapped)
+                    idx_fh.write(_IDX_ENTRY_STRUCT.pack(
+                        source_hash.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                        offset, len(wrapped),
+                    ))
+                    entries.append({"cache_key": cache_key, "status": "cached"})
+            return {"source_path": source_path, "entries": entries,
+                    "bin_path": str(bin_path) if bin_path.exists() else None,
+                    "idx_path": str(idx_path) if idx_path.exists() else None}
+        except Exception as exc:
+            LOGGER.debug("Atom cache read failed for %s, falling back to mmCIF: %s", source_path, exc)
+
+    # Slow path: read and parse original mmCIF
     try:
         from biotite.structure.io.pdbx import get_assembly, get_structure
         from cif_parse.io import read_cif_file
@@ -663,13 +716,22 @@ def build_prep_database(
                     except Exception as exc:
                         LOGGER.warning("Phase 1 worker failed: %s", exc)
 
-        # Collect source_paths from temp files
+        # Collect source_paths and atom cache map from temp files
+        atom_cache_map: dict[str, str] = {}
         for sources_file in sorted(tmp_phase1.glob("temp_*_sources.txt")):
             for line in sources_file.read_text(encoding="utf-8").splitlines():
                 sp = line.strip()
                 if sp:
                     all_source_paths.add(sp)
             sources_file.unlink()
+        for atoms_file in sorted(tmp_phase1.glob("temp_*_atoms.jsonl")):
+            for line in atoms_file.read_text(encoding="utf-8").splitlines():
+                entry = json.loads(line.strip())
+                sp = entry.get("source_path", "")
+                ad = entry.get("atoms_dir", "")
+                if sp and ad and sp not in atom_cache_map:
+                    atom_cache_map[sp] = ad
+            atoms_file.unlink()
 
     # Merge temp Parquet files into final Parquet files (metadata-only concatenation)
     for table_name in tqdm(PARQUET_TABLES, desc="Merging Parquet", unit="table"):
@@ -753,11 +815,11 @@ def build_prep_database(
             idx_path = prep_dir / "cif_coords.idx"
 
             if len(tasks) <= 1:
-                worker_args = (tasks[0][0], tasks[0][1], tasks[0][2], tmp_phase2, 0)
+                worker_args = (tasks[0][0], tasks[0][1], tasks[0][2], tmp_phase2, 0, atom_cache_map)
                 result = _cache_sources_to_temp(worker_args)
                 _count_cif_entries(result, cif_stats)
             else:
-                task_args = [(sp, aids, cfd, tmp_phase2, wid)
+                task_args = [(sp, aids, cfd, tmp_phase2, wid, atom_cache_map)
                              for wid, (sp, aids, cfd) in enumerate(tasks)]
                 with ProcessPoolExecutor(max_workers=num_workers) as executor:
                     futures = [executor.submit(_cache_sources_to_temp, arg) for arg in task_args]
