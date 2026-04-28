@@ -60,25 +60,43 @@ Clustering consumes parsed case outputs, preferably from `--assembly-mode all`. 
 
 ### Pre-processing (recommended for large inputs)
 
-For large batch outputs (thousands of cases), first build a prep database that consolidates all case bundles and pre-caches mmCIF structures into a single SQLite file:
+For large batch outputs (thousands to millions of cases), first build a prep directory that consolidates all case bundles into columnar Parquet files and pre-caches mmCIF atom coordinates into a single indexed binary file. The output always contains exactly 8 files regardless of case count:
 
 ```bash
 cif-parse-cluster prep \
   --inputs batch_outputs/cases \
-  --db-path clustering_prep.db \
+  --prep-dir clustering_prep \
   --prep-jobs 8
 ```
 
-The prep database uses content hashing for incremental updates — re-running `prep` only processes new or changed cases. Pass `--prep-db` to the clustering command to read from the database instead of individual files:
+This produces:
+
+```
+clustering_prep/
+├── monomers.parquet              # pre-parsed polymer chain rows
+├── dimers.parquet                # pre-parsed dimer interface rows
+├── multimers.parquet             # pre-parsed tight multimer rows
+├── antibody_complexes.parquet    # pre-parsed antibody-antigen complex rows
+├── tcr_complexes.parquet         # pre-parsed TCR-pMHC complex rows
+├── cif_coords.bin               # all AtomArrays concatenated in one file
+├── cif_coords.idx               # 76-byte fixed-width index (hash → offset+len)
+└── prep_meta.json               # content hashes for incremental updates
+```
+
+Content hashing enables incremental updates — re-running `prep` only processes new or changed cases. Each worker writes independently, then the master merges temporary files (no lock contention).
+
+Pass `--prep-dir` to the clustering command to read from the prep directory:
 
 ```bash
 cif-parse-cluster \
   --inputs batch_outputs/cases \
-  --prep-db clustering_prep.db \
+  --prep-dir clustering_prep \
   --outdir cluster_outputs
 ```
 
-When `--prep-db` is not provided, clustering falls back to reading individual `result.json.gz` files directly.
+When `--prep-dir` is not provided, clustering falls back to reading individual `result.json.gz` files directly.
+
+Use `--no-cif-cache` to skip Phase 2 (mmCIF caching) when only the Parquet files are needed.
 
 ### Running Clustering
 
@@ -118,7 +136,7 @@ Key clustering defaults:
 4. Dimer, multimer, antibody-antigen, and TCR-pMHC complex clustering default to signature clustering plus overall `USalign -mm 1 -ter 1` refinement with TM-score threshold `0.50`.
 5. Parallel clustering controls are `--jobs`, `--mmseqs-threads`, `--sequence-cluster-jobs`, and `--usalign-jobs`.
 6. Use `--cif-files-directory` to override the location of original mmCIF files during structure extraction.
-7. Use `--prep-db` to read case bundles from a pre-built SQLite database (built with `cif-parse-cluster prep`).
+7. Use `--prep-dir` to read case data from Parquet files and cached AtomArrays (built with `cif-parse-cluster prep`).
 
 ## Configuration
 
@@ -154,16 +172,16 @@ cif-parse batch \
   --assembly-mode all \
   --jobs 8
 
-# 2. (Optional but recommended) Build prep database for fast I/O
+# 2. (Optional but recommended) Build prep directory for fast I/O
 cif-parse-cluster prep \
   --inputs batch_outputs/cases \
-  --db-path clustering_prep.db \
+  --prep-dir clustering_prep \
   --prep-jobs 8
 
-# 3. Run clustering (with prep database if available)
+# 3. Run clustering (consumes prep directory)
 cif-parse-cluster \
   --inputs batch_outputs/cases \
-  --prep-db clustering_prep.db \
+  --prep-dir clustering_prep \
   --outdir cluster_outputs \
   --dimer-mode signature \
   --multimer-mode signature \

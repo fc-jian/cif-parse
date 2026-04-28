@@ -41,7 +41,6 @@ import os
 import pickle
 import shutil
 import struct
-import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -325,17 +324,22 @@ def _optional_int(value: Any) -> int | None:
 
 
 def _ingest_cases_to_parquet(
-    args: tuple[list[Path], Path, str | None],
-) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    """Process a batch of case directories and return extracted rows + stats.
+    args: tuple[list[Path], Path, int, str | None],
+) -> dict[str, Any]:
+    """Process a batch of cases and write temp Parquet files directly.
 
-    Module-level so ProcessPoolExecutor can pickle it.
+    Each worker writes ``temp_{batch_id}_{table}.parquet`` and
+    ``temp_{batch_id}_sources.txt`` (one source_path per line).
+    Returns only file paths and stats — no row data through IPC.
+
+    Module-level so ThreadPoolExecutor/ProcessPoolExecutor can pickle it.
     """
-    case_dirs, prep_dir, cif_files_directory = args
+    case_dirs, prep_dir, batch_id, cif_files_directory = args
     from cif_parse.export import load_case_output_bundles
 
     all_rows: dict[str, list[dict[str, Any]]] = {t: [] for t in PARQUET_TABLES}
-    stats = {"ingested": 0, "skipped_unchanged": 0, "skipped_no_bundles": 0, "errors": 0}
+    source_paths: set[str] = set()
+    stats = {"ingested": 0, "skipped_no_bundles": 0, "errors": 0}
 
     for case_dir in case_dirs:
         case_id = case_dir.name
@@ -350,31 +354,56 @@ def _ingest_cases_to_parquet(
                     sp = str(summary.get("source_path", "") or "")
                     if sp:
                         summary["source_path"] = str(Path(cif_files_directory) / Path(sp).name)
+                for row in all_rows["monomers"]:
+                    if row.get("source_path"):
+                        source_paths.add(row["source_path"])
                 rows = _extract_bundle_rows(bundle, case_id)
                 for table_name in PARQUET_TABLES:
                     all_rows[table_name].extend(rows[table_name])
+                for row in rows["monomers"]:
+                    if row.get("source_path"):
+                        source_paths.add(row["source_path"])
             stats["ingested"] += 1
         except Exception:
             LOGGER.warning("Failed to ingest case %s", case_dir, exc_info=True)
             stats["errors"] += 1
 
-    return all_rows, stats
+    # Write temp Parquet files and source_paths list
+    tmp_dir = Path(prep_dir) / ".tmp_phase1"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+    for table_name in PARQUET_TABLES:
+        if all_rows[table_name]:
+            p = tmp_dir / f"temp_{batch_id}_{table_name}.parquet"
+            _write_parquet_table(all_rows[table_name], p)
+            paths[table_name] = str(p)
+    sources_path = tmp_dir / f"temp_{batch_id}_sources.txt"
+    sources_path.write_text("\n".join(sorted(source_paths)), encoding="utf-8")
+    paths["sources"] = str(sources_path)
+    return {"batch_id": batch_id, "paths": paths, "stats": stats}
 
 
-# ── Phase 2: cif_cache worker (module-level for ProcessPoolExecutor) ───────
+# ── Phase 2: cif_cache worker ───────────────────────────────────────────────
 
 
-def _cache_one_source(args: tuple[str, list[str | None], str]) -> dict[str, Any]:
-    """Parse one mmCIF file and return pickled atom arrays for assemblies.
+def _cache_sources_to_temp(
+    args: tuple[str, list[str | None], str, Path, int],
+) -> dict[str, Any]:
+    """Parse one mmCIF file and write cached atom arrays to temp bin+idx.
 
-    Returns a dict with write instructions that the main process collects
-    and writes to cif_coords.bin / cif_coords.idx.
+    Writes ``temp_{worker_id}.bin`` and ``temp_{worker_id}.idx`` directly,
+    returning only metadata — no blob data through IPC.
     """
-    source_path, assembly_ids, cif_files_directory = args
+    source_path, assembly_ids, cif_files_directory, tmp_dir, worker_id = args
     resolved_path = source_path
     if cif_files_directory:
         resolved_path = str(Path(cif_files_directory) / Path(source_path).name)
     source_hash = _hash_source_mtime(resolved_path)
+    tmp_dir = Path(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    bin_path = tmp_dir / f"temp_{worker_id}.bin"
+    idx_path = tmp_dir / f"temp_{worker_id}.idx"
     entries: list[dict[str, Any]] = []
 
     try:
@@ -384,37 +413,41 @@ def _cache_one_source(args: tuple[str, list[str | None], str]) -> dict[str, Any]
         cif_file = read_cif_file(resolved_path)
         quality = _read_quality(resolved_path, cif_file)
 
-        for assembly_id in assembly_ids:
-            cache_key = f"{source_path}__{assembly_id or ''}"
-            try:
-                if assembly_id:
-                    atom_array = get_assembly(cif_file, assembly_id=assembly_id, model=1, use_author_fields=False)
-                else:
-                    atom_array = get_structure(cif_file, model=1, use_author_fields=False)
-                if atom_array is not None and len(atom_array) > 0:
-                    chain_ops_json = _read_chain_ops_json(source_path, assembly_id)
-                    blob = pickle.dumps(
-                        {"atom_array": atom_array, "quality": quality, "chain_ops": chain_ops_json},
-                        protocol=pickle.HIGHEST_PROTOCOL,
-                    )
-                    entries.append({
-                        "cache_key": cache_key,
-                        "source_hash": source_hash,
-                        "blob": blob,
-                        "status": "cached",
-                    })
-                else:
-                    entries.append({"cache_key": cache_key, "source_hash": source_hash, "status": "empty"})
-            except Exception as exc:
-                LOGGER.warning("Failed to cache assembly %s for %s: %s", assembly_id, source_path, exc)
-                entries.append({"cache_key": cache_key, "source_hash": source_hash, "status": "error", "error": str(exc)})
+        with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
+            for assembly_id in assembly_ids:
+                cache_key = f"{source_path}__{assembly_id or ''}"
+                try:
+                    if assembly_id:
+                        atom_array = get_assembly(cif_file, assembly_id=assembly_id, model=1, use_author_fields=False)
+                    else:
+                        atom_array = get_structure(cif_file, model=1, use_author_fields=False)
+                    if atom_array is not None and len(atom_array) > 0:
+                        chain_ops_json = _read_chain_ops_json(source_path, assembly_id)
+                        blob = pickle.dumps(
+                            {"atom_array": atom_array, "quality": quality, "chain_ops": chain_ops_json},
+                            protocol=pickle.HIGHEST_PROTOCOL,
+                        )
+                        offset = bin_fh.tell()
+                        bin_fh.write(blob)
+                        idx_fh.write(_IDX_ENTRY_STRUCT.pack(
+                            source_hash.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                            offset, len(blob),
+                        ))
+                        entries.append({"cache_key": cache_key, "status": "cached"})
+                    else:
+                        entries.append({"cache_key": cache_key, "status": "empty"})
+                except Exception as exc:
+                    LOGGER.warning("Failed to cache assembly %s for %s: %s", assembly_id, source_path, exc)
+                    entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
     except Exception as exc:
         LOGGER.warning("Failed to read mmCIF %s: %s", source_path, exc)
         for assembly_id in assembly_ids:
             cache_key = f"{source_path}__{assembly_id or ''}"
-            entries.append({"cache_key": cache_key, "source_hash": "", "status": "error", "error": str(exc)})
+            entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
 
-    return {"source_path": source_path, "entries": entries}
+    return {"source_path": source_path, "entries": entries,
+            "bin_path": str(bin_path) if bin_path.exists() else None,
+            "idx_path": str(idx_path) if idx_path.exists() else None}
 
 
 # ── quality / chain-ops helpers ──────────────────────────────────────────────
@@ -479,6 +512,63 @@ def _write_parquet_table(rows: list[dict[str, Any]], output_path: Path) -> int:
     return len(rows)
 
 
+def _merge_parquet_files(temp_files: list[Path], output_path: Path) -> None:
+    """Merge multiple Parquet files into one via row-group concatenation."""
+    import pyarrow.parquet as pq
+    if len(temp_files) == 1:
+        temp_files[0].rename(output_path)
+        return
+    schema = pq.read_schema(temp_files[0])
+    with pq.ParquetWriter(output_path, schema, compression="zstd", compression_level=3) as writer:
+        for tf in temp_files:
+            pf = pq.ParquetFile(tf)
+            for rg_idx in range(pf.metadata.num_row_groups):
+                writer.write_table(pf.read_row_group(rg_idx))
+
+
+def _merge_batch_stats(result: dict[str, Any], stats: dict[str, Any]) -> None:
+    """Accumulate worker stats into the global stats dict."""
+    for key in ("ingested", "skipped_no_bundles", "errors"):
+        stats[key] += result.get("stats", {}).get(key, 0)
+
+
+def _count_cif_entries(result: dict[str, Any], stats: dict[str, int]) -> None:
+    """Count cached/skipped/error entries from a Phase 2 worker result."""
+    for entry in result.get("entries", []):
+        status = entry.get("status", "")
+        if status == "cached":
+            stats["cached"] += 1
+        elif status in ("skipped", "empty", "error"):
+            stats["skipped"] += 1
+
+
+def _read_idx_entries(idx_path: Path) -> list[bytes]:
+    """Read all 76-byte index entries from a temp idx file."""
+    data = idx_path.read_bytes()
+    return [data[i:i + _IDX_ENTRY_SIZE] for i in range(0, len(data), _IDX_ENTRY_SIZE)]
+
+
+def _collect_source_paths_from_parquet(prep_dir: Path, sink: set[str]) -> None:
+    """Read source_path columns from existing Parquet files into *sink*."""
+    try:
+        import pyarrow.parquet as pq
+        for table_name in PARQUET_TABLES:
+            p = prep_dir / f"{table_name}.parquet"
+            if not p.exists():
+                continue
+            pf = pq.ParquetFile(p)
+            schema_names = set(pf.schema_arrow.names)
+            if "source_path" not in schema_names:
+                continue
+            for rg_idx in range(pf.metadata.num_row_groups):
+                tbl = pf.read_row_group(rg_idx, columns=["source_path"])
+                for sp in tbl.column("source_path").to_pylist():
+                    if sp:
+                        sink.add(sp)
+    except ImportError:
+        pass
+
+
 # ── main builder ─────────────────────────────────────────────────────────────
 
 
@@ -541,72 +631,74 @@ def build_prep_database(
     if skipped_unchanged:
         LOGGER.info("Skipping %d unchanged case(s)", skipped_unchanged)
 
-    all_rows: dict[str, list[dict[str, Any]]] = {t: [] for t in PARQUET_TABLES}
     all_source_paths: set[str] = set()
     stats = {"total_cases": len(case_dirs), "ingested": 0, "skipped_unchanged": skipped_unchanged,
              "skipped_no_bundles": 0, "errors": 0}
 
-    if new_cases:
-        if actual_jobs <= 1:
-            result_rows, result_stats = _ingest_cases_to_parquet((new_cases, prep_dir, cif_files_directory))
-            for table_name in PARQUET_TABLES:
-                all_rows[table_name] = result_rows[table_name]
-            stats["ingested"] = result_stats["ingested"]
-            stats["skipped_no_bundles"] = result_stats["skipped_no_bundles"]
-            stats["errors"] = result_stats["errors"]
-        else:
-            # Split case dirs into batches for workers
-            batch_size = max(1, len(new_cases) // actual_jobs)
-            batches = [new_cases[i:i + batch_size] for i in range(0, len(new_cases), batch_size)]
-            task_args = [(batch, prep_dir, cif_files_directory) for batch in batches]
+    tmp_phase1 = prep_dir / ".tmp_phase1"
+    tmp_phase1.mkdir(parents=True, exist_ok=True)
 
-            with ProcessPoolExecutor(max_workers=actual_jobs) as executor:
+    if new_cases:
+        # Small batches for load balancing: at least 4× num_workers batches,
+        # but each batch has at least 500 cases.  ThreadPoolExecutor is sufficient
+        # because gzip decompression and JSON parsing release the GIL.
+        cases_per_batch = max(500, len(new_cases) // (actual_jobs * 4)) if new_cases else 500
+        batches = [new_cases[i:i + cases_per_batch] for i in range(0, len(new_cases), cases_per_batch)]
+        task_args = [(batch, prep_dir, bid, cif_files_directory) for bid, batch in enumerate(batches)]
+
+        LOGGER.info("Dispatching %d batches (batch_size=%d) to %d workers",
+                    len(batches), BATCH_SIZE, actual_jobs)
+
+        if len(batches) <= 1:
+            result = _ingest_cases_to_parquet(task_args[0])
+            _merge_batch_stats(result, stats)
+        else:
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            with _TPE(max_workers=actual_jobs) as executor:
                 futures = [executor.submit(_ingest_cases_to_parquet, arg) for arg in task_args]
                 for future in tqdm(as_completed(futures), total=len(futures),
                                    desc="Parsing case bundles", unit="batch"):
                     try:
-                        batch_rows, batch_stats = future.result()
-                        for table_name in PARQUET_TABLES:
-                            all_rows[table_name].extend(batch_rows[table_name])
-                        stats["ingested"] += batch_stats["ingested"]
-                        stats["skipped_no_bundles"] += batch_stats["skipped_no_bundles"]
-                        stats["errors"] += batch_stats["errors"]
+                        _merge_batch_stats(future.result(), stats)
                     except Exception as exc:
                         LOGGER.warning("Phase 1 worker failed: %s", exc)
 
-    # Collect unique source paths from new rows
-    for row in tqdm(all_rows["monomers"], desc="Collecting source paths", unit="row"):
-        sp = row.get("source_path", "")
-        if sp:
-            all_source_paths.add(sp)
+        # Collect source_paths from temp files
+        for sources_file in sorted(tmp_phase1.glob("temp_*_sources.txt")):
+            for line in sources_file.read_text(encoding="utf-8").splitlines():
+                sp = line.strip()
+                if sp:
+                    all_source_paths.add(sp)
+            sources_file.unlink()
 
-    # If only incremental update: also collect source paths from existing parquet
-    if skipped_unchanged > 0 and all_source_paths:
-        try:
-            import pyarrow.parquet as pq
-            for table_name in ["dimers", "multimers", "antibody_complexes", "tcr_complexes"]:
-                existing_path = prep_dir / f"{table_name}.parquet"
-                if existing_path.exists():
-                    pf = pq.ParquetFile(existing_path)
-                    for rg_idx in range(pf.metadata.num_row_groups):
-                        tbl = pf.read_row_group(rg_idx, columns=["source_path"])
-                        for sp in tbl.column("source_path").to_pylist():
-                            if sp:
-                                all_source_paths.add(sp)
-        except ImportError:
-            pass
-
-    # Write Parquet files
-    for table_name in tqdm(PARQUET_TABLES, desc="Writing Parquet files", unit="table"):
+    # Merge temp Parquet files into final Parquet files (metadata-only concatenation)
+    for table_name in tqdm(PARQUET_TABLES, desc="Merging Parquet", unit="table"):
+        temp_files = sorted(tmp_phase1.glob(f"temp_*_{table_name}.parquet"))
         output_path = prep_dir / f"{table_name}.parquet"
-        if all_rows[table_name]:
-            n = _write_parquet_table(all_rows[table_name], output_path)
-            LOGGER.info("Wrote %s: %d rows", output_path.name, n)
+        if temp_files:
+            _merge_parquet_files(temp_files, output_path)
+            for tf in temp_files:
+                tf.unlink()
+            LOGGER.info("Merged %s from %d temp files", output_path.name, len(temp_files))
         elif not output_path.exists():
             _write_parquet_table([], output_path)
 
+    # Source paths from existing Parquet (incremental update: unchanged cases)
+    if skipped_unchanged > 0 and not all_source_paths:
+        _collect_source_paths_from_parquet(prep_dir, all_source_paths)
+    else:
+        _collect_source_paths_from_parquet(prep_dir, all_source_paths)
+
+    # Cleanup temp dir
+    try:
+        remaining = list(tmp_phase1.iterdir())
+        for f in remaining:
+            f.unlink()
+        tmp_phase1.rmdir()
+    except OSError:
+        pass
+
     # Save metadata
-    json.dumps({"hashes": case_hashes}, ensure_ascii=False)  # pre-validate
     meta_path.write_text(json.dumps({"hashes": case_hashes}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     LOGGER.info("Phase 1 complete (%.1fs): %d ingested, %d skipped, %d source paths",
@@ -629,66 +721,69 @@ def build_prep_database(
             import pyarrow.parquet as pq
             for table_name in ["dimers", "multimers"]:
                 p = prep_dir / f"{table_name}.parquet"
-                if p.exists():
-                    pf = pq.ParquetFile(p)
-                    for rg_idx in range(pf.metadata.num_row_groups):
-                        tbl = pf.read_row_group(rg_idx, columns=["source_path", "assembly_id"])
-                        for sp, aid in zip(tbl.column("source_path").to_pylist(),
-                                           tbl.column("assembly_id").to_pylist()):
-                            if sp and sp in cache_pairs:
-                                cache_pairs[sp].add(aid if aid else None)
+                if not p.exists():
+                    continue
+                pf = pq.ParquetFile(p)
+                schema_names = set(pf.schema_arrow.names)
+                if "source_path" not in schema_names:
+                    continue
+                for rg_idx in range(pf.metadata.num_row_groups):
+                    cols = ["source_path"]
+                    if "assembly_id" in schema_names:
+                        cols.append("assembly_id")
+                    tbl = pf.read_row_group(rg_idx, columns=cols)
+                    sp_list = tbl.column("source_path").to_pylist()
+                    aid_list = tbl.column("assembly_id").to_pylist() if "assembly_id" in schema_names else [None] * len(sp_list)
+                    for sp, aid in zip(sp_list, aid_list):
+                        if sp and sp in cache_pairs:
+                            cache_pairs[sp].add(aid if aid else None)
         except ImportError:
             pass
 
         tasks = [(sp, sorted(aids, key=lambda x: x or ""), cif_files_directory)
                  for sp, aids in sorted(cache_pairs.items())]
-        LOGGER.info("Dispatching %d source files to %d worker processes", len(tasks), min(actual_jobs, len(tasks)))
 
-        # Workers write to temp files; master merges
-        tmpdir = Path(tempfile.mkdtemp(prefix="cif_cache_", dir=prep_dir))
+        num_workers = max(1, min(actual_jobs, len(tasks)))
+        LOGGER.info("Dispatching %d source files to %d worker processes", len(tasks), num_workers)
+
+        tmp_phase2 = prep_dir / ".tmp_phase2"
+        tmp_phase2.mkdir(parents=True, exist_ok=True)
         try:
             bin_path = prep_dir / "cif_coords.bin"
             idx_path = prep_dir / "cif_coords.idx"
 
             if len(tasks) <= 1:
-                all_entries: list[dict[str, Any]] = []
-                for task in tqdm(tasks, desc="Caching mmCIF structures", unit="source"):
-                    result = _cache_one_source(task)
-                    all_entries.extend(result["entries"])
+                worker_args = (tasks[0][0], tasks[0][1], tasks[0][2], tmp_phase2, 0)
+                result = _cache_sources_to_temp(worker_args)
+                _count_cif_entries(result, cif_stats)
             else:
-                # Each worker returns entries with blob data; master writes sequentially
-                all_entries = []
-                with ProcessPoolExecutor(max_workers=min(actual_jobs, len(tasks))) as executor:
-                    futures = [executor.submit(_cache_one_source, task) for task in tasks]
+                task_args = [(sp, aids, cfd, tmp_phase2, wid)
+                             for wid, (sp, aids, cfd) in enumerate(tasks)]
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    futures = [executor.submit(_cache_sources_to_temp, arg) for arg in task_args]
                     for future in tqdm(as_completed(futures), total=len(futures),
                                        desc="Caching mmCIF structures", unit="source"):
                         try:
-                            result = future.result()
-                            all_entries.extend(result["entries"])
+                            _count_cif_entries(future.result(), cif_stats)
                         except Exception as exc:
                             LOGGER.warning("Phase 2 worker failed: %s", exc)
 
-            # Write bin + idx sequentially from collected entries
-            with bin_path.open("wb") as bin_fh, idx_path.open("wb") as idx_fh:
+            # Concatenate temp bin files and rebuild global index
+            temp_bins = sorted(tmp_phase2.glob("temp_*.bin"))
+            temp_idxs = sorted(tmp_phase2.glob("temp_*.idx"))
+            if temp_bins:
                 offset = 0
-                for entry in tqdm(all_entries, desc="Writing cif_coords", unit="blob"):
-                    if entry["status"] != "cached":
-                        cif_stats["skipped"] += 1
-                        continue
-                    blob = entry["blob"]
-                    blob_len = len(blob)
-                    bin_fh.write(blob)
-                    source_hash = entry.get("source_hash", "").ljust(64, "\0")[:64]
-                    idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                        source_hash.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                        offset,
-                        blob_len,
-                    ))
-                    offset += blob_len
-                    cif_stats["cached"] += 1
+                with bin_path.open("wb") as bin_fh, idx_path.open("wb") as idx_fh:
+                    for tbin, tidx in zip(temp_bins, temp_idxs):
+                        data = tbin.read_bytes()
+                        bin_fh.write(data)
+                        for entry_bytes in _read_idx_entries(tidx):
+                            source_hash, _, blob_len = _IDX_ENTRY_STRUCT.unpack(entry_bytes)
+                            idx_fh.write(_IDX_ENTRY_STRUCT.pack(source_hash, offset, blob_len))
+                            offset += blob_len
 
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            shutil.rmtree(tmp_phase2, ignore_errors=True)
 
         LOGGER.info("Phase 2 complete (%.1fs): %d cached, %d skipped",
                     time.monotonic() - t2, cif_stats["cached"], cif_stats["skipped"])
