@@ -17,7 +17,6 @@ Layout
     ├── tcr_complexes.parquet         # pre-parsed TCR-pMHC complex rows
     ├── cif_coords.bin               # concatenated pickled AtomArray blobs
     ├── cif_coords.idx               # 76-byte fixed-width index
-    └── prep_meta.json               # content hashes and statistics
 
 Builder
 -------
@@ -65,23 +64,6 @@ PARQUET_TABLES = [
 ]
 
 # ── hash helpers ─────────────────────────────────────────────────────────────
-
-
-def _hash_file(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(1 << 20):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _hash_case_dir(case_dir: Path) -> str:
-    hasher = hashlib.sha256()
-    for child_path in sorted(case_dir.iterdir()):
-        if child_path.is_file() and child_path.name.endswith((".json", ".json.gz", ".gz")):
-            hasher.update(child_path.name.encode())
-            hasher.update(_hash_file(child_path).encode())
-    return hasher.hexdigest()
 
 
 def _hash_source_mtime(source_path: str) -> str:
@@ -654,84 +636,58 @@ def build_prep_database(
     case_dirs = discover_case_output_dirs(inputs)
     LOGGER.info("Prepping %d case directories into %s", len(case_dirs), prep_dir)
 
-    # Load existing hash metadata for incremental updates
-    meta_path = prep_dir / "prep_meta.json"
-    existing_meta: dict[str, str] = {}
-    if meta_path.exists():
-        try:
-            existing_meta = json.loads(meta_path.read_text(encoding="utf-8")).get("hashes", {})
-        except Exception:
-            existing_meta = {}
-
     # ── Phase 1: Parse JSON bundles → Parquet ────────────────────────────
     t1 = time.monotonic()
     prep_jobs = max(1, int(prep_jobs))
     actual_jobs = max(1, min(prep_jobs, len(case_dirs)))
     LOGGER.info("Phase 1: parsing %d case bundles → Parquet (%d workers)", len(case_dirs), actual_jobs)
 
-    # Hash and filter: only process new/changed case dirs
-    new_cases: list[Path] = []
-    skipped_unchanged = 0
-    case_hashes: dict[str, str] = {}
-    for case_dir in case_dirs:
-        ch = _hash_case_dir(case_dir)
-        case_hashes[str(case_dir.resolve())] = ch
-        if existing_meta.get(str(case_dir.resolve())) == ch:
-            skipped_unchanged += 1
-        else:
-            new_cases.append(case_dir)
-
-    if skipped_unchanged:
-        LOGGER.info("Skipping %d unchanged case(s)", skipped_unchanged)
-
     all_source_paths: set[str] = set()
-    stats = {"total_cases": len(case_dirs), "ingested": 0, "skipped_unchanged": skipped_unchanged,
-             "skipped_no_bundles": 0, "errors": 0}
+    stats = {"total_cases": len(case_dirs), "ingested": 0, "skipped_no_bundles": 0, "errors": 0}
 
     tmp_phase1 = prep_dir / ".tmp_phase1"
     tmp_phase1.mkdir(parents=True, exist_ok=True)
 
-    if new_cases:
-        # Small batches for load balancing: at least 4× num_workers batches,
-        # but each batch has at least 500 cases.  ThreadPoolExecutor is sufficient
-        # because gzip decompression and JSON parsing release the GIL.
-        cases_per_batch = max(500, len(new_cases) // (actual_jobs * 4)) if new_cases else 500
-        batches = [new_cases[i:i + cases_per_batch] for i in range(0, len(new_cases), cases_per_batch)]
-        task_args = [(batch, prep_dir, bid, cif_files_directory) for bid, batch in enumerate(batches)]
+    # Small batches for load balancing: at least 4× num_workers batches,
+    # but each batch has at least 500 cases.  ThreadPoolExecutor is sufficient
+    # because gzip decompression and JSON parsing release the GIL.
+    cases_per_batch = max(500, len(case_dirs) // (actual_jobs * 4)) if case_dirs else 500
+    batches = [case_dirs[i:i + cases_per_batch] for i in range(0, len(case_dirs), cases_per_batch)]
+    task_args = [(batch, prep_dir, bid, cif_files_directory) for bid, batch in enumerate(batches)]
 
-        LOGGER.info("Dispatching %d batches (batch_size=%d) to %d workers",
-                    len(batches), BATCH_SIZE, actual_jobs)
+    LOGGER.info("Dispatching %d batches (batch_size=%d) to %d workers",
+                len(batches), cases_per_batch, actual_jobs)
 
-        if len(batches) <= 1:
-            result = _ingest_cases_to_parquet(task_args[0])
-            _merge_batch_stats(result, stats)
-        else:
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-            with _TPE(max_workers=actual_jobs) as executor:
-                futures = [executor.submit(_ingest_cases_to_parquet, arg) for arg in task_args]
-                for future in tqdm(as_completed(futures), total=len(futures),
-                                   desc="Parsing case bundles", unit="batch"):
-                    try:
-                        _merge_batch_stats(future.result(), stats)
-                    except Exception as exc:
-                        LOGGER.warning("Phase 1 worker failed: %s", exc)
+    if len(batches) <= 1:
+        result = _ingest_cases_to_parquet(task_args[0])
+        _merge_batch_stats(result, stats)
+    else:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(max_workers=actual_jobs) as executor:
+            futures = [executor.submit(_ingest_cases_to_parquet, arg) for arg in task_args]
+            for future in tqdm(as_completed(futures), total=len(futures),
+                               desc="Parsing case bundles", unit="batch"):
+                try:
+                    _merge_batch_stats(future.result(), stats)
+                except Exception as exc:
+                    LOGGER.warning("Phase 1 worker failed: %s", exc)
 
-        # Collect source_paths and atom cache map from temp files
-        atom_cache_map: dict[str, str] = {}
-        for sources_file in sorted(tmp_phase1.glob("temp_*_sources.txt")):
-            for line in sources_file.read_text(encoding="utf-8").splitlines():
-                sp = line.strip()
-                if sp:
-                    all_source_paths.add(sp)
-            sources_file.unlink()
-        for atoms_file in sorted(tmp_phase1.glob("temp_*_atoms.jsonl")):
-            for line in atoms_file.read_text(encoding="utf-8").splitlines():
-                entry = json.loads(line.strip())
-                sp = entry.get("source_path", "")
-                ad = entry.get("atoms_dir", "")
-                if sp and ad and sp not in atom_cache_map:
-                    atom_cache_map[sp] = ad
-            atoms_file.unlink()
+    # Collect source_paths and atom cache map from temp files
+    atom_cache_map: dict[str, str] = {}
+    for sources_file in sorted(tmp_phase1.glob("temp_*_sources.txt")):
+        for line in sources_file.read_text(encoding="utf-8").splitlines():
+            sp = line.strip()
+            if sp:
+                all_source_paths.add(sp)
+        sources_file.unlink()
+    for atoms_file in sorted(tmp_phase1.glob("temp_*_atoms.jsonl")):
+        for line in atoms_file.read_text(encoding="utf-8").splitlines():
+            entry = json.loads(line.strip())
+            sp = entry.get("source_path", "")
+            ad = entry.get("atoms_dir", "")
+            if sp and ad and sp not in atom_cache_map:
+                atom_cache_map[sp] = ad
+        atoms_file.unlink()
 
     # Merge temp Parquet files into final Parquet files (metadata-only concatenation)
     for table_name in tqdm(PARQUET_TABLES, desc="Merging Parquet", unit="table"):
@@ -745,12 +701,6 @@ def build_prep_database(
         elif not output_path.exists():
             _write_parquet_table([], output_path)
 
-    # Source paths from existing Parquet (incremental update: unchanged cases)
-    if skipped_unchanged > 0 and not all_source_paths:
-        _collect_source_paths_from_parquet(prep_dir, all_source_paths)
-    else:
-        _collect_source_paths_from_parquet(prep_dir, all_source_paths)
-
     # Cleanup temp dir
     try:
         remaining = list(tmp_phase1.iterdir())
@@ -760,11 +710,11 @@ def build_prep_database(
     except OSError:
         pass
 
-    # Save metadata
-    meta_path.write_text(json.dumps({"hashes": case_hashes}, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Collect source_paths from the Parquet files just written
+    _collect_source_paths_from_parquet(prep_dir, all_source_paths)
 
-    LOGGER.info("Phase 1 complete (%.1fs): %d ingested, %d skipped, %d source paths",
-                time.monotonic() - t1, stats["ingested"], skipped_unchanged, len(all_source_paths))
+    LOGGER.info("Phase 1 complete (%.1fs): %d ingested, %d source paths",
+                time.monotonic() - t1, stats["ingested"], len(all_source_paths))
 
     # ── Phase 2: mmCIF → AtomArray binary cache ──────────────────────────
     cif_stats = {"cached": 0, "skipped": 0}
@@ -859,7 +809,6 @@ def build_prep_database(
         "prep_dir": str(prep_dir.resolve()),
         "total_cases": stats["total_cases"],
         "ingested": stats["ingested"],
-        "skipped_unchanged": stats["skipped_unchanged"],
         "skipped_no_bundles": stats["skipped_no_bundles"],
         "errors": stats["errors"],
         "total_source_paths": len(all_source_paths),

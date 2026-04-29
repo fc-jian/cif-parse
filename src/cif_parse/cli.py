@@ -630,6 +630,22 @@ def main(argv: list[str] | None = None) -> int:
         for case_spec in case_specs
     ]
 
+    # Sort by input file size descending so that the largest (slowest) cases
+    # start first, minimising the long tail at the end of the batch.
+    if args.jobs > 1 and len(tasks) > 1:
+        def _task_size(task: dict[str, Any]) -> int:
+            try:
+                return Path(task["input_path"]).stat().st_size
+            except OSError:
+                return 0
+        tasks.sort(key=_task_size, reverse=True)
+        largest = Path(tasks[0]["input_path"])
+        LOGGER.info(
+            "Largest input submitted first: %s (%.1f MB)",
+            largest.name,
+            _task_size(tasks[0]) / (1 << 20),
+        )
+
     results: list[dict[str, Any]] = []
     if args.jobs == 1:
         for task in tasks:
