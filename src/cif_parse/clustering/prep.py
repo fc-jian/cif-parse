@@ -36,7 +36,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import pickle
 import shutil
 import struct
@@ -72,6 +71,16 @@ def _hash_source_mtime(source_path: str) -> str:
         return "missing"
     stat = p.stat()
     return hashlib.sha256(f"{p.resolve()}:{stat.st_size}:{stat.st_mtime}".encode()).hexdigest()
+
+
+def _blob_index_key(source_path: str, assembly_id: str | None) -> str:
+    """Return a stable 64-char hex key that uniquely identifies a cached blob.
+
+    Different assemblies from the same mmCIF file get different keys, so the
+    index can store them independently.
+    """
+    cache_key = f"{source_path}__{assembly_id or ''}"
+    return hashlib.sha256(cache_key.encode()).hexdigest()
 
 
 # ── json extraction helpers (move heavy parsing into prep once) ──────────────
@@ -352,8 +361,8 @@ def _ingest_cases_to_parquet(
             LOGGER.warning("Failed to ingest case %s", case_dir, exc_info=True)
             stats["errors"] += 1
 
-    # Write temp files
-    tmp_dir = Path(prep_dir) / ".tmp_phase1"
+    # Write temp files into the shared temp directory
+    tmp_dir = Path(prep_dir)  # prep_dir is actually tmp_phase1 passed from main
     tmp_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, str] = {}
     for table_name in PARQUET_TABLES:
@@ -429,8 +438,9 @@ def _cache_sources_to_temp(
                     )
                     offset = bin_fh.tell()
                     bin_fh.write(wrapped)
+                    blob_key = _blob_index_key(source_path, assembly_id)
                     idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                        source_hash.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                        blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
                         offset, len(wrapped),
                     ))
                     entries.append({"cache_key": cache_key, "status": "cached"})
@@ -464,8 +474,9 @@ def _cache_sources_to_temp(
                         )
                         offset = bin_fh.tell()
                         bin_fh.write(blob)
+                        blob_key = _blob_index_key(source_path, assembly_id)
                         idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                            source_hash.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                            blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
                             offset, len(blob),
                         ))
                         entries.append({"cache_key": cache_key, "status": "cached"})
@@ -551,7 +562,7 @@ def _merge_parquet_files(temp_files: list[Path], output_path: Path) -> None:
     """Merge multiple Parquet files into one via row-group concatenation."""
     import pyarrow.parquet as pq
     if len(temp_files) == 1:
-        temp_files[0].rename(output_path)
+        shutil.move(str(temp_files[0]), str(output_path))
         return
     schema = pq.read_schema(temp_files[0])
     with pq.ParquetWriter(output_path, schema, compression="zstd", compression_level=3) as writer:
@@ -645,15 +656,15 @@ def build_prep_database(
     all_source_paths: set[str] = set()
     stats = {"total_cases": len(case_dirs), "ingested": 0, "skipped_no_bundles": 0, "errors": 0}
 
-    tmp_phase1 = prep_dir / ".tmp_phase1"
-    tmp_phase1.mkdir(parents=True, exist_ok=True)
+    from cif_parse.settings import get_fast_temp_dir
+    tmp_phase1 = get_fast_temp_dir("phase1")
 
     # Small batches for load balancing: at least 4× num_workers batches,
     # but each batch has at least 500 cases.  ThreadPoolExecutor is sufficient
     # because gzip decompression and JSON parsing release the GIL.
     cases_per_batch = max(500, len(case_dirs) // (actual_jobs * 4)) if case_dirs else 500
     batches = [case_dirs[i:i + cases_per_batch] for i in range(0, len(case_dirs), cases_per_batch)]
-    task_args = [(batch, prep_dir, bid, cif_files_directory) for bid, batch in enumerate(batches)]
+    task_args = [(batch, str(tmp_phase1), bid, cif_files_directory) for bid, batch in enumerate(batches)]
 
     LOGGER.info("Dispatching %d batches (batch_size=%d) to %d workers",
                 len(batches), cases_per_batch, actual_jobs)
@@ -696,7 +707,8 @@ def build_prep_database(
         if temp_files:
             _merge_parquet_files(temp_files, output_path)
             for tf in temp_files:
-                tf.unlink()
+                if tf.exists():
+                    tf.unlink()
             LOGGER.info("Merged %s from %d temp files", output_path.name, len(temp_files))
         elif not output_path.exists():
             _write_parquet_table([], output_path)
@@ -758,8 +770,7 @@ def build_prep_database(
         num_workers = max(1, min(actual_jobs, len(tasks)))
         LOGGER.info("Dispatching %d source files to %d worker processes", len(tasks), num_workers)
 
-        tmp_phase2 = prep_dir / ".tmp_phase2"
-        tmp_phase2.mkdir(parents=True, exist_ok=True)
+        tmp_phase2 = get_fast_temp_dir("phase2")
         try:
             bin_path = prep_dir / "cif_coords.bin"
             idx_path = prep_dir / "cif_coords.idx"
@@ -881,9 +892,8 @@ def load_cif_from_prep(
     idx = index or load_cif_coords_index(prep_dir)
     if idx is None:
         return None
-    cache_key = f"{source_path}__{assembly_id or ''}"
-    source_hash = _hash_source_mtime(source_path)
-    entry = idx.get(source_hash)
+    blob_key = _blob_index_key(source_path, assembly_id)
+    entry = idx.get(blob_key)
     if entry is None:
         return None
 

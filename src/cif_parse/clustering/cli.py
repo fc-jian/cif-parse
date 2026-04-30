@@ -22,6 +22,7 @@ from cif_parse.settings import (
     SUPPORTED_CLUSTERING_SEQUENCE_MODES,
     SUPPORTED_CLUSTERING_STRUCTURE_MODES,
     SUPPORTED_LOG_LEVELS,
+    get_fast_temp_dir,
     load_clustering_cli_config,
     resolve_source_path,
 )
@@ -361,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
             protein_monomer_count,
             args.usalign_jobs,
         )
-        structure_outdir = args.outdir / "protein_structures"
+        structure_outdir = get_fast_temp_dir("protein_structures")
         extracted_structures, extraction_manifest = extract_protein_monomer_structures(
             sequence_dataset["monomers"],
             outdir=structure_outdir,
@@ -378,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         t2 = time.monotonic()
-        seq_cluster_count = len(set(row["sequence_cluster_id"] for row in sequence_dataset["membership_rows"] if row["polymer_class"] == "protein"))
+        seq_cluster_count = len(set(row.get("cluster_id", row.get("sequence_cluster_id", "")) for row in sequence_dataset["membership_rows"] if row.get("polymer_class") == "protein"))
         LOGGER.info(
             "Step 3/4: Clustering protein monomer structures (%d sequence clusters, %d workers)",
             seq_cluster_count,

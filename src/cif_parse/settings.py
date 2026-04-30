@@ -25,6 +25,53 @@ DEFAULT_CLUSTERING_OUTDIR = Path("cluster_outputs")
 
 _DEFAULT_JOB_COUNT = max(1, os.cpu_count() or 1)
 
+# Resolved once at import time so every module sees the same directory.
+_FAST_TEMP_ROOT: Path | None = None
+
+
+def _resolve_fast_temp_root() -> Path | None:
+    """Pick the best transient-storage root available on this machine.
+
+    Precedence:
+    1. ``CIF_PARSE_TMPDIR`` environment variable (explicit user choice).
+    2. ``/dev/shm`` on Linux (RAM-backed tmpfs).
+    3. ``$TMPDIR`` or ``/tmp`` if no RAM-backed option is available.
+    """
+    env = os.environ.get("CIF_PARSE_TMPDIR")
+    if env:
+        p = Path(env)
+        if p.is_dir() and os.access(p, os.W_OK):
+            return p
+    shm = Path("/dev/shm")
+    if shm.is_dir() and os.access(shm, os.W_OK):
+        return shm
+    for candidate in (os.environ.get("TMPDIR"), "/tmp"):
+        if candidate:
+            p = Path(candidate)
+            if p.is_dir() and os.access(p, os.W_OK):
+                return p
+    return None
+
+
+def get_fast_temp_dir(suffix: str = "") -> Path:
+    """Return a writable directory suitable for transient large I/O.
+
+    The directory is created inside the best available temp root
+    (see :func:`_resolve_fast_temp_root`) with a PID-prefixed name so
+    that concurrent processes do not collide.  Callers may supply an
+    optional *suffix* for human-readable identification.
+    """
+    global _FAST_TEMP_ROOT
+    if _FAST_TEMP_ROOT is None:
+        _FAST_TEMP_ROOT = _resolve_fast_temp_root()
+    root = _FAST_TEMP_ROOT or Path("/tmp")
+    name = f".cif_parse_{os.getpid()}"
+    if suffix:
+        name = f"{name}_{suffix}"
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 
 @dataclass(slots=True)
 class AppSettings:

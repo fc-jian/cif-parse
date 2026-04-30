@@ -136,6 +136,8 @@ class ExtractedMonomerStructure:
         return asdict(self)
 
     def quality_sort_key(self) -> tuple[float, float, float, str]:
+        if self.quality is None:
+            return (4.0, math.inf, -float(self.resolved_fraction), self.monomer_id)
         resolution = self.quality.resolution if self.quality.resolution is not None else math.inf
         return (
             float(self.quality.method_priority),
@@ -411,6 +413,21 @@ def extract_protein_monomer_structures(
         from cif_parse.clustering.prep import load_cif_from_prep as _lcfp
         return _lcfp(_prep_dir, _source_path, _assembly_id, index=_idx, mmap=_mmap)
 
+    def _load_atom_array_for_monomer(_source_path, _observed_assembly_ids):
+        """Try asymmetric unit first, then each observed assembly."""
+        if cif_idx is None:
+            return None
+        # Try asymmetric unit
+        cached = _load_cif_cache(prep_dir, _source_path, None, cif_idx, cif_mmap)
+        if cached is not None and cached.get("atom_array") is not None:
+            return cached["atom_array"]
+        # Try each observed assembly
+        for aid in (_observed_assembly_ids or []):
+            cached = _load_cif_cache(prep_dir, _source_path, str(aid), cif_idx, cif_mmap)
+            if cached is not None and cached.get("atom_array") is not None:
+                return cached["atom_array"]
+        return None
+
     protein_monomers = sorted(
         (monomer for monomer in monomers if monomer.polymer_class == "protein"),
         key=lambda item: item.monomer_id,
@@ -421,12 +438,10 @@ def extract_protein_monomer_structures(
         quality_cache: dict[str, EntryQualityMetadata] = {}
         atom_array_cache: dict[str, AtomArray] = {}
         for monomer in tqdm(protein_monomers, desc="Extracting monomer structures", unit="monomer"):
-            if monomer.source_path not in atom_array_cache and cif_idx is not None:
-                _cached = _load_cif_cache(prep_dir, monomer.source_path, None, cif_idx, cif_mmap)
-                if _cached is not None:
-                    atom_array_cache[monomer.source_path] = _cached["atom_array"]
-                    if _cached.get("quality"):
-                        quality_cache[monomer.source_path] = _cached["quality"]
+            if monomer.source_path not in atom_array_cache:
+                _prep_atoms = _load_atom_array_for_monomer(monomer.source_path, monomer.observed_assembly_ids)
+                if _prep_atoms is not None:
+                    atom_array_cache[monomer.source_path] = _prep_atoms
             if monomer.source_path not in quality_cache:
                 quality_cache[monomer.source_path] = read_entry_quality_metadata(
                     monomer.source_path,
@@ -460,12 +475,10 @@ def extract_protein_monomer_structures(
 
         def _extract_one(monomer: MonomerSample) -> ExtractedMonomerStructure | None:
             with cache_lock:
-                if monomer.source_path not in atom_array_cache and cif_idx is not None:
-                    _cached = _load_cif_cache(prep_dir, monomer.source_path, None, cif_idx, cif_mmap)
-                    if _cached is not None:
-                        atom_array_cache[monomer.source_path] = _cached["atom_array"]
-                        if _cached.get("quality"):
-                            quality_cache[monomer.source_path] = _cached["quality"]
+                if monomer.source_path not in atom_array_cache:
+                    _prep_atoms = _load_atom_array_for_monomer(monomer.source_path, monomer.observed_assembly_ids)
+                    if _prep_atoms is not None:
+                        atom_array_cache[monomer.source_path] = _prep_atoms
                 if monomer.source_path not in quality_cache:
                     quality_cache[monomer.source_path] = read_entry_quality_metadata(
                         monomer.source_path,
