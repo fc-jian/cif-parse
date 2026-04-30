@@ -390,40 +390,28 @@ def extract_protein_monomer_structures(
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    # Load cif_cache index + mmap when prep_dir is available
+    # Load cif_cache index when prep_dir is available
     cif_idx: dict | None = None
-    cif_mmap = None
     if prep_dir:
         from cif_parse.clustering.prep import load_cif_coords_index, load_cif_from_prep
         cif_idx = load_cif_coords_index(prep_dir)
-        if cif_idx is not None:
-            try:
-                import mmap as _mmap
-                bin_path = Path(prep_dir) / "cif_coords.bin"
-                if bin_path.exists():
-                    _fh = bin_path.open("rb")
-                    cif_mmap = _mmap.mmap(_fh.fileno(), 0, access=_mmap.ACCESS_READ)
-            except Exception:
-                cif_mmap = None
 
     structures: dict[str, ExtractedMonomerStructure] = {}
     failures: list[dict[str, str]] = []
 
-    def _load_cif_cache(_prep_dir, _source_path, _assembly_id, _idx, _mmap):
+    def _load_cif_cache(_prep_dir, _source_path, _assembly_id, _idx):
         from cif_parse.clustering.prep import load_cif_from_prep as _lcfp
-        return _lcfp(_prep_dir, _source_path, _assembly_id, index=_idx, mmap=_mmap)
+        return _lcfp(_prep_dir, _source_path, _assembly_id, index=_idx)
 
     def _load_atom_array_for_monomer(_source_path, _observed_assembly_ids):
         """Try asymmetric unit first, then each observed assembly."""
         if cif_idx is None:
             return None
-        # Try asymmetric unit
-        cached = _load_cif_cache(prep_dir, _source_path, None, cif_idx, cif_mmap)
+        cached = _load_cif_cache(prep_dir, _source_path, None, cif_idx)
         if cached is not None and cached.get("atom_array") is not None:
             return cached["atom_array"]
-        # Try each observed assembly
         for aid in (_observed_assembly_ids or []):
-            cached = _load_cif_cache(prep_dir, _source_path, str(aid), cif_idx, cif_mmap)
+            cached = _load_cif_cache(prep_dir, _source_path, str(aid), cif_idx)
             if cached is not None and cached.get("atom_array") is not None:
                 return cached["atom_array"]
         return None

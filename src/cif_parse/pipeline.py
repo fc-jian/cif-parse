@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import logging
 import pickle
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -358,7 +359,7 @@ def _dump_atom_cache(
                 atom_array = get_structure(cif_file, model=model, use_author_fields=False)
                 if atom_array is not None and len(atom_array) > 0:
                     au_cache_path.write_bytes(
-                        pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL)
+                        zlib.compress(pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL), 3)
                     )
             except Exception:
                 LOGGER.debug("Failed to cache asymmetric unit for %s", input_path)
@@ -381,7 +382,7 @@ def _dump_atom_cache(
                         )
                         if atom_array is not None and len(atom_array) > 0:
                             asm_cache_path.write_bytes(
-                                pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL)
+                                zlib.compress(pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL), 3)
                             )
                     except ValueError as exc:
                         if str(exc) == "Array must contain at least one element":

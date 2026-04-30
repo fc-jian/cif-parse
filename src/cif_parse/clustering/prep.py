@@ -40,6 +40,7 @@ import pickle
 import shutil
 import struct
 import time
+import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -52,6 +53,22 @@ LOGGER = logging.getLogger(__name__)
 
 _IDX_ENTRY_STRUCT = struct.Struct("64s Q I")  # hash(64 B hex ASCII), offset(8 B), len(4 B)
 _IDX_ENTRY_SIZE = _IDX_ENTRY_STRUCT.size  # 76 bytes
+
+# Compressed blob format: 4-byte magic + 4-byte raw length + zlib(data)
+_BLOB_MAGIC = b"\x01\xC1\xF0\x01"
+_BLOB_HEADER = struct.Struct("4s I")
+_ZLIB_LEVEL = 3  # fast, ~7x compression on AtomArray pickles
+
+
+def _compress_blob(data: bytes) -> bytes:
+    return _BLOB_HEADER.pack(_BLOB_MAGIC, len(data)) + zlib.compress(data, _ZLIB_LEVEL)
+
+
+def _decompress_blob(data: bytes) -> bytes:
+    magic, raw_len = _BLOB_HEADER.unpack(data[: _BLOB_HEADER.size])
+    if magic != _BLOB_MAGIC:
+        raise ValueError("cif_coords blob has unexpected magic; rebuild prep")
+    return zlib.decompress(data[_BLOB_HEADER.size:])
 
 # Parquet output file names
 PARQUET_TABLES = [
@@ -387,111 +404,108 @@ def _ingest_cases_to_parquet(
 
 
 def _cache_sources_to_temp(
-    args: tuple[str, list[str | None], str, Path, int, dict[str, str] | None],
+    args: tuple[list[tuple[str, list[str | None], str]], Path, int, dict[str, str] | None],
 ) -> dict[str, Any]:
-    """Parse one mmCIF file and write cached atom arrays to temp bin+idx.
+    """Process a batch of mmCIF files and write cached atom arrays to one chunk.
 
-    If *atom_cache_map* contains an ``atoms/`` directory for *source_path*,
-    pre-cached pickle files from the parsing stage are used directly (no
-    mmCIF re-read).  Otherwise the original mmCIF is read and parsed.
+    All source_paths in the batch write to a single ``temp_{worker_id}.bin`` +
+    ``temp_{worker_id}.idx`` pair — no inter-process coordination needed because
+    each batch runs in exactly one worker process.
 
-    Writes ``temp_{worker_id}.bin`` and ``temp_{worker_id}.idx`` directly,
-    returning only metadata — no blob data through IPC.
+    Returns metadata only — no blob data through IPC.
     """
-    source_path, assembly_ids, cif_files_directory, tmp_dir, worker_id, atom_cache_map = args
-    resolved_path = source_path
-    if cif_files_directory:
-        resolved_path = str(Path(cif_files_directory) / Path(source_path).name)
-    source_hash = _hash_source_mtime(resolved_path)
+    chunk_tasks, tmp_dir, worker_id, atom_cache_map = args
     tmp_dir = Path(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     bin_path = tmp_dir / f"temp_{worker_id}.bin"
     idx_path = tmp_dir / f"temp_{worker_id}.idx"
-    entries: list[dict[str, Any]] = []
+    all_entries: list[dict[str, Any]] = []
 
-    # Fast path: use atom cache from parsing stage
-    atoms_dir = atom_cache_map.get(source_path) if atom_cache_map else None
-    if atoms_dir:
-        atoms_dir = Path(atoms_dir)
-        try:
-            with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
-                for assembly_id in assembly_ids:
-                    cache_key = f"{source_path}__{assembly_id or ''}"
-                    pkl_name = f"{assembly_id or '_none'}.pkl"
-                    pkl_path = atoms_dir / pkl_name
-                    if not pkl_path.exists():
-                        if assembly_id is None:
-                            entries.append({"cache_key": cache_key, "status": "empty"})
-                            continue
-                        pkl_none = atoms_dir / "_none.pkl"
-                        if pkl_none.exists():
-                            pkl_path = pkl_none
-                        else:
-                            entries.append({"cache_key": cache_key, "status": "empty"})
-                            continue
-                    # Wrap raw AtomArray in same format as slow path
-                    raw = pickle.loads(pkl_path.read_bytes())
-                    wrapped = pickle.dumps(
-                        {"atom_array": raw, "quality": None, "chain_ops": None},
-                        protocol=pickle.HIGHEST_PROTOCOL,
-                    )
-                    offset = bin_fh.tell()
-                    bin_fh.write(wrapped)
-                    blob_key = _blob_index_key(source_path, assembly_id)
-                    idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                        blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                        offset, len(wrapped),
-                    ))
-                    entries.append({"cache_key": cache_key, "status": "cached"})
-            return {"source_path": source_path, "entries": entries,
-                    "bin_path": str(bin_path) if bin_path.exists() else None,
-                    "idx_path": str(idx_path) if idx_path.exists() else None}
-        except Exception as exc:
-            LOGGER.debug("Atom cache read failed for %s, falling back to mmCIF: %s", source_path, exc)
+    for source_path, assembly_ids, cif_files_directory in chunk_tasks:
+        resolved_path = source_path
+        if cif_files_directory:
+            resolved_path = str(Path(cif_files_directory) / Path(source_path).name)
 
-    # Slow path: read and parse original mmCIF
-    try:
-        from biotite.structure.io.pdbx import get_assembly, get_structure
-        from cif_parse.io import read_cif_file
-
-        cif_file = read_cif_file(resolved_path)
-        quality = _read_quality(resolved_path, cif_file)
-
-        with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
-            for assembly_id in assembly_ids:
-                cache_key = f"{source_path}__{assembly_id or ''}"
-                try:
-                    if assembly_id:
-                        atom_array = get_assembly(cif_file, assembly_id=assembly_id, model=1, use_author_fields=False)
-                    else:
-                        atom_array = get_structure(cif_file, model=1, use_author_fields=False)
-                    if atom_array is not None and len(atom_array) > 0:
-                        chain_ops_json = _read_chain_ops_json(source_path, assembly_id)
-                        blob = pickle.dumps(
-                            {"atom_array": atom_array, "quality": quality, "chain_ops": chain_ops_json},
+        # Fast path: use atom cache from parsing stage
+        atoms_dir = atom_cache_map.get(source_path) if atom_cache_map else None
+        if atoms_dir:
+            atoms_dir = Path(atoms_dir)
+            try:
+                with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
+                    for assembly_id in assembly_ids:
+                        cache_key = f"{source_path}__{assembly_id or ''}"
+                        pkl_name = f"{assembly_id or '_none'}.pkl"
+                        pkl_path = atoms_dir / pkl_name
+                        if not pkl_path.exists():
+                            if assembly_id is None:
+                                all_entries.append({"cache_key": cache_key, "status": "empty"})
+                                continue
+                            pkl_none = atoms_dir / "_none.pkl"
+                            if pkl_none.exists():
+                                pkl_path = pkl_none
+                            else:
+                                all_entries.append({"cache_key": cache_key, "status": "empty"})
+                                continue
+                        raw = pickle.loads(zlib.decompress(pkl_path.read_bytes()))
+                        wrapped = _compress_blob(pickle.dumps(
+                            {"atom_array": raw, "quality": None, "chain_ops": None},
                             protocol=pickle.HIGHEST_PROTOCOL,
-                        )
+                        ))
                         offset = bin_fh.tell()
-                        bin_fh.write(blob)
+                        bin_fh.write(wrapped)
                         blob_key = _blob_index_key(source_path, assembly_id)
                         idx_fh.write(_IDX_ENTRY_STRUCT.pack(
                             blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                            offset, len(blob),
+                            offset, len(wrapped),
                         ))
-                        entries.append({"cache_key": cache_key, "status": "cached"})
-                    else:
-                        entries.append({"cache_key": cache_key, "status": "empty"})
-                except Exception as exc:
-                    LOGGER.warning("Failed to cache assembly %s for %s: %s", assembly_id, source_path, exc)
-                    entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
-    except Exception as exc:
-        LOGGER.warning("Failed to read mmCIF %s: %s", source_path, exc)
-        for assembly_id in assembly_ids:
-            cache_key = f"{source_path}__{assembly_id or ''}"
-            entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
+                        all_entries.append({"cache_key": cache_key, "status": "cached"})
+                continue  # skip slow path for this source_path
+            except Exception as exc:
+                LOGGER.debug("Atom cache read failed for %s, falling back to mmCIF: %s", source_path, exc)
 
-    return {"source_path": source_path, "entries": entries,
+        # Slow path: read and parse original mmCIF
+        try:
+            from biotite.structure.io.pdbx import get_assembly, get_structure
+            from cif_parse.io import read_cif_file
+
+            cif_file = read_cif_file(resolved_path)
+            quality = _read_quality(resolved_path, cif_file)
+
+            with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
+                for assembly_id in assembly_ids:
+                    cache_key = f"{source_path}__{assembly_id or ''}"
+                    try:
+                        if assembly_id:
+                            atom_array = get_assembly(cif_file, assembly_id=assembly_id, model=1, use_author_fields=False)
+                        else:
+                            atom_array = get_structure(cif_file, model=1, use_author_fields=False)
+                        if atom_array is not None and len(atom_array) > 0:
+                            chain_ops_json = _read_chain_ops_json(source_path, assembly_id)
+                            blob = _compress_blob(pickle.dumps(
+                                {"atom_array": atom_array, "quality": quality, "chain_ops": chain_ops_json},
+                                protocol=pickle.HIGHEST_PROTOCOL,
+                            ))
+                            offset = bin_fh.tell()
+                            bin_fh.write(blob)
+                            blob_key = _blob_index_key(source_path, assembly_id)
+                            idx_fh.write(_IDX_ENTRY_STRUCT.pack(
+                                blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                                offset, len(blob),
+                            ))
+                            all_entries.append({"cache_key": cache_key, "status": "cached"})
+                        else:
+                            all_entries.append({"cache_key": cache_key, "status": "empty"})
+                    except Exception as exc:
+                        LOGGER.warning("Failed to cache assembly %s for %s: %s", assembly_id, source_path, exc)
+                        all_entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
+        except Exception as exc:
+            LOGGER.warning("Failed to read mmCIF %s: %s", source_path, exc)
+            for assembly_id in assembly_ids:
+                cache_key = f"{source_path}__{assembly_id or ''}"
+                all_entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
+
+    return {"entries": all_entries,
             "bin_path": str(bin_path) if bin_path.exists() else None,
             "idx_path": str(idx_path) if idx_path.exists() else None}
 
@@ -772,16 +786,19 @@ def build_prep_database(
 
         tmp_phase2 = get_fast_temp_dir("phase2")
         try:
-            bin_path = prep_dir / "cif_coords.bin"
-            idx_path = prep_dir / "cif_coords.idx"
-
             if len(tasks) <= 1:
-                worker_args = (tasks[0][0], tasks[0][1], tasks[0][2], tmp_phase2, 0, atom_cache_map)
-                result = _cache_sources_to_temp(worker_args)
+                chunk_tasks = [(sp, aids, cfd) for sp, aids, cfd in tasks]
+                result = _cache_sources_to_temp((chunk_tasks, tmp_phase2, 0, atom_cache_map))
                 _count_cif_entries(result, cif_stats)
             else:
-                task_args = [(sp, aids, cfd, tmp_phase2, wid, atom_cache_map)
-                             for wid, (sp, aids, cfd) in enumerate(tasks)]
+                # Split tasks into num_workers groups; each group → one chunk file
+                chunk_size = max(1, len(tasks) // num_workers)
+                grouped: list[list[tuple]] = [[] for _ in range(num_workers)]
+                for i, (sp, aids, cfd) in enumerate(tasks):
+                    grouped[min(i // chunk_size, num_workers - 1)].append((sp, aids, cfd))
+                grouped = [g for g in grouped if g]  # drop empty groups
+                task_args = [(chunk_tasks, tmp_phase2, wid, atom_cache_map)
+                             for wid, chunk_tasks in enumerate(grouped)]
                 with ProcessPoolExecutor(max_workers=num_workers) as executor:
                     futures = [executor.submit(_cache_sources_to_temp, arg) for arg in task_args]
                     for future in tqdm(as_completed(futures), total=len(futures),
@@ -791,19 +808,16 @@ def build_prep_database(
                         except Exception as exc:
                             LOGGER.warning("Phase 2 worker failed: %s", exc)
 
-            # Concatenate temp bin files and rebuild global index
+            # Move temp files to chunked storage — no concatenation needed.
+            # Each worker's output becomes an independent chunk file.
             temp_bins = sorted(tmp_phase2.glob("temp_*.bin"))
             temp_idxs = sorted(tmp_phase2.glob("temp_*.idx"))
             if temp_bins:
-                offset = 0
-                with bin_path.open("wb") as bin_fh, idx_path.open("wb") as idx_fh:
-                    for tbin, tidx in zip(temp_bins, temp_idxs):
-                        data = tbin.read_bytes()
-                        bin_fh.write(data)
-                        for entry_bytes in _read_idx_entries(tidx):
-                            source_hash, _, blob_len = _IDX_ENTRY_STRUCT.unpack(entry_bytes)
-                            idx_fh.write(_IDX_ENTRY_STRUCT.pack(source_hash, offset, blob_len))
-                            offset += blob_len
+                coords_dir = prep_dir / "cif_coords"
+                coords_dir.mkdir(parents=True, exist_ok=True)
+                for chunk_id, (tbin, tidx) in enumerate(zip(temp_bins, temp_idxs)):
+                    shutil.move(str(tbin), str(coords_dir / f"chunk_{chunk_id}.bin"))
+                    shutil.move(str(tidx), str(coords_dir / f"chunk_{chunk_id}.idx"))
 
         finally:
             shutil.rmtree(tmp_phase2, ignore_errors=True)
@@ -856,24 +870,51 @@ def iter_parquet_rows(prep_dir: str | Path, table_name: str, columns: list[str] 
             yield {c: tbl.column(c)[i].as_py() for c in cols}
 
 
-def load_cif_coords_index(prep_dir: str | Path) -> dict[str, tuple[int, int]] | None:
-    """Load the cif_coords.idx into a dict {source_hash: (offset, length)}.
+def load_cif_coords_index(prep_dir: str | Path) -> dict[str, tuple[Path, int, int]] | None:
+    """Load all chunk idx files from ``cif_coords/``.
 
-    Returns None if the index file does not exist.
+    Returns ``{blob_key: (chunk_bin_path, offset, length)}``, or None if the
+    chunk directory does not exist.  Also accepts legacy single-file
+    ``cif_coords.idx`` for backward compatibility.
     """
-    idx_path = Path(prep_dir) / "cif_coords.idx"
-    if not idx_path.exists():
-        return None
-    index: dict[str, tuple[int, int]] = {}
-    with idx_path.open("rb") as fh:
-        while True:
-            entry = fh.read(_IDX_ENTRY_SIZE)
-            if len(entry) < _IDX_ENTRY_SIZE:
-                break
-            source_hash, offset, length = _IDX_ENTRY_STRUCT.unpack(entry)
-            key = source_hash.decode("ascii").rstrip("\0")
-            index[key] = (offset, length)
-    return index
+    prep_dir = Path(prep_dir)
+    coords_dir = prep_dir / "cif_coords"
+    index: dict[str, tuple[Path, int, int]] = {}
+
+    # New chunked format
+    if coords_dir.is_dir():
+        for idx_path in sorted(coords_dir.glob("chunk_*.idx")):
+            chunk_id = idx_path.stem.replace("chunk_", "")
+            bin_path = coords_dir / f"chunk_{chunk_id}.bin"
+            if not bin_path.exists():
+                continue
+            with idx_path.open("rb") as fh:
+                while True:
+                    entry = fh.read(_IDX_ENTRY_SIZE)
+                    if len(entry) < _IDX_ENTRY_SIZE:
+                        break
+                    source_hash, offset, length = _IDX_ENTRY_STRUCT.unpack(entry)
+                    key = source_hash.decode("ascii").rstrip("\0")
+                    index[key] = (bin_path, offset, length)
+        if index:
+            return index
+
+    # Legacy single-file format
+    idx_path = prep_dir / "cif_coords.idx"
+    bin_path = prep_dir / "cif_coords.bin"
+    if idx_path.exists() and bin_path.exists():
+        with idx_path.open("rb") as fh:
+            while True:
+                entry = fh.read(_IDX_ENTRY_SIZE)
+                if len(entry) < _IDX_ENTRY_SIZE:
+                    break
+                source_hash, offset, length = _IDX_ENTRY_STRUCT.unpack(entry)
+                key = source_hash.decode("ascii").rstrip("\0")
+                index[key] = (bin_path, offset, length)
+        if index:
+            return index
+
+    return None
 
 
 def load_cif_from_prep(
@@ -881,7 +922,7 @@ def load_cif_from_prep(
     source_path: str,
     assembly_id: str | None = None,
     *,
-    index: dict[str, tuple[int, int]] | None = None,
+    index: dict[str, tuple[Path, int, int]] | None = None,
     mmap: Any = None,
 ) -> dict[str, Any] | None:
     """Fetch a cached AtomArray + metadata from the binary index.
@@ -897,16 +938,16 @@ def load_cif_from_prep(
     if entry is None:
         return None
 
-    offset, length = entry
-    bin_path = Path(prep_dir) / "cif_coords.bin"
-    if mmap is not None:
+    bin_path, offset, length = entry
+    if mmap is not None and hasattr(mmap, "seek"):
+        # Legacy: single mmap over old cif_coords.bin
         data = mmap[offset:offset + length]
     else:
         with bin_path.open("rb") as fh:
             fh.seek(offset)
             data = fh.read(length)
     try:
-        return pickle.loads(data)
+        return pickle.loads(_decompress_blob(data))
     except Exception:
         return None
 
