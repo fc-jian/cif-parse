@@ -480,7 +480,8 @@ def extract_multimer_structures(
                 executor.submit(_process_one, observation): observation
                 for observation in sorted_observations
             }
-            for future in as_completed(future_to_obs):
+            for future in tqdm(as_completed(future_to_obs), total=len(future_to_obs),
+                               desc="Extracting multimer structures", unit="multimer"):
                 observation = future_to_obs[future]
                 try:
                     extracted = future.result()
@@ -553,10 +554,12 @@ def refine_multimer_signature_clusters(
     runner = alignment_runner or run_multimer_usalign_alignment
     alignment_jobs = normalize_worker_count(alignment_jobs)
     total_observations = sum(len(members) for _, members in signature_groups)
+    multi_member = sum(1 for _, m in signature_groups if len(m) > 1)
     LOGGER.info(
-        "Refining %d multimer signature clusters (%d observations, %d alignment workers)",
+        "Refining %d multimer signature clusters (%d observations, %d multi-member, %d alignment workers)",
         len(signature_groups),
         total_observations,
+        multi_member,
         alignment_jobs,
     )
     alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}

@@ -302,9 +302,6 @@ def default_cli_config() -> dict[str, Any]:
             "min_alignment_coverage_ratio": 0.80,
             "usalign_executable": "USalign",
             "jobs": _DEFAULT_JOB_COUNT,
-            "mmseqs_threads": _DEFAULT_JOB_COUNT,
-            "sequence_cluster_jobs": _DEFAULT_JOB_COUNT,
-            "usalign_jobs": _DEFAULT_JOB_COUNT,
             "log_level": "INFO",
         },
     }

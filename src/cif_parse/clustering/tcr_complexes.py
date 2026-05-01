@@ -567,7 +567,8 @@ def extract_tcr_complex_structures(
                 executor.submit(_process_one, observation): observation
                 for observation in sorted_observations
             }
-            for future in as_completed(future_to_obs):
+            for future in tqdm(as_completed(future_to_obs), total=len(future_to_obs),
+                               desc="Extracting TCR complex structures", unit="complex"):
                 observation = future_to_obs[future]
                 try:
                     extracted = future.result()
@@ -640,10 +641,12 @@ def refine_tcr_complex_signature_clusters(
     runner = alignment_runner or run_tcr_complex_usalign_alignment
     alignment_jobs = normalize_worker_count(alignment_jobs)
     total_observations = sum(len(members) for _, members in signature_groups)
+    multi_member = sum(1 for _, m in signature_groups if len(m) > 1)
     LOGGER.info(
-        "Refining %d TCR complex signature clusters (%d observations, %d alignment workers)",
+        "Refining %d TCR complex signature clusters (%d observations, %d multi-member, %d alignment workers)",
         len(signature_groups),
         total_observations,
+        multi_member,
         alignment_jobs,
     )
     alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}

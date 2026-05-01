@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from tqdm import tqdm
+
 import biotite.structure as struc
 from biotite.structure import AtomArray, get_residues
 from biotite.structure.io.pdb import PDBFile
@@ -435,7 +437,7 @@ def extract_dimer_structures(
         atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
         import threading as _threading
         _lock = _threading.Lock()
-        for observation in sorted_observations:
+        for observation in tqdm(sorted_observations, desc="Extracting dimer structures", unit="dimer"):
             try:
                 atom_array = _load_atom_array(observation, atom_array_cache, _lock)
                 structures[observation.dimer_observation_id] = extract_dimer_structure(
@@ -471,7 +473,8 @@ def extract_dimer_structures(
                 executor.submit(_extract_one, observation): observation
                 for observation in sorted_observations
             }
-            for future in as_completed(future_to_obs):
+            for future in tqdm(as_completed(future_to_obs), total=len(future_to_obs),
+                               desc="Extracting dimer structures", unit="dimer"):
                 observation = future_to_obs[future]
                 try:
                     extracted = future.result()
@@ -548,13 +551,15 @@ def refine_dimer_signature_clusters(
     num_signature_clusters_split = 0
 
     total_observations = sum(len(members) for _, members in signature_groups)
+    multi_member = sum(1 for _, m in signature_groups if len(m) > 1)
     LOGGER.info(
-        "Refining %d dimer signature clusters (%d observations, %d alignment workers)",
+        "Refining %d dimer signature clusters (%d observations, %d multi-member, %d alignment workers)",
         len(signature_groups),
         total_observations,
+        multi_member,
         alignment_jobs,
     )
-    for signature_cluster_id, members in signature_groups:
+    for signature_cluster_id, members in tqdm(signature_groups, desc="Refining dimer clusters", unit="sig-group"):
         extracted_members = [
             member for member in members if member.dimer_observation_id in extracted_structures
         ]

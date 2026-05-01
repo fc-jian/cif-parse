@@ -254,20 +254,20 @@ def build_parser(
     parser.add_argument(
         "--mmseqs-threads",
         type=int,
-        default=int(clustering_defaults.get("mmseqs_threads", clustering_defaults.get("jobs", 1))),
-        help="Thread count passed to mmseqs easy-cluster",
+        default=None,
+        help="Thread count passed to mmseqs easy-cluster (default: same as --jobs)",
     )
     parser.add_argument(
         "--sequence-cluster-jobs",
         type=int,
-        default=int(clustering_defaults.get("sequence_cluster_jobs", clustering_defaults.get("jobs", 1))),
-        help="Number of protein sequence clusters processed concurrently during monomer structure clustering",
+        default=None,
+        help="Number of protein sequence clusters processed concurrently (default: same as --jobs)",
     )
     parser.add_argument(
         "--usalign-jobs",
         type=int,
-        default=int(clustering_defaults.get("usalign_jobs", clustering_defaults.get("jobs", 1))),
-        help="Maximum concurrent USalign subprocesses per clustering refinement stage",
+        default=None,
+        help="Maximum concurrent USalign subprocesses per refinement stage (default: same as --jobs)",
     )
     parser.add_argument(
         "--log-level",
@@ -307,6 +307,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.inputs is None:
         parser = build_parser(config_defaults=config_defaults, config_path=config_path)
         parser.error("--inputs is required for clustering mode (or use 'prep' subcommand)")
+
+    # subtask job counts inherit from --jobs when not explicitly set
+    if args.mmseqs_threads is None:
+        args.mmseqs_threads = args.jobs
+    if args.sequence_cluster_jobs is None:
+        args.sequence_cluster_jobs = args.jobs
+    if args.usalign_jobs is None:
+        args.usalign_jobs = args.jobs
 
     for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
         if getattr(args, field_name) < 1:
