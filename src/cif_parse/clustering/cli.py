@@ -254,19 +254,19 @@ def build_parser(
     parser.add_argument(
         "--mmseqs-threads",
         type=int,
-        default=None,
+        default=clustering_defaults.get("mmseqs_threads") or clustering_defaults.get("jobs", 1),
         help="Thread count passed to mmseqs easy-cluster (default: same as --jobs)",
     )
     parser.add_argument(
         "--sequence-cluster-jobs",
         type=int,
-        default=None,
+        default=clustering_defaults.get("sequence_cluster_jobs") or clustering_defaults.get("jobs", 1),
         help="Number of protein sequence clusters processed concurrently (default: same as --jobs)",
     )
     parser.add_argument(
         "--usalign-jobs",
         type=int,
-        default=None,
+        default=clustering_defaults.get("usalign_jobs") or clustering_defaults.get("jobs", 1),
         help="Maximum concurrent USalign subprocesses per refinement stage (default: same as --jobs)",
     )
     parser.add_argument(
@@ -307,14 +307,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.inputs is None:
         parser = build_parser(config_defaults=config_defaults, config_path=config_path)
         parser.error("--inputs is required for clustering mode (or use 'prep' subcommand)")
-
-    # subtask job counts inherit from --jobs when not explicitly set
-    if args.mmseqs_threads is None:
-        args.mmseqs_threads = args.jobs
-    if args.sequence_cluster_jobs is None:
-        args.sequence_cluster_jobs = args.jobs
-    if args.usalign_jobs is None:
-        args.usalign_jobs = args.jobs
 
     for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
         if getattr(args, field_name) < 1:
@@ -359,52 +351,93 @@ def main(argv: list[str] | None = None) -> int:
         manifest.get("num_sequence_membership_rows", 0) if isinstance(manifest, dict) else 0,
     )
 
-    # --- Step 2-3: protein monomer structure extraction + clustering ---
+    # --- Step 2-3: protein monomer structure extraction + clustering (pipelined) ---
     if args.protein_structure_mode == "greedy":
         t1 = time.monotonic()
         protein_monomer_count = sum(
             1 for m in sequence_dataset["monomers"] if m.polymer_class == "protein"
         )
-        LOGGER.info(
-            "Step 2/4: Extracting protein monomer structures (%d monomers, %d workers)",
-            protein_monomer_count,
-            args.usalign_jobs,
-        )
-        structure_outdir = get_fast_temp_dir("protein_structures")
-        extracted_structures, extraction_manifest = extract_protein_monomer_structures(
-            sequence_dataset["monomers"],
-            outdir=structure_outdir,
-            model=args.model,
-            drop_hydrogens=not args.keep_hydrogens,
-            extraction_jobs=args.usalign_jobs,
-            prep_dir=prep_dir,
-        )
-        LOGGER.info(
-            "Step 2 complete (%.1fs): %d structures extracted, %d failures",
-            time.monotonic() - t1,
-            extraction_manifest.get("num_extracted_protein_structures", 0),
-            extraction_manifest.get("num_failed_protein_structure_extractions", 0),
-        )
-
-        t2 = time.monotonic()
         seq_cluster_count = len(set(row.get("cluster_id", row.get("sequence_cluster_id", "")) for row in sequence_dataset["membership_rows"] if row.get("polymer_class") == "protein"))
+        structure_outdir = get_fast_temp_dir("protein_structures")
         LOGGER.info(
-            "Step 3/4: Clustering protein monomer structures (%d sequence clusters, %d workers)",
+            "Step 2+3/4: Extracting + clustering protein monomer structures "
+            "(%d monomers, %d seq clusters, pipelined with %d seq-cluster workers)",
+            protein_monomer_count,
             seq_cluster_count,
             args.sequence_cluster_jobs,
         )
-        greedy_cluster_protein_structures(
+
+        # Build on-the-fly extractor that shares the prep cif_cache
+        cif_idx_for_pipeline: dict | None = None
+        if prep_dir:
+            from cif_parse.clustering.prep import load_cif_coords_index, load_cif_from_prep
+            cif_idx_for_pipeline = load_cif_coords_index(prep_dir)
+
+        from cif_parse.io import read_cif_file
+        from biotite.structure.io.pdbx import get_structure
+        quality_cache: dict[str, Any] = {}
+        atom_array_cache: dict[str, Any] = {}
+        import threading
+        _extract_lock = threading.Lock()
+
+        def _pipeline_extract(monomer) -> Any | None:
+            nonlocal cif_idx_for_pipeline
+            from cif_parse.clustering.protein_structures import (
+                extract_protein_monomer_structure,
+                read_entry_quality_metadata,
+            )
+            with _extract_lock:
+                if monomer.source_path not in atom_array_cache and cif_idx_for_pipeline is not None:
+                    from cif_parse.clustering.prep import load_cif_from_prep as _lcfp
+                    # try asymmetric unit first, then assembly
+                    for aid in [None] + (monomer.observed_assembly_ids or []):
+                        _c = _lcfp(prep_dir, monomer.source_path, str(aid) if aid else None, index=cif_idx_for_pipeline)
+                        if _c is not None and _c.get("atom_array") is not None:
+                            atom_array_cache[monomer.source_path] = _c["atom_array"]
+                            break
+                if monomer.source_path not in quality_cache:
+                    quality_cache[monomer.source_path] = read_entry_quality_metadata(
+                        monomer.source_path, pdb_id=monomer.pdb_id,
+                    )
+                if monomer.source_path not in atom_array_cache:
+                    cf = read_cif_file(monomer.source_path)
+                    atom_array_cache[monomer.source_path] = get_structure(cf, model=args.model, use_author_fields=False)
+            try:
+                return extract_protein_monomer_structure(
+                    monomer,
+                    outdir=structure_outdir,
+                    model=args.model,
+                    drop_hydrogens=not args.keep_hydrogens,
+                    quality_metadata=quality_cache[monomer.source_path],
+                    atom_array=atom_array_cache[monomer.source_path],
+                )
+            except Exception:
+                return None
+
+        result = greedy_cluster_protein_structures(
             sequence_dataset["monomers"],
             sequence_dataset["membership_rows"],
-            extracted_structures,
+            None,  # no pre-extracted structures
             outdir=args.outdir / "structure_clusters",
             tm_score_threshold=args.tm_score_threshold,
             min_alignment_coverage_ratio=args.min_alignment_coverage_ratio,
             usalign_executable=args.usalign_executable,
             sequence_cluster_jobs=args.sequence_cluster_jobs,
             pairwise_alignment_jobs=args.usalign_jobs,
+            extract_fn=_pipeline_extract,
         )
-        LOGGER.info("Step 3 complete (%.1fs)", time.monotonic() - t2)
+        manifest = result.get("manifest", {})
+        LOGGER.info(
+            "Step 2+3 complete (%.1fs): %d structures extracted (%d failures), "
+            "%d sequence clusters -> %d structure clusters (%d alignments, %d failures)",
+            time.monotonic() - t1,
+            manifest.get("num_extracted", 0),
+            manifest.get("num_extraction_failures", 0),
+            manifest.get("num_sequence_clusters", 0),
+            manifest.get("num_structure_clusters", 0),
+            manifest.get("num_alignment_runs", 0),
+            manifest.get("num_alignment_failures", 0),
+        )
 
     # --- Steps 4: higher-order clustering (run concurrently) ---
     from concurrent.futures import ThreadPoolExecutor, as_completed

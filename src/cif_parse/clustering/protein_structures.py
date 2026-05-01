@@ -518,7 +518,7 @@ def extract_protein_monomer_structures(
 def greedy_cluster_protein_structures(
     monomers: Iterable[MonomerSample],
     membership_rows: Iterable[dict[str, Any]],
-    extracted_structures: dict[str, ExtractedMonomerStructure],
+    extracted_structures: dict[str, ExtractedMonomerStructure] | None = None,
     *,
     outdir: str | Path,
     tm_score_threshold: float = 0.50,
@@ -527,8 +527,15 @@ def greedy_cluster_protein_structures(
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     sequence_cluster_jobs: int = 1,
     pairwise_alignment_jobs: int = 1,
+    extract_fn: Callable[[MonomerSample], ExtractedMonomerStructure | None] | None = None,
 ) -> dict[str, Any]:
-    """Perform quality-directed greedy structural clustering inside protein sequence buckets."""
+    """Perform quality-directed greedy structural clustering inside protein sequence buckets.
+
+    When *extract_fn* is provided, monomer structures are extracted on-the-fly
+    per sequence cluster, allowing extraction and USalign to overlap across
+    different clusters (producer-consumer pipeline).  Otherwise *extracted_structures*
+    must contain all pre-extracted structures.
+    """
 
     monomer_index = {monomer.monomer_id: monomer for monomer in monomers}
     sequence_groups = _group_protein_sequence_membership(membership_rows)
@@ -536,13 +543,19 @@ def greedy_cluster_protein_structures(
     outdir.mkdir(parents=True, exist_ok=True)
     runner = alignment_runner or run_usalign_alignment
 
+    if extracted_structures is None:
+        extracted_structures = {}
+
     available_structures = len(extracted_structures)
+    pipeline_mode = extract_fn is not None and available_structures == 0
     LOGGER.info(
-        "Clustering protein monomers: %d sequence groups, %d available structures, %d seq-cluster workers, %d pairwise workers",
+        "Clustering protein monomers: %d sequence groups, %d pre-extracted structures, "
+        "%d seq-cluster workers, %d pairwise workers%s",
         len(sequence_groups),
         available_structures,
         sequence_cluster_jobs,
         pairwise_alignment_jobs,
+        " (pipelined extraction+clustering)" if pipeline_mode else "",
     )
 
     alignment_rows: list[dict[str, Any]] = []
@@ -555,6 +568,9 @@ def greedy_cluster_protein_structures(
     total_alignment_failures = 0
     total_sequence_fallback_assignments = 0
     total_all_failure_cluster_collapses = 0
+
+    total_monomers_to_extract = 0
+    total_extraction_failures = 0
 
     pairwise_alignment_jobs = normalize_worker_count(pairwise_alignment_jobs)
 
@@ -570,6 +586,26 @@ def greedy_cluster_protein_structures(
         local_alignment_failures = 0
         local_sequence_fallback_assignments = 0
         local_all_failure_cluster_collapses = 0
+        local_extracted = 0
+        local_extraction_failures = 0
+
+        # On-the-fly extraction when no pre-extracted structures available
+        if extract_fn is not None:
+            for member_id in member_ids:
+                if member_id in extracted_structures:
+                    continue
+                monomer = monomer_index.get(member_id)
+                if monomer is None:
+                    continue
+                try:
+                    local_extracted += 1
+                    ext = extract_fn(monomer)
+                    if ext is not None:
+                        extracted_structures[member_id] = ext
+                    else:
+                        local_extraction_failures += 1
+                except Exception:
+                    local_extraction_failures += 1
 
         candidates = [
             extracted_structures[member_id]
@@ -906,6 +942,8 @@ def greedy_cluster_protein_structures(
             "num_alignment_failures": local_alignment_failures,
             "num_sequence_fallback_assignments": local_sequence_fallback_assignments,
             "num_all_failure_sequence_cluster_collapses": local_all_failure_cluster_collapses,
+            "num_extracted": local_extracted,
+            "num_extraction_failures": local_extraction_failures,
         }
 
     sequence_group_items = list(sequence_groups.items())
@@ -935,6 +973,8 @@ def greedy_cluster_protein_structures(
         total_alignment_failures += group_result["num_alignment_failures"]
         total_sequence_fallback_assignments += group_result["num_sequence_fallback_assignments"]
         total_all_failure_cluster_collapses += group_result["num_all_failure_sequence_cluster_collapses"]
+        total_monomers_to_extract += group_result.get("num_extracted", 0)
+        total_extraction_failures += group_result.get("num_extraction_failures", 0)
 
     dump_csv_rows(outdir / "protein_structure_cluster_membership.csv", membership_out_rows)
     dump_csv_rows(outdir / "protein_structure_cluster_representatives.csv", representative_rows)
@@ -948,6 +988,8 @@ def greedy_cluster_protein_structures(
         "num_sequence_fallback_assignments": total_sequence_fallback_assignments,
         "num_all_failure_sequence_cluster_collapses": total_all_failure_cluster_collapses,
         "num_membership_rows": len(membership_out_rows),
+        "num_extracted": total_monomers_to_extract,
+        "num_extraction_failures": total_extraction_failures,
         "tm_score_threshold": tm_score_threshold,
         "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
         "sequence_cluster_jobs": sequence_cluster_jobs,
