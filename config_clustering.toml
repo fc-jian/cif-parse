@@ -133,16 +133,16 @@ jobs = 8
 # Thread count passed to `mmseqs easy-cluster --threads`.
 # If omitted in custom configs, defaults to `jobs`.
 # Allowed values: integer >= 1.
-mmseqs_threads = 8
+# mmseqs_threads = 8
 
 # Number of protein sequence clusters processed concurrently in monomer
 # structure clustering.
 # Allowed values: integer >= 1.
-sequence_cluster_jobs = 8
+# sequence_cluster_jobs = 8
 
 # Maximum concurrent USalign subprocesses per refinement stage.
 # Allowed values: integer >= 1.
-usalign_jobs = 8
+# usalign_jobs = 8
 
 # Root logging level for clustering runs.
 # Options: "DEBUG", "INFO", "WARNING", "ERROR".
