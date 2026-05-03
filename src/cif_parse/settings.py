@@ -226,17 +226,11 @@ class ClusteringSettings:
             raise ValueError("clustering.usalign_executable must not be empty")
         if self.jobs < 1:
             raise ValueError("clustering.jobs must be >= 1")
-        if self.mmseqs_threads is None:
-            self.mmseqs_threads = self.jobs
-        if self.sequence_cluster_jobs is None:
-            self.sequence_cluster_jobs = self.jobs
-        if self.usalign_jobs is None:
-            self.usalign_jobs = self.jobs
-        if self.mmseqs_threads < 1:
+        if self.mmseqs_threads is not None and self.mmseqs_threads < 1:
             raise ValueError("clustering.mmseqs_threads must be >= 1")
-        if self.sequence_cluster_jobs < 1:
+        if self.sequence_cluster_jobs is not None and self.sequence_cluster_jobs < 1:
             raise ValueError("clustering.sequence_cluster_jobs must be >= 1")
-        if self.usalign_jobs < 1:
+        if self.usalign_jobs is not None and self.usalign_jobs < 1:
             raise ValueError("clustering.usalign_jobs must be >= 1")
 
 

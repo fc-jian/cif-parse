@@ -263,19 +263,19 @@ def build_parser(
     parser.add_argument(
         "--mmseqs-threads",
         type=int,
-        default=clustering_defaults.get("mmseqs_threads") or clustering_defaults.get("jobs", 1),
+        default=clustering_defaults.get("mmseqs_threads"),
         help="Thread count passed to mmseqs easy-cluster (default: same as --jobs)",
     )
     parser.add_argument(
         "--sequence-cluster-jobs",
         type=int,
-        default=clustering_defaults.get("sequence_cluster_jobs") or clustering_defaults.get("jobs", 1),
+        default=clustering_defaults.get("sequence_cluster_jobs"),
         help="Number of protein sequence clusters processed concurrently (default: same as --jobs)",
     )
     parser.add_argument(
         "--usalign-jobs",
         type=int,
-        default=clustering_defaults.get("usalign_jobs") or clustering_defaults.get("jobs", 1),
+        default=clustering_defaults.get("usalign_jobs"),
         help="Maximum concurrent USalign subprocesses per refinement stage (default: same as --jobs)",
     )
     parser.add_argument(
@@ -317,6 +317,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.inputs is None and prep_dir is None:
         parser = build_parser(config_defaults=config_defaults, config_path=config_path)
         parser.error("--inputs is required unless --prep-dir is provided")
+
+    # Subtask job counts inherit from --jobs when not explicitly set.
+    # Config values take precedence over --jobs when they exist, but
+    # argparse defaults don't flow through config properly, so we
+    # resolve the priority here: CLI arg > config value > args.jobs
+    if args.mmseqs_threads is None:
+        args.mmseqs_threads = config_defaults.get("clustering", {}).get("mmseqs_threads") or args.jobs
+    if args.sequence_cluster_jobs is None:
+        args.sequence_cluster_jobs = config_defaults.get("clustering", {}).get("sequence_cluster_jobs") or args.jobs
+    if args.usalign_jobs is None:
+        args.usalign_jobs = config_defaults.get("clustering", {}).get("usalign_jobs") or args.jobs
 
     for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
         if getattr(args, field_name) < 1:
