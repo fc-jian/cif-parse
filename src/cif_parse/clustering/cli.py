@@ -314,6 +314,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"--{field_name.replace('_', '-')} must be >= 1"
             )
 
+    # Global USalign concurrency cap prevents oversubscription when multiple
+    # clustering stages submit USalign tasks concurrently.
+    from cif_parse.clustering.parallel import set_global_usalign_limit
+    set_global_usalign_limit(args.usalign_jobs)
+
     if args.cif_files_directory is not None:
         LOGGER.warning(
             "Using --cif-files-directory=%s to override source mmCIF paths. "
@@ -325,6 +330,12 @@ def main(argv: list[str] | None = None) -> int:
 
     cif_files_directory: str | None = str(args.cif_files_directory) if args.cif_files_directory is not None else None
     prep_dir: str | None = str(args.prep_dir) if getattr(args, "prep_dir", None) else None
+
+    # Load prep coord index once; all extraction stages share it.
+    if prep_dir:
+        from cif_parse.clustering.prep import load_cif_coords_index, set_shared_coord_index
+        _shared = load_cif_coords_index(prep_dir)
+        set_shared_coord_index(_shared, prep_dir)
 
     # --- Step 1: monomer sequence dataset ---
     t0 = time.monotonic()
@@ -386,30 +397,60 @@ def main(argv: list[str] | None = None) -> int:
                 extract_protein_monomer_structure,
                 read_entry_quality_metadata,
             )
+            _atom_key = f"{monomer.source_path}__{monomer.label_asym_id}"
+            # Phase 1: check caches under lock, record what needs loading
+            _need_atoms = False
+            _need_quality = False
             with _extract_lock:
-                if monomer.source_path not in atom_array_cache and cif_idx_for_pipeline is not None:
-                    from cif_parse.clustering.prep import load_cif_from_prep as _lcfp
-                    # try asymmetric unit first, then assembly
+                _need_atoms = (_atom_key not in atom_array_cache)
+                _need_quality = (monomer.source_path not in quality_cache)
+
+            # Phase 2: do I/O outside lock
+            if _need_atoms and cif_idx_for_pipeline is not None:
+                from cif_parse.clustering.prep import load_chain_from_prep, load_cif_from_prep as _lcfp
+                _found = None
+                for aid in [None] + (monomer.observed_assembly_ids or []):
+                    _c = load_chain_from_prep(prep_dir, monomer.source_path, monomer.label_asym_id,
+                                              assembly_id=str(aid) if aid else None, index=cif_idx_for_pipeline)
+                    if _c is not None and _c.get("atom_array") is not None:
+                        _found = _c["atom_array"]
+                        break
+                if _found is None:
                     for aid in [None] + (monomer.observed_assembly_ids or []):
                         _c = _lcfp(prep_dir, monomer.source_path, str(aid) if aid else None, index=cif_idx_for_pipeline)
                         if _c is not None and _c.get("atom_array") is not None:
-                            atom_array_cache[monomer.source_path] = _c["atom_array"]
+                            _found = _c["atom_array"]
                             break
-                if monomer.source_path not in quality_cache:
-                    quality_cache[monomer.source_path] = read_entry_quality_metadata(
-                        monomer.source_path, pdb_id=monomer.pdb_id,
-                    )
-                if monomer.source_path not in atom_array_cache:
+                if _found is not None:
+                    with _extract_lock:
+                        atom_array_cache[_atom_key] = _found
+            if _need_quality:
+                _q = read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+                with _extract_lock:
+                    if monomer.source_path not in quality_cache:
+                        quality_cache[monomer.source_path] = _q
+            if _need_atoms:
+                with _extract_lock:
+                    if _atom_key not in atom_array_cache:
+                        _need_atoms = True
+                    else:
+                        _need_atoms = False
+                if _need_atoms:
                     cf = read_cif_file(monomer.source_path)
-                    atom_array_cache[monomer.source_path] = get_structure(cf, model=args.model, use_author_fields=False)
+                    _atoms = get_structure(cf, model=args.model, use_author_fields=False)
+                    with _extract_lock:
+                        if _atom_key not in atom_array_cache:
+                            atom_array_cache[_atom_key] = _atoms
+
+            _atoms = None
+            with _extract_lock:
+                _atoms = atom_array_cache.get(_atom_key)
+                _q = quality_cache.get(monomer.source_path)
             try:
                 return extract_protein_monomer_structure(
-                    monomer,
-                    outdir=structure_outdir,
-                    model=args.model,
+                    monomer, outdir=structure_outdir, model=args.model,
                     drop_hydrogens=not args.keep_hydrogens,
-                    quality_metadata=quality_cache[monomer.source_path],
-                    atom_array=atom_array_cache[monomer.source_path],
+                    quality_metadata=_q, atom_array=_atoms,
                 )
             except Exception:
                 return None

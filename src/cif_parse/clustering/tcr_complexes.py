@@ -200,14 +200,129 @@ def _structure_chain_ids(
     return chain_ids
 
 
+def _build_tcr_observation(
+    *,
+    pdb_id: str, source_path: str, assembly_id: str | None, assembly_mode: str,
+    complex_id: str, complex_index: int,
+    tcr_type: str, mhc_class: str,
+    tcr_chain_ids: list[str], tcr_auth_asym_ids: list[str],
+    mhc_chain_ids: list[str], mhc_auth_asym_ids: list[str],
+    mhc_chain_roles: list[str],
+    peptide_chain_ids: list[str], peptide_auth_asym_ids: list[str],
+    auxiliary_chain_ids: list[str], auxiliary_auth_asym_ids: list[str],
+    num_tcr_chains: int, num_peptide_chains: int,
+    num_tcr_pmhc_interfaces: int, contact_score: float,
+    monomer_cluster_assignments: dict[str, dict[str, str]],
+    monomer_inventory: dict[str, dict[str, Any]],
+) -> TcrComplexObservation:
+    num_unclustered = 0
+    tcr_desc: list[dict[str, str]] = []
+    for role, cid in zip(_tcr_roles(tcr_type, len(tcr_chain_ids)), tcr_chain_ids):
+        cs, cluster_id, _ = resolve_monomer_cluster(canonical_monomer_id(pdb_id, cid), monomer_cluster_assignments)
+        if cs == "unclustered": num_unclustered += 1
+        tcr_desc.append({"role": role, "monomer_cluster_id": cluster_id})
+
+    mhc_desc: list[dict[str, str]] = []
+    for cid, role in zip(mhc_chain_ids, mhc_chain_roles):
+        cs, cluster_id, _ = resolve_monomer_cluster(canonical_monomer_id(pdb_id, cid), monomer_cluster_assignments)
+        if cs == "unclustered": num_unclustered += 1
+        mhc_desc.append({"role": role, "monomer_cluster_id": cluster_id})
+
+    pep_desc: list[dict[str, str]] = []
+    for cid in peptide_chain_ids:
+        mid = canonical_monomer_id(pdb_id, cid)
+        cp = monomer_inventory.get(mid, {})
+        cs, cluster_id, _ = resolve_monomer_cluster(mid, monomer_cluster_assignments)
+        if cs == "unclustered": num_unclustered += 1
+        pep_desc.append({"chain_type": str(cp.get("chain_type", "") or ""), "monomer_cluster_id": cluster_id})
+
+    aux_desc: list[dict[str, str]] = []
+    structural_aux: list[str] = []
+    for cid in auxiliary_chain_ids:
+        mid = canonical_monomer_id(pdb_id, cid)
+        cp = monomer_inventory.get(mid, {})
+        if mid in monomer_inventory or mid in monomer_cluster_assignments:
+            cs, cluster_id, _ = resolve_monomer_cluster(mid, monomer_cluster_assignments)
+            if cs == "unclustered": num_unclustered += 1
+            aux_desc.append({"chain_type": str(cp.get("chain_type", "") or ""), "monomer_cluster_id": cluster_id})
+            structural_aux.append(cid)
+        else:
+            aux_desc.append({"chain_type": "auxiliary_nonpolymer", "monomer_cluster_id": "auxiliary_nonpolymer"})
+
+    sig_key = json.dumps({
+        "tcr_type": tcr_type, "mhc_class": mhc_class,
+        "tcr_members": sorted(tcr_desc, key=lambda x: (x["role"], x["monomer_cluster_id"])),
+        "mhc_members": sorted(mhc_desc, key=lambda x: (x["role"], x["monomer_cluster_id"])),
+        "peptide_members": sorted(pep_desc, key=lambda x: (x["chain_type"], x["monomer_cluster_id"])),
+        "auxiliary_members": sorted(aux_desc, key=lambda x: (x["chain_type"], x["monomer_cluster_id"])),
+    }, ensure_ascii=False, sort_keys=True)
+
+    return TcrComplexObservation(
+        complex_observation_id=f"{pdb_id}:{assembly_id or 'na'}:{complex_index}",
+        pdb_id=pdb_id, source_path=source_path, assembly_id=assembly_id,
+        assembly_mode=assembly_mode, complex_id=complex_id,
+        tcr_type=tcr_type, mhc_class=mhc_class,
+        tcr_chain_ids=tcr_chain_ids, tcr_auth_asym_ids=tcr_auth_asym_ids,
+        mhc_chain_ids=mhc_chain_ids, mhc_auth_asym_ids=mhc_auth_asym_ids,
+        mhc_chain_roles=mhc_chain_roles,
+        peptide_chain_ids=peptide_chain_ids, peptide_auth_asym_ids=peptide_auth_asym_ids,
+        auxiliary_chain_ids=auxiliary_chain_ids, auxiliary_auth_asym_ids=auxiliary_auth_asym_ids,
+        structural_auxiliary_chain_ids=structural_aux,
+        num_tcr_chains=num_tcr_chains, num_peptide_chains=num_peptide_chains,
+        num_tcr_pmhc_interfaces=num_tcr_pmhc_interfaces, contact_score=contact_score,
+        tcr_member_descriptors=tcr_desc, mhc_member_descriptors=mhc_desc,
+        peptide_member_descriptors=pep_desc, auxiliary_member_descriptors=aux_desc,
+        signature_key=sig_key, num_unclustered_monomer_members=num_unclustered,
+    )
+
+
 def collect_tcr_complex_observations(
     case_dirs: Iterable[str | Path],
     monomer_cluster_assignments: dict[str, dict[str, str]],
     monomer_inventory: dict[str, dict[str, Any]],
     cif_files_directory: str | None = None,
     prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> list[TcrComplexObservation]:
     observations: list[TcrComplexObservation] = []
+
+    # Fast path: read pre-parsed Parquet
+    from cif_parse.clustering.prep import open_prep_parquet, iter_parquet_rows
+    pf = open_prep_parquet(prep_dir, "tcr_complexes", required=True) if prep_dir else None
+    if pf is not None:
+        for row in tqdm(iter_parquet_rows(prep_dir, "tcr_complexes", required=True),
+                        desc="Collecting TCR complexes", unit="complex"):
+            pdb_id = row.get("pdb_id", "")
+            if not pdb_id:
+                continue
+            sp = resolve_source_path(row.get("source_path", ""), cif_files_directory)
+            observations.append(_build_tcr_observation(
+                pdb_id=pdb_id, source_path=sp,
+                assembly_id=row.get("assembly_id"),
+                assembly_mode=row.get("assembly_mode", ""),
+                complex_id=row.get("complex_id", ""),
+                complex_index=row.get("complex_index", 0),
+                tcr_type=row.get("tcr_type", ""),
+                mhc_class=row.get("mhc_class", ""),
+                tcr_chain_ids=json.loads(row.get("tcr_chain_ids", "[]")),
+                tcr_auth_asym_ids=json.loads(row.get("tcr_auth_asym_ids", "[]")),
+                mhc_chain_ids=json.loads(row.get("mhc_chain_ids", "[]")),
+                mhc_auth_asym_ids=json.loads(row.get("mhc_auth_asym_ids", "[]")),
+                mhc_chain_roles=json.loads(row.get("mhc_chain_roles", "[]")),
+                peptide_chain_ids=json.loads(row.get("peptide_chain_ids", "[]")),
+                peptide_auth_asym_ids=json.loads(row.get("peptide_auth_asym_ids", "[]")),
+                auxiliary_chain_ids=json.loads(row.get("auxiliary_chain_ids", "[]")),
+                auxiliary_auth_asym_ids=json.loads(row.get("auxiliary_auth_asym_ids", "[]")),
+                num_tcr_chains=row.get("num_tcr_chains", 0),
+                num_peptide_chains=row.get("num_peptide_chains", 0),
+                num_tcr_pmhc_interfaces=row.get("num_tcr_pmhc_interfaces", 0),
+                contact_score=row.get("contact_score", 0.0),
+                monomer_cluster_assignments=monomer_cluster_assignments,
+                monomer_inventory=monomer_inventory,
+            ))
+        LOGGER.info("Collected %d TCR complex observations from prep Parquet", len(observations))
+        return observations
+
     from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
 
     sorted_dirs = sorted(Path(path).resolve() for path in case_dirs)
@@ -505,6 +620,7 @@ def extract_tcr_complex_structures(
     model: int = 1,
     drop_hydrogens: bool = True,
     extraction_jobs: int = 1,
+    prep_dir: str | Path | None = None,
 ) -> tuple[dict[str, ExtractedTcrComplexStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -515,6 +631,23 @@ def extract_tcr_complex_structures(
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
     import threading as _threading
+
+    _prep_tcr_idx: dict | None = None
+    if prep_dir:
+        from cif_parse.clustering.prep import load_cif_coords_index, assemble_atom_array_from_chains
+        _prep_tcr_idx = load_cif_coords_index(prep_dir)
+
+    def _try_assemble_tcr(obs: TcrComplexObservation) -> AtomArray | None:
+        if _prep_tcr_idx is None:
+            return None
+        chain_ids = _structure_chain_ids(obs)
+        if not chain_ids:
+            return None
+        return assemble_atom_array_from_chains(
+            prep_dir, obs.source_path,
+            [(cid, None) for cid in chain_ids],
+            assembly_id=obs.assembly_id, index=_prep_tcr_idx,
+        )
 
     atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
     _lock = _threading.Lock()
@@ -540,12 +673,15 @@ def extract_tcr_complex_structures(
         return atom_array_cache[cache_key]
 
     def _process_one(observation: TcrComplexObservation) -> ExtractedTcrComplexStructure | None:
+        atom_array = _try_assemble_tcr(observation)
+        if atom_array is None:
+            atom_array = _load_atom_array(observation)
         return extract_tcr_complex_structure(
             observation,
             outdir=outdir,
             model=model,
             drop_hydrogens=drop_hydrogens,
-            atom_array=_load_atom_array(observation),
+            atom_array=atom_array,
         )
 
     if extraction_jobs <= 1 or len(sorted_observations) <= 1:
@@ -916,7 +1052,7 @@ def build_tcr_complex_signature_clusters(
         monomer_assignments,
         monomer_inventory,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_dir,
+        prep_dir=prep_dir,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -947,6 +1083,7 @@ def build_tcr_complex_signature_clusters(
             model=model,
             drop_hydrogens=drop_hydrogens,
             extraction_jobs=alignment_jobs,
+            prep_dir=prep_dir,
         )
 
     if structure_refinement_mode == "greedy":

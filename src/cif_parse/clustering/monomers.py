@@ -148,10 +148,14 @@ def collect_canonical_monomers(
     skipped_missing_identity = 0
 
     # Fast path: read pre-parsed Parquet
-    pf = open_prep_parquet(prep_dir, "monomers") if prep_dir else None
+    pf = open_prep_parquet(prep_dir, "monomers", required=True) if prep_dir else None
     if pf is not None:
         num_case_bundles = pf.metadata.num_rows
-        for row in tqdm(iter_parquet_rows(prep_dir, "monomers"), desc="Collecting canonical monomers", unit="monomer"):
+        for row in tqdm(
+            iter_parquet_rows(prep_dir, "monomers", required=True),
+            desc="Collecting canonical monomers",
+            unit="monomer",
+        ):
             polymer_observations += 1
             pdb_id = str(row.get("pdb_id", "") or "")
             label_asym_id = str(row.get("label_asym_id", "") or "")

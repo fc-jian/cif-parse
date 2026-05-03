@@ -36,9 +36,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os as _os
 import pickle
 import shutil
 import struct
+import threading
 import time
 import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -98,6 +100,12 @@ def _blob_index_key(source_path: str, assembly_id: str | None) -> str:
     """
     cache_key = f"{source_path}__{assembly_id or ''}"
     return hashlib.sha256(cache_key.encode()).hexdigest()
+
+
+def _chain_blob_key(source_path: str, assembly_id: str | None, chain_id: str) -> str:
+    """Return a stable 64-char key for a single-chain blob."""
+    raw = f"{source_path}__{assembly_id or '_none'}__{chain_id}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 # ── json extraction helpers (move heavy parsing into prep once) ──────────────
@@ -272,11 +280,13 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
                 "antibody_light_auth_asym_id": str(complex_data.get("antibody_light_auth_asym_id", "") or ""),
                 "antibody_chain_ids": json.dumps(complex_data.get("antibody_chain_ids", []) or [], ensure_ascii=False),
                 "antibody_auth_asym_ids": json.dumps(complex_data.get("antibody_auth_asym_ids", []) or [], ensure_ascii=False),
-                "antibody_entity_ids": json.dumps(complex_data.get("antibody_entity_ids", []) or [], ensure_ascii=False),
                 "antigen_chain_ids": json.dumps(complex_data.get("antigen_chain_ids", []) or [], ensure_ascii=False),
                 "antigen_auth_asym_ids": json.dumps(complex_data.get("antigen_auth_asym_ids", []) or [], ensure_ascii=False),
-                "antigen_entity_ids": json.dumps(complex_data.get("antigen_entity_ids", []) or [], ensure_ascii=False),
                 "antigen_chain_types": json.dumps(complex_data.get("antigen_chain_types", []) or [], ensure_ascii=False),
+                "auxiliary_component_ids": json.dumps(complex_data.get("auxiliary_component_ids", []) or [], ensure_ascii=False),
+                "auxiliary_component_auth_asym_ids": json.dumps(complex_data.get("auxiliary_component_auth_asym_ids", []) or [], ensure_ascii=False),
+                "auxiliary_branched_ids": json.dumps(complex_data.get("auxiliary_branched_ids", []) or [], ensure_ascii=False),
+                "auxiliary_branched_auth_asym_ids": json.dumps(complex_data.get("auxiliary_branched_auth_asym_ids", []) or [], ensure_ascii=False),
                 "num_antigen_chains": int(complex_data.get("num_antigen_chains", 0) or 0),
                 "num_antibody_antigen_interfaces": int(complex_data.get("num_antibody_antigen_interfaces", 0) or 0),
                 "contact_score": float(complex_data.get("contact_score", 0.0) or 0.0),
@@ -448,18 +458,27 @@ def _cache_sources_to_temp(
                                 all_entries.append({"cache_key": cache_key, "status": "empty"})
                                 continue
                         raw = pickle.loads(zlib.decompress(pkl_path.read_bytes()))
-                        wrapped = _compress_blob(pickle.dumps(
-                            {"atom_array": raw, "quality": None, "chain_ops": None},
-                            protocol=pickle.HIGHEST_PROTOCOL,
-                        ))
-                        offset = bin_fh.tell()
-                        bin_fh.write(wrapped)
-                        blob_key = _blob_index_key(source_path, assembly_id)
-                        idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                            blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                            offset, len(wrapped),
-                        ))
-                        all_entries.append({"cache_key": cache_key, "status": "cached"})
+                        if isinstance(raw, dict):
+                            aa = raw.get("atom_array", raw)
+                        else:
+                            aa = raw
+                        if aa is not None and len(aa) > 0:
+                            for cid in sorted(set(aa.chain_id)):
+                                chain_atoms = aa[aa.chain_id == cid]
+                                if chain_atoms is None or len(chain_atoms) == 0:
+                                    continue
+                                wrapped = _compress_blob(pickle.dumps(
+                                    {"atom_array": chain_atoms, "quality": None, "chain_ops": None},
+                                    protocol=pickle.HIGHEST_PROTOCOL,
+                                ))
+                                offset = bin_fh.tell()
+                                bin_fh.write(wrapped)
+                                blob_key = _chain_blob_key(source_path, assembly_id, str(cid))
+                                idx_fh.write(_IDX_ENTRY_STRUCT.pack(
+                                    blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                                    offset, len(wrapped),
+                                ))
+                                all_entries.append({"cache_key": cache_key, "status": "cached"})
                 continue  # skip slow path for this source_path
             except Exception as exc:
                 LOGGER.debug("Atom cache read failed for %s, falling back to mmCIF: %s", source_path, exc)
@@ -481,19 +500,22 @@ def _cache_sources_to_temp(
                         else:
                             atom_array = get_structure(cif_file, model=1, use_author_fields=False)
                         if atom_array is not None and len(atom_array) > 0:
-                            chain_ops_json = _read_chain_ops_json(source_path, assembly_id)
-                            blob = _compress_blob(pickle.dumps(
-                                {"atom_array": atom_array, "quality": quality, "chain_ops": chain_ops_json},
-                                protocol=pickle.HIGHEST_PROTOCOL,
-                            ))
-                            offset = bin_fh.tell()
-                            bin_fh.write(blob)
-                            blob_key = _blob_index_key(source_path, assembly_id)
-                            idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                                blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                                offset, len(blob),
-                            ))
-                            all_entries.append({"cache_key": cache_key, "status": "cached"})
+                            for cid in sorted(set(atom_array.chain_id)):
+                                chain_atoms = atom_array[atom_array.chain_id == cid]
+                                if chain_atoms is None or len(chain_atoms) == 0:
+                                    continue
+                                blob = _compress_blob(pickle.dumps(
+                                    {"atom_array": chain_atoms, "quality": quality, "chain_ops": None},
+                                    protocol=pickle.HIGHEST_PROTOCOL,
+                                ))
+                                offset = bin_fh.tell()
+                                bin_fh.write(blob)
+                                blob_key = _chain_blob_key(source_path, assembly_id, str(cid))
+                                idx_fh.write(_IDX_ENTRY_STRUCT.pack(
+                                    blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                                    offset, len(blob),
+                                ))
+                                all_entries.append({"cache_key": cache_key, "status": "cached"})
                         else:
                             all_entries.append({"cache_key": cache_key, "status": "empty"})
                     except Exception as exc:
@@ -846,21 +868,36 @@ def build_prep_database(
 # ── consumer API (used by collect_* and extract_* functions) ─────────────────
 
 
-def open_prep_parquet(prep_dir: str | Path, table_name: str) -> "pyarrow.parquet.ParquetFile | None":
+def open_prep_parquet(
+    prep_dir: str | Path,
+    table_name: str,
+    *,
+    required: bool = False,
+) -> "pyarrow.parquet.ParquetFile | None":
     """Open a prep Parquet file for reading. Returns None if not available."""
+    path = Path(prep_dir) / f"{table_name}.parquet"
     try:
         import pyarrow.parquet as pq
-        path = Path(prep_dir) / f"{table_name}.parquet"
         if path.exists():
             return pq.ParquetFile(path)
-    except ImportError:
-        pass
+    except ImportError as exc:
+        if required:
+            raise RuntimeError("pyarrow is required when --prep-dir is provided") from exc
+        return None
+    if required:
+        raise FileNotFoundError(f"Prep Parquet table not found: {path}")
     return None
 
 
-def iter_parquet_rows(prep_dir: str | Path, table_name: str, columns: list[str] | None = None) -> Iterable[dict[str, Any]]:
+def iter_parquet_rows(
+    prep_dir: str | Path,
+    table_name: str,
+    columns: list[str] | None = None,
+    *,
+    required: bool = False,
+) -> Iterable[dict[str, Any]]:
     """Iterate over all rows in a prep Parquet file as dicts."""
-    pf = open_prep_parquet(prep_dir, table_name)
+    pf = open_prep_parquet(prep_dir, table_name, required=required)
     if pf is None:
         return
     for rg_idx in range(pf.metadata.num_row_groups):
@@ -870,14 +907,36 @@ def iter_parquet_rows(prep_dir: str | Path, table_name: str, columns: list[str] 
             yield {c: tbl.column(c)[i].as_py() for c in cols}
 
 
+# Shared index: set by CLI so that dimer/multimer/antibody/TCR builders
+# reuse the same in-memory dict instead of each loading their own copy.
+_shared_coord_index: dict[str, tuple[Path, int, int]] | None = None
+_shared_coord_index_prep_dir: Path | None = None
+
+
+def set_shared_coord_index(
+    index: dict[str, tuple[Path, int, int]] | None,
+    prep_dir: str | Path | None = None,
+) -> None:
+    global _shared_coord_index, _shared_coord_index_prep_dir
+    _shared_coord_index = index
+    _shared_coord_index_prep_dir = Path(prep_dir).resolve() if prep_dir is not None else None
+
+
 def load_cif_coords_index(prep_dir: str | Path) -> dict[str, tuple[Path, int, int]] | None:
     """Load all chunk idx files from ``cif_coords/``.
 
     Returns ``{blob_key: (chunk_bin_path, offset, length)}``, or None if the
     chunk directory does not exist.  Also accepts legacy single-file
     ``cif_coords.idx`` for backward compatibility.
+
+    When :func:`set_shared_coord_index` has been called the cached value is
+    returned immediately, avoiding duplicate loads.
     """
-    prep_dir = Path(prep_dir)
+    prep_dir = Path(prep_dir).resolve()
+    if _shared_coord_index is not None and (
+        _shared_coord_index_prep_dir is None or _shared_coord_index_prep_dir == prep_dir
+    ):
+        return _shared_coord_index
     coords_dir = prep_dir / "cif_coords"
     index: dict[str, tuple[Path, int, int]] = {}
 
@@ -927,6 +986,10 @@ def load_cif_from_prep(
 ) -> dict[str, Any] | None:
     """Fetch a cached AtomArray + metadata from the binary index.
 
+    For the new chain-level format this returns a single-chain atom array
+    when *assembly_id* is None (asymmetric unit).  For full-assembly blobs
+    (legacy format) the behaviour is unchanged.
+
     Returns a dict with ``atom_array``, ``quality``, ``chain_ops`` keys,
     or None if not cached.
     """
@@ -938,18 +1001,111 @@ def load_cif_from_prep(
     if entry is None:
         return None
 
+    return _read_blob(entry)
+
+
+def load_chain_from_prep(
+    prep_dir: str | Path,
+    source_path: str,
+    label_asym_id: str,
+    *,
+    assembly_id: str | None = None,
+    index: dict[str, tuple[Path, int, int]] | None = None,
+) -> dict[str, Any] | None:
+    """Fetch a single-chain AtomArray from the per-chain index.
+
+    Returns a dict with ``atom_array``, ``quality``, ``chain_ops`` keys,
+    or None if the chain is not cached.
+    """
+    idx = index or load_cif_coords_index(prep_dir)
+    if idx is None:
+        return None
+    blob_key = _chain_blob_key(source_path, assembly_id, label_asym_id)
+    entry = idx.get(blob_key)
+    if entry is None:
+        return None
+    return _read_blob(entry)
+
+
+# Per-session blob I/O cache: open file descriptors reused via os.pread().
+# os.pread() is thread-safe (no shared seek pointer), so concurrent reads
+# on the same chunk file never interfere.
+_blob_fd_cache: dict[Path, int] = {}
+_blob_fd_cache_lock = threading.Lock()
+
+
+def _read_blob(entry: tuple[Path, int, int]) -> dict[str, Any] | None:
     bin_path, offset, length = entry
-    if mmap is not None and hasattr(mmap, "seek"):
-        # Legacy: single mmap over old cif_coords.bin
-        data = mmap[offset:offset + length]
-    else:
-        with bin_path.open("rb") as fh:
-            fh.seek(offset)
-            data = fh.read(length)
+    with _blob_fd_cache_lock:
+        fd = _blob_fd_cache.get(bin_path)
+        if fd is None:
+            try:
+                fd = _os.open(str(bin_path), _os.O_RDONLY)
+                _blob_fd_cache[bin_path] = fd
+            except OSError:
+                return None
     try:
+        data = _os.pread(fd, length, offset)
         return pickle.loads(_decompress_blob(data))
     except Exception:
         return None
+
+
+def close_blob_handles() -> None:
+    """Close all cached chunk file descriptors (call after extraction finishes)."""
+    with _blob_fd_cache_lock:
+        for fd in _blob_fd_cache.values():
+            try:
+                _os.close(fd)
+            except Exception:
+                pass
+        _blob_fd_cache.clear()
+
+
+def load_chain_atoms(
+    prep_dir: str | Path,
+    source_path: str,
+    label_asym_id: str,
+    *,
+    assembly_id: str | None = None,
+    index: dict[str, tuple[Path, int, int]] | None = None,
+) -> "AtomArray | None":
+    """Load a single-chain AtomArray from the chain-level index.
+
+    Convenience wrapper around :func:`load_chain_from_prep` that returns
+    just the atom array (or None).  Imported by extraction functions.
+    """
+    cached = load_chain_from_prep(prep_dir, source_path, label_asym_id,
+                                  assembly_id=assembly_id, index=index)
+    if cached is None:
+        return None
+    return cached.get("atom_array")
+
+
+def assemble_atom_array_from_chains(
+    prep_dir: str | Path,
+    source_path: str,
+    chain_specs: list[tuple[str, int | None]],  # [(label_asym_id, sym_id), ...]
+    *,
+    assembly_id: str | None = None,
+    index: dict[str, tuple[Path, int, int]] | None = None,
+) -> "AtomArray | None":
+    """Load multiple chain blobs and concatenate into one AtomArray.
+
+    Returns None if any chain is not found.  Used by dimer/multimer/complex
+    extraction to avoid loading the full assembly blob.
+    """
+    import biotite.structure as _struc
+    idx = index or load_cif_coords_index(prep_dir)
+    arrays: list[Any] = []
+    for lbl, sym in chain_specs:
+        aa = load_chain_atoms(prep_dir, source_path, lbl, assembly_id=assembly_id, index=idx)
+        if aa is None or len(aa) == 0:
+            return None
+        arrays.append(aa)
+    if not arrays:
+        return None
+    return _struc.concatenate(arrays) if len(arrays) > 1 else arrays[0]
 
 
 # ── backward-compatible wrappers (for higher-order collect functions) ───────

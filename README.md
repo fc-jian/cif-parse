@@ -60,7 +60,7 @@ Clustering consumes parsed case outputs, preferably from `--assembly-mode all`. 
 
 ### Pre-processing (recommended for large inputs)
 
-For large batch outputs (thousands to millions of cases), first build a prep directory that consolidates all case bundles into columnar Parquet files and pre-caches mmCIF atom coordinates into a single indexed binary file. The output always contains exactly 8 files regardless of case count:
+For large batch outputs (thousands to millions of cases), first build a prep directory that consolidates all case bundles into columnar Parquet files and pre-caches per-chain atom coordinates into indexed chunk files. The chunk count equals the number of worker processes, keeping the total file count bounded regardless of scale:
 
 ```bash
 cif-parse-cluster prep \
@@ -78,12 +78,13 @@ clustering_prep/
 ├── multimers.parquet             # pre-parsed tight multimer rows
 ├── antibody_complexes.parquet    # pre-parsed antibody-antigen complex rows
 ├── tcr_complexes.parquet         # pre-parsed TCR-pMHC complex rows
-├── cif_coords.bin               # all AtomArrays concatenated in one file
-├── cif_coords.idx               # 76-byte fixed-width index (hash → offset+len)
-└── prep_meta.json               # content hashes for incremental updates
+└── cif_coords/                   # per-chain atom array chunks
+    ├── chunk_0.bin + chunk_0.idx
+    ├── chunk_1.bin + chunk_1.idx
+    └── ...                        (num_workers chunks total)
 ```
 
-Content hashing enables incremental updates — re-running `prep` only processes new or changed cases. Each worker writes independently, then the master merges temporary files (no lock contention).
+Atoms are stored **per-chain** rather than per-assembly: monomer / dimer / multimer / complex extraction each reads only the chains they need via direct index lookup, eliminating repeated slicing of full assembly blobs.
 
 Pass `--prep-dir` to the clustering command to read from the prep directory:
 
@@ -94,9 +95,9 @@ cif-parse-cluster \
   --outdir cluster_outputs
 ```
 
-When `--prep-dir` is not provided, clustering falls back to reading individual `result.json.gz` files directly.
+When `--prep-dir` is not provided, clustering falls back to reading individual `result.json.gz` files and original mmCIF files directly.
 
-Use `--no-cif-cache` to skip Phase 2 (mmCIF caching) when only the Parquet files are needed.
+Use `--no-cif-cache` to skip Phase 2 (atom caching) when only the Parquet files are needed.
 
 ### Running Clustering
 
@@ -134,9 +135,10 @@ Key clustering defaults:
 2. Protein monomer structure clustering uses `max(TM(query,target), TM(target,query)) >= 0.50`.
 3. Protein monomer alignment coverage requires `aligned_length / shorter_length >= 0.80`.
 4. Dimer, multimer, antibody-antigen, and TCR-pMHC complex clustering default to signature clustering plus overall `USalign -mm 1 -ter 1` refinement with TM-score threshold `0.50`.
-5. Parallel clustering controls are `--jobs`, `--mmseqs-threads`, `--sequence-cluster-jobs`, and `--usalign-jobs`.
-6. Use `--cif-files-directory` to override the location of original mmCIF files during structure extraction.
-7. Use `--prep-dir` to read case data from Parquet files and cached AtomArrays (built with `cif-parse-cluster prep`).
+5. Monomer extraction and structure clustering run in a **pipelined** mode: structures are extracted per sequence cluster on-the-fly while USalign runs on previously extracted clusters, overlapping I/O and computation.
+6. `--jobs N` automatically propagates to all subtask workers (`--mmseqs-threads`, `--sequence-cluster-jobs`, `--usalign-jobs`). Individual subtask counts can still be overridden explicitly.
+7. Use `--cif-files-directory` to override the location of original mmCIF files during structure extraction.
+8. Use `--prep-dir` to read case data from Parquet files and per-chain cached AtomArrays (built with `cif-parse-cluster prep`). Without it, the clustering pipeline falls back to reading individual case bundles and mmCIF files.
 
 ## Configuration
 

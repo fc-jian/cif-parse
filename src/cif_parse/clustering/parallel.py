@@ -1,8 +1,23 @@
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
+
+# Global semaphore to cap total USalign subprocesses across ALL stages
+# (monomer, dimer, multimer, antibody, TCR).
+_global_usalign_semaphore: threading.BoundedSemaphore | None = None
+_global_usalign_limit: int | None = None
+
+
+def set_global_usalign_limit(max_concurrent: int) -> None:
+    """Cap the total number of concurrent USalign processes across all stages."""
+    global _global_usalign_limit, _global_usalign_semaphore
+    max_concurrent = normalize_worker_count(max_concurrent)
+    if _global_usalign_limit != max_concurrent:
+        _global_usalign_limit = max_concurrent
+        _global_usalign_semaphore = threading.BoundedSemaphore(max_concurrent)
 
 
 @dataclass(slots=True)
@@ -19,6 +34,16 @@ def normalize_worker_count(value: int | None) -> int:
     if value is None:
         return 1
     return max(1, int(value))
+
+
+def _semaphored_runner(runner, query, target, **kwargs):
+    if _global_usalign_semaphore is not None:
+        _global_usalign_semaphore.acquire()
+    try:
+        return runner(query, target, **kwargs)
+    finally:
+        if _global_usalign_semaphore is not None:
+            _global_usalign_semaphore.release()
 
 
 def run_alignment_tasks(
@@ -40,7 +65,7 @@ def run_alignment_tasks(
         failures: list[tuple[AlignmentTask, Exception]] = []
         for task in task_list:
             try:
-                successes.append((task, runner(task.query, task.target, **runner_kwargs)))
+                successes.append((task, _semaphored_runner(runner, task.query, task.target, **runner_kwargs)))
             except Exception as exc:
                 failures.append((task, exc))
         return successes, failures
@@ -49,7 +74,7 @@ def run_alignment_tasks(
     failures = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_task = {
-            executor.submit(runner, task.query, task.target, **runner_kwargs): task
+            executor.submit(_semaphored_runner, runner, task.query, task.target, **runner_kwargs): task
             for task in task_list
         }
         for future in as_completed(future_to_task):

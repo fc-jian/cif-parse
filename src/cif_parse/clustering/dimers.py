@@ -199,23 +199,78 @@ def collect_dimer_observations(
     monomer_cluster_assignments: dict[str, dict[str, str]],
     cif_files_directory: str | None = None,
     prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> list[DimerObservation]:
-    """Collect dimer observations from case-output bundles."""
+    """Collect dimer observations from case-output bundles or prep Parquet."""
 
     observations: list[DimerObservation] = []
-    from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
 
+    # Fast path: read pre-parsed Parquet
+    from cif_parse.clustering.prep import open_prep_parquet, iter_parquet_rows
+    pf = open_prep_parquet(prep_dir, "dimers", required=True) if prep_dir else None
+    if pf is not None:
+        for row in tqdm(iter_parquet_rows(prep_dir, "dimers", required=True),
+                        desc="Collecting dimers", unit="dimer"):
+            pdb_id = row.get("pdb_id", "")
+            lbl1 = row.get("label_asym_id_1", "")
+            lbl2 = row.get("label_asym_id_2", "")
+            if not pdb_id or not lbl1 or not lbl2:
+                continue
+            source_path = resolve_source_path(row.get("source_path", ""), cif_files_directory)
+            monomer_id_1 = canonical_monomer_id(pdb_id, lbl1)
+            monomer_id_2 = canonical_monomer_id(pdb_id, lbl2)
+            cs1, cid1, scid1 = _resolve_monomer_cluster(monomer_id_1, monomer_cluster_assignments)
+            cs2, cid2, scid2 = _resolve_monomer_cluster(monomer_id_2, monomer_cluster_assignments)
+            sm = sorted([
+                _dimer_member_descriptor(chain_type=row.get("chain_type_1", ""), monomer_cluster_id=cid1),
+                _dimer_member_descriptor(chain_type=row.get("chain_type_2", ""), monomer_cluster_id=cid2),
+            ], key=lambda x: (x["chain_type"], x["monomer_cluster_id"]))
+            sig_key = json.dumps({
+                "members": sm,
+                "interface_label": row.get("interface_label", ""),
+                "is_same_entity": row.get("is_same_entity", False),
+                "contains_antibody_unit": row.get("contains_antibody_unit", False),
+                "contains_tcr_pmhc_unit": row.get("contains_tcr_pmhc_unit", False),
+            }, ensure_ascii=False, sort_keys=True)
+            asm_id = row.get("assembly_id") or None
+            observations.append(DimerObservation(
+                dimer_observation_id=f"{pdb_id}:{asm_id or 'na'}:{row.get('dimer_index', 0)}",
+                pdb_id=pdb_id, source_path=source_path,
+                assembly_id=str(asm_id) if asm_id else None,
+                assembly_mode=row.get("assembly_mode", ""),
+                sym_id_1=_optional_int(row.get("sym_id_1")),
+                label_asym_id_1=lbl1, auth_asym_id_1=row.get("auth_asym_id_1"),
+                chain_type_1=row.get("chain_type_1", ""), monomer_id_1=monomer_id_1,
+                monomer_sequence_cluster_id_1=scid1,
+                monomer_structure_cluster_id_1=cid1 if cs1 == "structure" else None,
+                sym_id_2=_optional_int(row.get("sym_id_2")),
+                label_asym_id_2=lbl2, auth_asym_id_2=row.get("auth_asym_id_2"),
+                chain_type_2=row.get("chain_type_2", ""), monomer_id_2=monomer_id_2,
+                monomer_sequence_cluster_id_2=scid2,
+                monomer_structure_cluster_id_2=cid2 if cs2 == "structure" else None,
+                interface_label=row.get("interface_label", ""),
+                is_same_entity=row.get("is_same_entity", False),
+                contains_antibody_unit=row.get("contains_antibody_unit", False),
+                contains_tcr_pmhc_unit=row.get("contains_tcr_pmhc_unit", False),
+                buried_area=float(row.get("buried_area", 0) or 0),
+                num_residue_contacts=int(row.get("num_residue_contacts", 0) or 0),
+                num_atom_contacts=int(row.get("num_atom_contacts", 0) or 0),
+                signature_key=sig_key, signature_members=sm,
+                cluster_source_1=cs1, cluster_source_2=cs2,
+            ))
+        LOGGER.info("Collected %d dimer observations from prep Parquet", len(observations))
+        return observations
+
+    # Slow path: read individual JSON bundles
+    from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
     sorted_dirs = sorted(Path(path).resolve() for path in case_dirs)
-    prep_bundles = load_bundles_for_collect(sorted_dirs, prep_db_path=prep_db_path)
+    prep_bundles = load_bundles_for_collect(sorted_dirs, prep_db_path=prep_dir)
     for case_dir in sorted_dirs:
         payloads = load_case_bundles(case_dir, prep_bundles=prep_bundles)
         for payload in payloads:
             summary = payload.get("structure_summary", {})
             pdb_id = str(summary.get("pdb_id", "") or "")
-            source_path = resolve_source_path(
-                str(summary.get("source_path", "") or ""),
-                cif_files_directory,
-            )
+            source_path = resolve_source_path(str(summary.get("source_path", "") or ""), cif_files_directory)
             assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
             default_assembly_id = assembly_ids[0] if len(assembly_ids) == 1 else None
             dimers = payload.get("dimer_interfaces", [])
@@ -224,95 +279,51 @@ def collect_dimer_observations(
             for index, dimer in enumerate(dimers, start=1):
                 if not isinstance(dimer, dict):
                     continue
-                label_asym_id_1 = str(dimer.get("label_asym_id_1", "") or "")
-                label_asym_id_2 = str(dimer.get("label_asym_id_2", "") or "")
-                if not label_asym_id_1 or not label_asym_id_2:
+                lbl1 = str(dimer.get("label_asym_id_1", "") or "")
+                lbl2 = str(dimer.get("label_asym_id_2", "") or "")
+                if not lbl1 or not lbl2:
                     continue
-                monomer_id_1 = canonical_monomer_id(pdb_id, label_asym_id_1)
-                monomer_id_2 = canonical_monomer_id(pdb_id, label_asym_id_2)
-                cluster_source_1, cluster_id_1, sequence_cluster_id_1 = _resolve_monomer_cluster(
-                    monomer_id_1,
-                    monomer_cluster_assignments,
-                )
-                cluster_source_2, cluster_id_2, sequence_cluster_id_2 = _resolve_monomer_cluster(
-                    monomer_id_2,
-                    monomer_cluster_assignments,
-                )
-                signature_members = sorted(
-                    [
-                        _dimer_member_descriptor(
-                            chain_type=str(dimer.get("chain_type_1", "") or ""),
-                            monomer_cluster_id=cluster_id_1,
-                        ),
-                        _dimer_member_descriptor(
-                            chain_type=str(dimer.get("chain_type_2", "") or ""),
-                            monomer_cluster_id=cluster_id_2,
-                        ),
-                    ],
-                    key=lambda item: (item["chain_type"], item["monomer_cluster_id"]),
-                )
-                signature_key = json.dumps(
-                    {
-                        "members": signature_members,
-                        "interface_label": str(dimer.get("interface_label", "") or ""),
-                        "is_same_entity": bool(dimer.get("is_same_entity", False)),
-                        "contains_antibody_unit": bool(dimer.get("contains_antibody_unit", False)),
-                        "contains_tcr_pmhc_unit": bool(
-                            dimer.get("contains_tcr_pmhc_unit", False)
-                        ),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-                assembly_id = dimer.get("assembly_id")
-                observations.append(
-                    DimerObservation(
-                        dimer_observation_id=(
-                            f"{pdb_id}:{assembly_id or default_assembly_id or 'na'}:{index}"
-                        ),
-                        pdb_id=pdb_id,
-                        source_path=source_path,
-                        assembly_id=str(assembly_id) if assembly_id is not None else default_assembly_id,
-                        assembly_mode=str(dimer.get("assembly_mode", "") or ""),
-                        sym_id_1=_optional_int(dimer.get("sym_id_1")),
-                        label_asym_id_1=label_asym_id_1,
-                        auth_asym_id_1=(
-                            str(dimer.get("auth_asym_id_1"))
-                            if dimer.get("auth_asym_id_1") is not None
-                            else None
-                        ),
-                        chain_type_1=str(dimer.get("chain_type_1", "") or ""),
-                        monomer_id_1=monomer_id_1,
-                        monomer_sequence_cluster_id_1=sequence_cluster_id_1,
-                        monomer_structure_cluster_id_1=(
-                            cluster_id_1 if cluster_source_1 == "structure" else None
-                        ),
-                        sym_id_2=_optional_int(dimer.get("sym_id_2")),
-                        label_asym_id_2=label_asym_id_2,
-                        auth_asym_id_2=(
-                            str(dimer.get("auth_asym_id_2"))
-                            if dimer.get("auth_asym_id_2") is not None
-                            else None
-                        ),
-                        chain_type_2=str(dimer.get("chain_type_2", "") or ""),
-                        monomer_id_2=monomer_id_2,
-                        monomer_sequence_cluster_id_2=sequence_cluster_id_2,
-                        monomer_structure_cluster_id_2=(
-                            cluster_id_2 if cluster_source_2 == "structure" else None
-                        ),
-                        interface_label=str(dimer.get("interface_label", "") or ""),
-                        is_same_entity=bool(dimer.get("is_same_entity", False)),
-                        contains_antibody_unit=bool(dimer.get("contains_antibody_unit", False)),
-                        contains_tcr_pmhc_unit=bool(dimer.get("contains_tcr_pmhc_unit", False)),
-                        buried_area=float(dimer.get("buried_area", 0.0) or 0.0),
-                        num_residue_contacts=int(dimer.get("num_residue_contacts", 0) or 0),
-                        num_atom_contacts=int(dimer.get("num_atom_contacts", 0) or 0),
-                        signature_key=signature_key,
-                        signature_members=signature_members,
-                        cluster_source_1=cluster_source_1,
-                        cluster_source_2=cluster_source_2,
-                    )
-                )
+                mid1 = canonical_monomer_id(pdb_id, lbl1)
+                mid2 = canonical_monomer_id(pdb_id, lbl2)
+                cs1, cid1, scid1 = _resolve_monomer_cluster(mid1, monomer_cluster_assignments)
+                cs2, cid2, scid2 = _resolve_monomer_cluster(mid2, monomer_cluster_assignments)
+                sm = sorted([
+                    _dimer_member_descriptor(chain_type=str(dimer.get("chain_type_1", "") or ""), monomer_cluster_id=cid1),
+                    _dimer_member_descriptor(chain_type=str(dimer.get("chain_type_2", "") or ""), monomer_cluster_id=cid2),
+                ], key=lambda x: (x["chain_type"], x["monomer_cluster_id"]))
+                sig_key = json.dumps({
+                    "members": sm,
+                    "interface_label": str(dimer.get("interface_label", "") or ""),
+                    "is_same_entity": bool(dimer.get("is_same_entity", False)),
+                    "contains_antibody_unit": bool(dimer.get("contains_antibody_unit", False)),
+                    "contains_tcr_pmhc_unit": bool(dimer.get("contains_tcr_pmhc_unit", False)),
+                }, ensure_ascii=False, sort_keys=True)
+                asm_id = dimer.get("assembly_id")
+                observations.append(DimerObservation(
+                    dimer_observation_id=f"{pdb_id}:{asm_id or default_assembly_id or 'na'}:{index}",
+                    pdb_id=pdb_id, source_path=source_path,
+                    assembly_id=str(asm_id) if asm_id is not None else default_assembly_id,
+                    assembly_mode=str(dimer.get("assembly_mode", "") or ""),
+                    sym_id_1=_optional_int(dimer.get("sym_id_1")),
+                    label_asym_id_1=lbl1, auth_asym_id_1=str(dimer.get("auth_asym_id_1")) if dimer.get("auth_asym_id_1") is not None else None,
+                    chain_type_1=str(dimer.get("chain_type_1", "") or ""), monomer_id_1=mid1,
+                    monomer_sequence_cluster_id_1=scid1,
+                    monomer_structure_cluster_id_1=cid1 if cs1 == "structure" else None,
+                    sym_id_2=_optional_int(dimer.get("sym_id_2")),
+                    label_asym_id_2=lbl2, auth_asym_id_2=str(dimer.get("auth_asym_id_2")) if dimer.get("auth_asym_id_2") is not None else None,
+                    chain_type_2=str(dimer.get("chain_type_2", "") or ""), monomer_id_2=mid2,
+                    monomer_sequence_cluster_id_2=scid2,
+                    monomer_structure_cluster_id_2=cid2 if cs2 == "structure" else None,
+                    interface_label=str(dimer.get("interface_label", "") or ""),
+                    is_same_entity=bool(dimer.get("is_same_entity", False)),
+                    contains_antibody_unit=bool(dimer.get("contains_antibody_unit", False)),
+                    contains_tcr_pmhc_unit=bool(dimer.get("contains_tcr_pmhc_unit", False)),
+                    buried_area=float(dimer.get("buried_area", 0.0) or 0.0),
+                    num_residue_contacts=int(dimer.get("num_residue_contacts", 0) or 0),
+                    num_atom_contacts=int(dimer.get("num_atom_contacts", 0) or 0),
+                    signature_key=sig_key, signature_members=sm,
+                    cluster_source_1=cs1, cluster_source_2=cs2,
+                ))
     LOGGER.info("Collected %d dimer observations from %d case dir(s)", len(observations), len(list(case_dirs)))
     return observations
 
@@ -404,6 +415,7 @@ def extract_dimer_structures(
     model: int = 1,
     drop_hydrogens: bool = True,
     extraction_jobs: int = 1,
+    prep_dir: str | Path | None = None,
 ) -> tuple[dict[str, ExtractedDimerStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -433,13 +445,30 @@ def extract_dimer_structures(
                     )
         return cache[cache_key]
 
+    # Fast path: assemble dimer from per-chain blobs
+    _prep_cif_idx: dict | None = None
+    if prep_dir:
+        from cif_parse.clustering.prep import load_cif_coords_index, assemble_atom_array_from_chains
+        _prep_cif_idx = load_cif_coords_index(prep_dir)
+
+    def _try_assemble_from_chains(obs: DimerObservation) -> AtomArray | None:
+        if _prep_cif_idx is None:
+            return None
+        return assemble_atom_array_from_chains(
+            prep_dir, obs.source_path,
+            [(obs.label_asym_id_1, obs.sym_id_1), (obs.label_asym_id_2, obs.sym_id_2)],
+            assembly_id=obs.assembly_id, index=_prep_cif_idx,
+        )
+
     if extraction_jobs <= 1 or len(sorted_observations) <= 1:
         atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
         import threading as _threading
         _lock = _threading.Lock()
         for observation in tqdm(sorted_observations, desc="Extracting dimer structures", unit="dimer"):
             try:
-                atom_array = _load_atom_array(observation, atom_array_cache, _lock)
+                atom_array = _try_assemble_from_chains(observation)
+                if atom_array is None:
+                    atom_array = _load_atom_array(observation, atom_array_cache, _lock)
                 structures[observation.dimer_observation_id] = extract_dimer_structure(
                     observation,
                     outdir=outdir,
@@ -459,7 +488,9 @@ def extract_dimer_structures(
         cache_lock = _threading.Lock()
 
         def _extract_one(observation: DimerObservation) -> ExtractedDimerStructure | None:
-            atom_array = _load_atom_array(observation, atom_array_cache, cache_lock)
+            atom_array = _try_assemble_from_chains(observation)
+            if atom_array is None:
+                atom_array = _load_atom_array(observation, atom_array_cache, cache_lock)
             return extract_dimer_structure(
                 observation,
                 outdir=outdir,
@@ -817,7 +848,7 @@ def build_dimer_signature_clusters(
     observations = collect_dimer_observations(
         case_dirs, monomer_assignments,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_dir,
+        prep_dir=prep_dir,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -848,6 +879,7 @@ def build_dimer_signature_clusters(
             model=model,
             drop_hydrogens=drop_hydrogens,
             extraction_jobs=alignment_jobs,
+            prep_dir=prep_dir,
         )
 
     if structure_refinement_mode == "greedy":

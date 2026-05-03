@@ -403,17 +403,28 @@ def extract_protein_monomer_structures(
         from cif_parse.clustering.prep import load_cif_from_prep as _lcfp
         return _lcfp(_prep_dir, _source_path, _assembly_id, index=_idx)
 
-    def _load_atom_array_for_monomer(_source_path, _observed_assembly_ids):
-        """Try asymmetric unit first, then each observed assembly."""
+    def _load_chain_from_prep_fn(_source_path, _label_asym_id, _assembly_id=None):
+        from cif_parse.clustering.prep import load_chain_from_prep
+        return load_chain_from_prep(prep_dir, _source_path, _label_asym_id,
+                                    assembly_id=_assembly_id, index=cif_idx)
+
+    def _load_atom_array_for_monomer(_source_path, _label_asym_id, _observed_assembly_ids):
+        """Try asymmetric unit chain first, then each observed assembly."""
         if cif_idx is None:
             return None
+        # Try asymmetric unit chain
+        cached = _load_chain_from_prep_fn(_source_path, _label_asym_id, None)
+        if cached is not None and cached.get("atom_array") is not None:
+            return cached["atom_array"]
+        # Try each observed assembly
+        for aid in (_observed_assembly_ids or []):
+            cached = _load_chain_from_prep_fn(_source_path, _label_asym_id, str(aid))
+            if cached is not None and cached.get("atom_array") is not None:
+                return cached["atom_array"]
+        # Fallback: try legacy full-assembly blob
         cached = _load_cif_cache(prep_dir, _source_path, None, cif_idx)
         if cached is not None and cached.get("atom_array") is not None:
             return cached["atom_array"]
-        for aid in (_observed_assembly_ids or []):
-            cached = _load_cif_cache(prep_dir, _source_path, str(aid), cif_idx)
-            if cached is not None and cached.get("atom_array") is not None:
-                return cached["atom_array"]
         return None
 
     protein_monomers = sorted(
@@ -426,22 +437,25 @@ def extract_protein_monomer_structures(
         quality_cache: dict[str, EntryQualityMetadata] = {}
         atom_array_cache: dict[str, AtomArray] = {}
         for monomer in tqdm(protein_monomers, desc="Extracting monomer structures", unit="monomer"):
-            if monomer.source_path not in atom_array_cache:
-                _prep_atoms = _load_atom_array_for_monomer(monomer.source_path, monomer.observed_assembly_ids)
+            _atom_key = f"{monomer.source_path}__{monomer.label_asym_id}"
+            if _atom_key not in atom_array_cache:
+                _prep_atoms = _load_atom_array_for_monomer(
+                    monomer.source_path, monomer.label_asym_id, monomer.observed_assembly_ids)
                 if _prep_atoms is not None:
-                    atom_array_cache[monomer.source_path] = _prep_atoms
+                    atom_array_cache[_atom_key] = _prep_atoms
             if monomer.source_path not in quality_cache:
                 quality_cache[monomer.source_path] = read_entry_quality_metadata(
                     monomer.source_path,
                     pdb_id=monomer.pdb_id,
                 )
-            if monomer.source_path not in atom_array_cache:
+            if _atom_key not in atom_array_cache and monomer.source_path not in atom_array_cache:
                 cif_file = read_cif_file(monomer.source_path)
                 atom_array_cache[monomer.source_path] = get_structure(
                     cif_file,
                     model=model,
                     use_author_fields=False,
                 )
+            _atoms = atom_array_cache.get(_atom_key) or atom_array_cache.get(monomer.source_path)
             try:
                 structures[monomer.monomer_id] = extract_protein_monomer_structure(
                     monomer,
@@ -449,7 +463,7 @@ def extract_protein_monomer_structures(
                     model=model,
                     drop_hydrogens=drop_hydrogens,
                     quality_metadata=quality_cache[monomer.source_path],
-                    atom_array=atom_array_cache[monomer.source_path],
+                    atom_array=_atoms,
                 )
             except Exception as exc:
                 LOGGER.warning("Failed to extract protein monomer %s: %s", monomer.monomer_id, exc)
@@ -462,30 +476,43 @@ def extract_protein_monomer_structures(
         cache_lock = threading.Lock()
 
         def _extract_one(monomer: MonomerSample) -> ExtractedMonomerStructure | None:
+            _atom_key_local = f"{monomer.source_path}__{monomer.label_asym_id}"
+            # Phase 1: check caches under lock
+            _need_atoms = False
+            _need_quality = False
             with cache_lock:
-                if monomer.source_path not in atom_array_cache:
-                    _prep_atoms = _load_atom_array_for_monomer(monomer.source_path, monomer.observed_assembly_ids)
-                    if _prep_atoms is not None:
-                        atom_array_cache[monomer.source_path] = _prep_atoms
-                if monomer.source_path not in quality_cache:
-                    quality_cache[monomer.source_path] = read_entry_quality_metadata(
-                        monomer.source_path,
-                        pdb_id=monomer.pdb_id,
-                    )
-                if monomer.source_path not in atom_array_cache:
-                    cif_file = read_cif_file(monomer.source_path)
-                    atom_array_cache[monomer.source_path] = get_structure(
-                        cif_file,
-                        model=model,
-                        use_author_fields=False,
-                    )
+                _need_atoms = (_atom_key_local not in atom_array_cache)
+                _need_quality = (monomer.source_path not in quality_cache)
+
+            # Phase 2: do I/O outside lock
+            if _need_atoms:
+                _prep = _load_atom_array_for_monomer(
+                    monomer.source_path, monomer.label_asym_id, monomer.observed_assembly_ids)
+                if _prep is not None:
+                    with cache_lock:
+                        atom_array_cache[_atom_key_local] = _prep
+            if _need_quality:
+                _q = read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+                with cache_lock:
+                    if monomer.source_path not in quality_cache:
+                        quality_cache[monomer.source_path] = _q
+
+            # Phase 3: check again under lock, fallback to mmCIF if still missing
+            with cache_lock:
+                _need_atoms = (_atom_key_local not in atom_array_cache and monomer.source_path not in atom_array_cache)
+            if _need_atoms:
+                cf = read_cif_file(monomer.source_path)
+                _atoms_fb = get_structure(cf, model=model, use_author_fields=False)
+                with cache_lock:
+                    if _atom_key_local not in atom_array_cache:
+                        atom_array_cache[monomer.source_path] = _atoms_fb
+
+            with cache_lock:
+                _atoms = atom_array_cache.get(_atom_key_local) or atom_array_cache.get(monomer.source_path)
+                _q = quality_cache.get(monomer.source_path)
             return extract_protein_monomer_structure(
-                monomer,
-                outdir=outdir,
-                model=model,
-                drop_hydrogens=drop_hydrogens,
-                quality_metadata=quality_cache[monomer.source_path],
-                atom_array=atom_array_cache[monomer.source_path],
+                monomer, outdir=outdir, model=model, drop_hydrogens=drop_hydrogens,
+                quality_metadata=_q, atom_array=_atoms,
             )
 
         with ThreadPoolExecutor(max_workers=min(extraction_jobs, len(protein_monomers))) as executor:

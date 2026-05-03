@@ -201,14 +201,166 @@ def _structure_chain_ids(
     return chain_ids
 
 
+def _build_antibody_observation(
+    *,
+    pdb_id: str,
+    source_path: str,
+    assembly_id: str | None,
+    assembly_mode: str,
+    complex_id: str,
+    complex_index: int,
+    antibody_unit_type: str,
+    antibody_heavy_chain: str | None,
+    antibody_heavy_auth_asym_id: str | None,
+    antibody_light_chain: str | None,
+    antibody_light_auth_asym_id: str | None,
+    antibody_chain_ids: list[str],
+    antibody_auth_asym_ids: list[str],
+    antigen_chain_ids: list[str],
+    antigen_auth_asym_ids: list[str],
+    antigen_chain_types: list[str],
+    auxiliary_component_ids: list[str],
+    auxiliary_component_auth_asym_ids: list[str],
+    auxiliary_branched_ids: list[str],
+    auxiliary_branched_auth_asym_ids: list[str],
+    num_antigen_chains: int,
+    num_antibody_antigen_interfaces: int,
+    contact_score: float,
+    monomer_cluster_assignments: dict[str, dict[str, str]],
+    monomer_inventory: dict[str, dict[str, Any]],
+) -> AntibodyComplexObservation:
+    antibody_member_descriptors: list[dict[str, str]] = []
+    antigen_member_descriptors: list[dict[str, str]] = []
+    auxiliary_component_descriptors: list[dict[str, str]] = []
+    structural_auxiliary_chain_ids: list[str] = []
+    num_unclustered = 0
+    heavy_cluster_id: str | None = None
+    light_cluster_id: str | None = None
+
+    for chain_id in antibody_chain_ids:
+        monomer_id = canonical_monomer_id(pdb_id, chain_id)
+        cluster_source, cluster_id, _ = resolve_monomer_cluster(monomer_id, monomer_cluster_assignments)
+        if cluster_source == "unclustered":
+            num_unclustered += 1
+        role = _chain_role(chain_id=chain_id, heavy_chain_id=antibody_heavy_chain,
+                           light_chain_id=antibody_light_chain)
+        if role == "heavy":
+            heavy_cluster_id = cluster_id
+        elif role == "light":
+            light_cluster_id = cluster_id
+        antibody_member_descriptors.append({"role": role, "monomer_cluster_id": cluster_id})
+
+    for chain_id, chain_type in zip(antigen_chain_ids, antigen_chain_types):
+        monomer_id = canonical_monomer_id(pdb_id, chain_id)
+        cluster_source, cluster_id, _ = resolve_monomer_cluster(monomer_id, monomer_cluster_assignments)
+        if cluster_source == "unclustered":
+            num_unclustered += 1
+        antigen_member_descriptors.append({"chain_type": chain_type, "monomer_cluster_id": cluster_id})
+
+    for chain_id in auxiliary_component_ids:
+        monomer_id = canonical_monomer_id(pdb_id, chain_id)
+        chain_payload = monomer_inventory.get(monomer_id, {})
+        if monomer_id in monomer_inventory or monomer_id in monomer_cluster_assignments:
+            cluster_source, cluster_id, _ = resolve_monomer_cluster(monomer_id, monomer_cluster_assignments)
+            if cluster_source == "unclustered":
+                num_unclustered += 1
+            auxiliary_component_descriptors.append(
+                {"chain_type": str(chain_payload.get("chain_type", "") or ""), "monomer_cluster_id": cluster_id})
+            structural_auxiliary_chain_ids.append(chain_id)
+        else:
+            auxiliary_component_descriptors.append(
+                {"chain_type": "auxiliary_nonpolymer", "monomer_cluster_id": "auxiliary_nonpolymer"})
+
+    sig_key = json.dumps({
+        "antibody_unit_type": antibody_unit_type,
+        "heavy_cluster_id": heavy_cluster_id or "",
+        "light_cluster_id": light_cluster_id or "",
+        "antibody_members": sorted(antibody_member_descriptors,
+                                   key=lambda x: (x["role"], x["monomer_cluster_id"])),
+        "antigen_members": sorted(antigen_member_descriptors,
+                                  key=lambda x: (x["chain_type"], x["monomer_cluster_id"])),
+        "auxiliary_components": sorted(auxiliary_component_descriptors,
+                                       key=lambda x: (x["chain_type"], x["monomer_cluster_id"])),
+        "num_auxiliary_branched": len(auxiliary_branched_ids),
+    }, ensure_ascii=False, sort_keys=True)
+
+    return AntibodyComplexObservation(
+        complex_observation_id=f"{pdb_id}:{assembly_id or 'na'}:{complex_index}",
+        pdb_id=pdb_id, source_path=source_path, assembly_id=assembly_id,
+        assembly_mode=assembly_mode, complex_id=complex_id,
+        antibody_unit_type=antibody_unit_type,
+        antibody_heavy_chain=antibody_heavy_chain,
+        antibody_heavy_auth_asym_id=antibody_heavy_auth_asym_id,
+        antibody_light_chain=antibody_light_chain,
+        antibody_light_auth_asym_id=antibody_light_auth_asym_id,
+        antibody_chain_ids=antibody_chain_ids, antibody_auth_asym_ids=antibody_auth_asym_ids,
+        antigen_chain_ids=antigen_chain_ids, antigen_auth_asym_ids=antigen_auth_asym_ids,
+        antigen_chain_types=antigen_chain_types,
+        auxiliary_component_ids=auxiliary_component_ids,
+        auxiliary_component_auth_asym_ids=auxiliary_component_auth_asym_ids,
+        auxiliary_branched_ids=auxiliary_branched_ids,
+        auxiliary_branched_auth_asym_ids=auxiliary_branched_auth_asym_ids,
+        structural_auxiliary_chain_ids=structural_auxiliary_chain_ids,
+        num_antigen_chains=num_antigen_chains,
+        num_antibody_antigen_interfaces=num_antibody_antigen_interfaces,
+        contact_score=contact_score,
+        antibody_member_descriptors=antibody_member_descriptors,
+        antigen_member_descriptors=antigen_member_descriptors,
+        auxiliary_member_descriptors=auxiliary_component_descriptors,
+        signature_key=sig_key,
+        num_unclustered_monomer_members=num_unclustered,
+    )
+
+
 def collect_antibody_complex_observations(
     case_dirs: Iterable[str | Path],
     monomer_cluster_assignments: dict[str, dict[str, str]],
     monomer_inventory: dict[str, dict[str, Any]],
     cif_files_directory: str | None = None,
     prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> list[AntibodyComplexObservation]:
     observations: list[AntibodyComplexObservation] = []
+
+    # Fast path: read pre-parsed Parquet
+    from cif_parse.clustering.prep import open_prep_parquet, iter_parquet_rows
+    pf = open_prep_parquet(prep_dir, "antibody_complexes", required=True) if prep_dir else None
+    if pf is not None:
+        for row in tqdm(iter_parquet_rows(prep_dir, "antibody_complexes", required=True),
+                        desc="Collecting antibody complexes", unit="complex"):
+            pdb_id = row.get("pdb_id", "")
+            if not pdb_id:
+                continue
+            sp = resolve_source_path(row.get("source_path", ""), cif_files_directory)
+            observations.append(_build_antibody_observation(
+                pdb_id=pdb_id, source_path=sp,
+                assembly_id=row.get("assembly_id"),
+                assembly_mode=row.get("assembly_mode", ""),
+                complex_id=row.get("complex_id", ""),
+                complex_index=row.get("complex_index", 0),
+                antibody_unit_type=row.get("antibody_unit_type", ""),
+                antibody_heavy_chain=row.get("antibody_heavy_chain") or None,
+                antibody_heavy_auth_asym_id=row.get("antibody_heavy_auth_asym_id") or None,
+                antibody_light_chain=row.get("antibody_light_chain") or None,
+                antibody_light_auth_asym_id=row.get("antibody_light_auth_asym_id") or None,
+                antibody_chain_ids=json.loads(row.get("antibody_chain_ids", "[]")),
+                antibody_auth_asym_ids=json.loads(row.get("antibody_auth_asym_ids", "[]")),
+                antigen_chain_ids=json.loads(row.get("antigen_chain_ids", "[]")),
+                antigen_auth_asym_ids=json.loads(row.get("antigen_auth_asym_ids", "[]")),
+                antigen_chain_types=json.loads(row.get("antigen_chain_types", "[]")),
+                auxiliary_component_ids=json.loads(row.get("auxiliary_component_ids", "[]")),
+                auxiliary_component_auth_asym_ids=json.loads(row.get("auxiliary_component_auth_asym_ids", "[]")),
+                auxiliary_branched_ids=json.loads(row.get("auxiliary_branched_ids", "[]")),
+                auxiliary_branched_auth_asym_ids=json.loads(row.get("auxiliary_branched_auth_asym_ids", "[]")),
+                num_antigen_chains=row.get("num_antigen_chains", 0),
+                num_antibody_antigen_interfaces=row.get("num_antibody_antigen_interfaces", 0),
+                contact_score=row.get("contact_score", 0.0),
+                monomer_cluster_assignments=monomer_cluster_assignments,
+                monomer_inventory=monomer_inventory,
+            ))
+        LOGGER.info("Collected %d antibody complex observations from prep Parquet", len(observations))
+        return observations
+
     from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
 
     sorted_dirs = sorted(Path(path).resolve() for path in case_dirs)
@@ -525,6 +677,7 @@ def extract_antibody_complex_structures(
     model: int = 1,
     drop_hydrogens: bool = True,
     extraction_jobs: int = 1,
+    prep_dir: str | Path | None = None,
 ) -> tuple[dict[str, ExtractedAntibodyComplexStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -535,6 +688,23 @@ def extract_antibody_complex_structures(
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
     import threading as _threading
+
+    _prep_ab_idx: dict | None = None
+    if prep_dir:
+        from cif_parse.clustering.prep import load_cif_coords_index, assemble_atom_array_from_chains
+        _prep_ab_idx = load_cif_coords_index(prep_dir)
+
+    def _try_assemble_ab(obs: AntibodyComplexObservation) -> AtomArray | None:
+        if _prep_ab_idx is None:
+            return None
+        chain_ids = _structure_chain_ids(obs)
+        if not chain_ids:
+            return None
+        return assemble_atom_array_from_chains(
+            prep_dir, obs.source_path,
+            [(cid, None) for cid in chain_ids],
+            assembly_id=obs.assembly_id, index=_prep_ab_idx,
+        )
 
     atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
     _lock = _threading.Lock()
@@ -560,12 +730,15 @@ def extract_antibody_complex_structures(
         return atom_array_cache[cache_key]
 
     def _process_one(observation: AntibodyComplexObservation) -> ExtractedAntibodyComplexStructure | None:
+        atom_array = _try_assemble_ab(observation)
+        if atom_array is None:
+            atom_array = _load_atom_array(observation)
         return extract_antibody_complex_structure(
             observation,
             outdir=outdir,
             model=model,
             drop_hydrogens=drop_hydrogens,
-            atom_array=_load_atom_array(observation),
+            atom_array=atom_array,
         )
 
     if extraction_jobs <= 1 or len(sorted_observations) <= 1:
@@ -938,7 +1111,7 @@ def build_antibody_complex_signature_clusters(
         monomer_assignments,
         monomer_inventory,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_dir,
+        prep_dir=prep_dir,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -975,6 +1148,7 @@ def build_antibody_complex_signature_clusters(
             model=model,
             drop_hydrogens=drop_hydrogens,
             extraction_jobs=alignment_jobs,
+            prep_dir=prep_dir,
         )
 
     if structure_refinement_mode == "greedy":

@@ -150,8 +150,67 @@ def collect_multimer_observations(
     monomer_cluster_assignments: dict[str, dict[str, str]],
     cif_files_directory: str | None = None,
     prep_db_path: str | Path | None = None,
+    prep_dir: str | Path | None = None,
 ) -> list[MultimerObservation]:
     observations: list[MultimerObservation] = []
+
+    # Fast path: read pre-parsed Parquet
+    from cif_parse.clustering.prep import open_prep_parquet, iter_parquet_rows
+    pf = open_prep_parquet(prep_dir, "multimers", required=True) if prep_dir else None
+    if pf is not None:
+        for row in tqdm(iter_parquet_rows(prep_dir, "multimers", required=True),
+                        desc="Collecting multimers", unit="multimer"):
+            pdb_id = row.get("pdb_id", "")
+            source_path = resolve_source_path(row.get("source_path", ""), cif_files_directory)
+            if not pdb_id:
+                continue
+            m_cids = json.loads(row.get("member_chain_ids", "[]"))
+            m_ctypes = json.loads(row.get("member_chain_types", "[]"))
+            m_cnums = [int(c or 0) for c in json.loads(row.get("member_copy_numbers", "[]"))]
+            descriptors = []
+            m_mids, m_scids, m_stcids, m_csrcs = [], [], [], []
+            for cid, ctype, cnum in zip(m_cids, m_ctypes, m_cnums):
+                mid = canonical_monomer_id(pdb_id, cid)
+                cs, cid_cluster, scid = resolve_monomer_cluster(mid, monomer_cluster_assignments)
+                m_mids.append(mid); m_csrcs.append(cs)
+                m_scids.append(scid)
+                m_stcids.append(cid_cluster if cs == "structure" else None)
+                descriptors.append({"chain_type": ctype, "monomer_cluster_id": cid_cluster, "copy_number": cnum})
+            sig_members = sorted(descriptors, key=lambda x: (x["chain_type"], x["monomer_cluster_id"], int(x["copy_number"])))
+            sig_key = json.dumps({"members": sig_members, "multimer_type": row.get("multimer_type", ""),
+                                  "contains_antibody_unit": row.get("contains_antibody_unit", False),
+                                  "contains_tcr_pmhc_unit": row.get("contains_tcr_pmhc_unit", False)},
+                                 ensure_ascii=False, sort_keys=True)
+            observations.append(MultimerObservation(
+                multimer_observation_id=f"{pdb_id}:{row.get('assembly_id') or 'na'}:{row.get('multimer_index', 0)}",
+                pdb_id=pdb_id, source_path=source_path,
+                assembly_id=row.get("assembly_id"),
+                assembly_mode=row.get("assembly_mode", ""),
+                multimer_id=row.get("multimer_id", ""),
+                member_chain_ids=m_cids,
+                member_auth_asym_ids=json.loads(row.get("member_auth_asym_ids", "[]")),
+                member_entity_ids=json.loads(row.get("member_entity_ids", "[]")),
+                member_chain_types=m_ctypes,
+                member_copy_numbers=m_cnums,
+                member_instances=json.loads(row.get("member_instances", "[]")),
+                num_component_copies=row.get("num_component_copies", 0),
+                num_members=row.get("num_members", 0),
+                num_member_instances=row.get("num_member_instances", 0),
+                num_internal_edges=row.get("num_internal_edges", 0),
+                multimer_type=row.get("multimer_type", ""),
+                support_score=row.get("support_score", 0.0),
+                contains_antibody_unit=row.get("contains_antibody_unit", False),
+                contains_tcr_pmhc_unit=row.get("contains_tcr_pmhc_unit", False),
+                member_monomer_ids=m_mids,
+                member_sequence_cluster_ids=m_scids,
+                member_structure_cluster_ids=m_stcids,
+                member_cluster_sources=m_csrcs,
+                signature_key=sig_key,
+                signature_members=sig_members,
+            ))
+        LOGGER.info("Collected %d multimer observations from prep Parquet", len(observations))
+        return observations
+
     from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
 
     sorted_dirs = sorted(Path(path).resolve() for path in case_dirs)
@@ -409,6 +468,7 @@ def extract_multimer_structures(
     model: int = 1,
     drop_hydrogens: bool = True,
     extraction_jobs: int = 1,
+    prep_dir: str | Path | None = None,
 ) -> tuple[dict[str, ExtractedMultimerStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -420,9 +480,41 @@ def extract_multimer_structures(
 
     import threading as _threading
 
+    _prep_m_idx: dict | None = None
+    if prep_dir:
+        from cif_parse.clustering.prep import load_cif_coords_index, assemble_atom_array_from_chains
+        _prep_m_idx = load_cif_coords_index(prep_dir)
+
+    def _try_assemble_multimer(obs: MultimerObservation) -> AtomArray | None:
+        if _prep_m_idx is None:
+            return None
+        chain_specs = []
+        for inst in obs.member_instances:
+            lbl = str(inst.get("label_asym_id", "") or "")
+            if not lbl:
+                continue
+            chain_specs.append((lbl, None))
+        if not chain_specs:
+            return None
+        return assemble_atom_array_from_chains(
+            prep_dir, obs.source_path, chain_specs,
+            assembly_id=obs.assembly_id, index=_prep_m_idx,
+        )
+
     atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
     chain_ops_cache: dict[tuple[str, str | None], dict[str, list[str]]] = {}
     _lock = _threading.Lock()
+
+    def _load_chain_ops_only(observation: MultimerObservation) -> dict[str, list[str]]:
+        cache_key = (observation.source_path, observation.assembly_id)
+        with _lock:
+            if cache_key not in chain_ops_cache:
+                _, chain_ops = read_assembly_chain_operations(
+                    observation.source_path,
+                    assembly_id=observation.assembly_id,
+                )
+                chain_ops_cache[cache_key] = chain_ops
+        return chain_ops_cache[cache_key]
 
     def _load_caches(observation: MultimerObservation) -> tuple[AtomArray, dict[str, list[str]]]:
         cache_key = (observation.source_path, observation.assembly_id)
@@ -451,7 +543,11 @@ def extract_multimer_structures(
         return atom_array_cache[cache_key], chain_ops_cache[cache_key]
 
     def _process_one(observation: MultimerObservation) -> ExtractedMultimerStructure | None:
-        atom_array, chain_ops = _load_caches(observation)
+        atom_array = _try_assemble_multimer(observation)
+        if atom_array is not None:
+            chain_ops = _load_chain_ops_only(observation)
+        else:
+            atom_array, chain_ops = _load_caches(observation)
         return extract_multimer_structure(
             observation,
             outdir=outdir,
@@ -821,7 +917,7 @@ def build_multimer_signature_clusters(
     observations = collect_multimer_observations(
         case_dirs, monomer_assignments,
         cif_files_directory=cif_files_directory,
-        prep_db_path=prep_dir,
+        prep_dir=prep_dir,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -852,6 +948,7 @@ def build_multimer_signature_clusters(
             model=model,
             drop_hydrogens=drop_hydrogens,
             extraction_jobs=alignment_jobs,
+            prep_dir=prep_dir,
         )
 
     if structure_refinement_mode == "greedy":
