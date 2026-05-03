@@ -38,7 +38,10 @@ def build_parser(
     config_defaults = config_defaults or {}
     clustering_defaults = config_defaults.get("clustering", {})
     parser = argparse.ArgumentParser(
-        description="Build monomer and higher-order clustering artifacts from cif-parse case outputs"
+        description=(
+            "Build monomer and higher-order clustering artifacts from cif-parse "
+            "case outputs or a prebuilt clustering prep directory"
+        )
     )
     subparsers = parser.add_subparsers(dest="subcommand")
     # "prep" subcommand
@@ -92,14 +95,20 @@ def build_parser(
         nargs="+",
         type=Path,
         default=None,
-        help="One or more case-output directories or parents containing case-output directories",
+        help=(
+            "One or more case-output directories or parents containing case-output "
+            "directories. Not required when --prep-dir is provided."
+        ),
     )
     parser.add_argument(
         "--prep-dir",
         type=Path,
         default=None,
-        help="Optional path to a prep directory (built with `cif-parse-cluster prep`); "
-        "when provided, case data is read from Parquet files instead of individual bundles",
+        help=(
+            "Path to a prep directory built with `cif-parse-cluster prep`. When "
+            "provided, clustering reads case data only from prep Parquet/cif_coords "
+            "and --inputs is optional."
+        ),
     )
     parser.add_argument(
         "--cif-files-directory",
@@ -304,9 +313,10 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.info("Prep complete: %s", result)
         return 0
 
-    if args.inputs is None:
+    prep_dir: str | None = str(args.prep_dir) if getattr(args, "prep_dir", None) else None
+    if args.inputs is None and prep_dir is None:
         parser = build_parser(config_defaults=config_defaults, config_path=config_path)
-        parser.error("--inputs is required for clustering mode (or use 'prep' subcommand)")
+        parser.error("--inputs is required unless --prep-dir is provided")
 
     for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
         if getattr(args, field_name) < 1:
@@ -329,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     cif_files_directory: str | None = str(args.cif_files_directory) if args.cif_files_directory is not None else None
-    prep_dir: str | None = str(args.prep_dir) if getattr(args, "prep_dir", None) else None
+    cluster_inputs = args.inputs or []
 
     # Load prep coord index once; all extraction stages share it.
     if prep_dir:
@@ -339,11 +349,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Step 1: monomer sequence dataset ---
     t0 = time.monotonic()
-    LOGGER.info("Step 1/4: Building monomer sequence dataset from %d input(s)", len(args.inputs))
     if prep_dir:
-        LOGGER.info("Using prep directory: %s", prep_dir)
+        LOGGER.info("Step 1/4: Building monomer sequence dataset from prep directory: %s", prep_dir)
+    else:
+        LOGGER.info("Step 1/4: Building monomer sequence dataset from %d input(s)", len(cluster_inputs))
     sequence_dataset = build_monomer_sequence_dataset(
-        inputs=args.inputs,
+        inputs=cluster_inputs,
         outdir=args.outdir,
         protein_sequence_mode=args.protein_sequence_mode,
         protein_min_seq_id=args.protein_min_seq_id,
@@ -368,7 +379,11 @@ def main(argv: list[str] | None = None) -> int:
         protein_monomer_count = sum(
             1 for m in sequence_dataset["monomers"] if m.polymer_class == "protein"
         )
-        seq_cluster_count = len(set(row.get("cluster_id", row.get("sequence_cluster_id", "")) for row in sequence_dataset["membership_rows"] if row.get("polymer_class") == "protein"))
+        seq_cluster_count = len({
+            row.get("cluster_id", row.get("sequence_cluster_id", ""))
+            for row in sequence_dataset["membership_rows"]
+            if row.get("polymer_class") == "protein"
+        })
         structure_outdir = get_fast_temp_dir("protein_structures")
         LOGGER.info(
             "Step 2+3/4: Extracting + clustering protein monomer structures "
@@ -378,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             args.sequence_cluster_jobs,
         )
 
-        # Build on-the-fly extractor that shares the prep cif_cache
+        # Build on-the-fly extractor that shares the prep cif_cache.
         cif_idx_for_pipeline: dict | None = None
         if prep_dir:
             from cif_parse.clustering.prep import load_cif_coords_index, load_cif_from_prep
@@ -394,30 +409,39 @@ def main(argv: list[str] | None = None) -> int:
         def _pipeline_extract(monomer) -> Any | None:
             nonlocal cif_idx_for_pipeline
             from cif_parse.clustering.protein_structures import (
+                SKIP_QUALITY_METADATA,
                 extract_protein_monomer_structure,
                 read_entry_quality_metadata,
             )
             _atom_key = f"{monomer.source_path}__{monomer.label_asym_id}"
-            # Phase 1: check caches under lock, record what needs loading
             _need_atoms = False
             _need_quality = False
             with _extract_lock:
-                _need_atoms = (_atom_key not in atom_array_cache)
-                _need_quality = (monomer.source_path not in quality_cache)
+                _need_atoms = _atom_key not in atom_array_cache
+                _need_quality = monomer.source_path not in quality_cache
 
-            # Phase 2: do I/O outside lock
             if _need_atoms and cif_idx_for_pipeline is not None:
-                from cif_parse.clustering.prep import load_chain_from_prep, load_cif_from_prep as _lcfp
+                from cif_parse.clustering.prep import load_chain_atoms, load_cif_from_prep as _lcfp
                 _found = None
                 for aid in [None] + (monomer.observed_assembly_ids or []):
-                    _c = load_chain_from_prep(prep_dir, monomer.source_path, monomer.label_asym_id,
-                                              assembly_id=str(aid) if aid else None, index=cif_idx_for_pipeline)
-                    if _c is not None and _c.get("atom_array") is not None:
-                        _found = _c["atom_array"]
+                    _c = load_chain_atoms(
+                        prep_dir,
+                        monomer.source_path,
+                        monomer.label_asym_id,
+                        assembly_id=str(aid) if aid else None,
+                        index=cif_idx_for_pipeline,
+                    )
+                    if _c is not None:
+                        _found = _c
                         break
                 if _found is None:
                     for aid in [None] + (monomer.observed_assembly_ids or []):
-                        _c = _lcfp(prep_dir, monomer.source_path, str(aid) if aid else None, index=cif_idx_for_pipeline)
+                        _c = _lcfp(
+                            prep_dir,
+                            monomer.source_path,
+                            str(aid) if aid else None,
+                            index=cif_idx_for_pipeline,
+                        )
                         if _c is not None and _c.get("atom_array") is not None:
                             _found = _c["atom_array"]
                             break
@@ -425,32 +449,36 @@ def main(argv: list[str] | None = None) -> int:
                     with _extract_lock:
                         atom_array_cache[_atom_key] = _found
             if _need_quality:
-                _q = read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+                _q = (
+                    SKIP_QUALITY_METADATA
+                    if prep_dir
+                    else read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+                )
                 with _extract_lock:
                     if monomer.source_path not in quality_cache:
                         quality_cache[monomer.source_path] = _q
             if _need_atoms:
                 with _extract_lock:
-                    if _atom_key not in atom_array_cache:
-                        _need_atoms = True
-                    else:
-                        _need_atoms = False
+                    _need_atoms = _atom_key not in atom_array_cache
                 if _need_atoms:
+                    if prep_dir:
+                        raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
                     cf = read_cif_file(monomer.source_path)
                     _atoms = get_structure(cf, model=args.model, use_author_fields=False)
                     with _extract_lock:
-                        if _atom_key not in atom_array_cache:
-                            atom_array_cache[_atom_key] = _atoms
+                        atom_array_cache.setdefault(_atom_key, _atoms)
 
-            _atoms = None
             with _extract_lock:
                 _atoms = atom_array_cache.get(_atom_key)
                 _q = quality_cache.get(monomer.source_path)
             try:
                 return extract_protein_monomer_structure(
-                    monomer, outdir=structure_outdir, model=args.model,
+                    monomer,
+                    outdir=structure_outdir,
+                    model=args.model,
                     drop_hydrogens=not args.keep_hydrogens,
-                    quality_metadata=_q, atom_array=_atoms,
+                    quality_metadata=_q,
+                    atom_array=_atoms,
                 )
             except Exception:
                 return None
@@ -458,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
         result = greedy_cluster_protein_structures(
             sequence_dataset["monomers"],
             sequence_dataset["membership_rows"],
-            None,  # no pre-extracted structures
+            None,
             outdir=args.outdir / "structure_clusters",
             tm_score_threshold=args.tm_score_threshold,
             min_alignment_coverage_ratio=args.min_alignment_coverage_ratio,
@@ -480,31 +508,15 @@ def main(argv: list[str] | None = None) -> int:
             manifest.get("num_alignment_failures", 0),
         )
 
-    # --- Steps 4: higher-order clustering (run concurrently) ---
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
+    # --- Step 4: higher-order clustering (serial by layer) ---
     build_specs: list[tuple[str, str, str, str, str, dict[str, Any]]] = []
-    if args.dimer_mode == "signature":
-        build_specs.append(("dimer", "signature", args.dimer_structure_mode, "dimer_tm_score_threshold", "dimer_clusters", {
+    if args.tcr_complex_mode == "signature":
+        build_specs.append(("tcr_complex", "signature", args.tcr_complex_structure_mode, "tcr_complex_tm_score_threshold", "tcr_complex_clusters", {
             "case_dirs": sequence_dataset["case_dirs"],
             "clustering_outdir": args.outdir,
-            "outdir": args.outdir / "dimer_clusters",
-            "structure_refinement_mode": args.dimer_structure_mode,
-            "dimer_tm_score_threshold": args.dimer_tm_score_threshold,
-            "model": args.model,
-            "drop_hydrogens": not args.keep_hydrogens,
-            "usalign_executable": args.usalign_executable,
-            "alignment_jobs": args.usalign_jobs,
-            "cif_files_directory": cif_files_directory,
-            "prep_dir": prep_dir,
-        }))
-    if args.multimer_mode == "signature":
-        build_specs.append(("multimer", "signature", args.multimer_structure_mode, "multimer_tm_score_threshold", "multimer_clusters", {
-            "case_dirs": sequence_dataset["case_dirs"],
-            "clustering_outdir": args.outdir,
-            "outdir": args.outdir / "multimer_clusters",
-            "structure_refinement_mode": args.multimer_structure_mode,
-            "multimer_tm_score_threshold": args.multimer_tm_score_threshold,
+            "outdir": args.outdir / "tcr_complex_clusters",
+            "structure_refinement_mode": args.tcr_complex_structure_mode,
+            "tcr_complex_tm_score_threshold": args.tcr_complex_tm_score_threshold,
             "model": args.model,
             "drop_hydrogens": not args.keep_hydrogens,
             "usalign_executable": args.usalign_executable,
@@ -526,13 +538,27 @@ def main(argv: list[str] | None = None) -> int:
             "cif_files_directory": cif_files_directory,
             "prep_dir": prep_dir,
         }))
-    if args.tcr_complex_mode == "signature":
-        build_specs.append(("tcr_complex", "signature", args.tcr_complex_structure_mode, "tcr_complex_tm_score_threshold", "tcr_complex_clusters", {
+    if args.multimer_mode == "signature":
+        build_specs.append(("multimer", "signature", args.multimer_structure_mode, "multimer_tm_score_threshold", "multimer_clusters", {
             "case_dirs": sequence_dataset["case_dirs"],
             "clustering_outdir": args.outdir,
-            "outdir": args.outdir / "tcr_complex_clusters",
-            "structure_refinement_mode": args.tcr_complex_structure_mode,
-            "tcr_complex_tm_score_threshold": args.tcr_complex_tm_score_threshold,
+            "outdir": args.outdir / "multimer_clusters",
+            "structure_refinement_mode": args.multimer_structure_mode,
+            "multimer_tm_score_threshold": args.multimer_tm_score_threshold,
+            "model": args.model,
+            "drop_hydrogens": not args.keep_hydrogens,
+            "usalign_executable": args.usalign_executable,
+            "alignment_jobs": args.usalign_jobs,
+            "cif_files_directory": cif_files_directory,
+            "prep_dir": prep_dir,
+        }))
+    if args.dimer_mode == "signature":
+        build_specs.append(("dimer", "signature", args.dimer_structure_mode, "dimer_tm_score_threshold", "dimer_clusters", {
+            "case_dirs": sequence_dataset["case_dirs"],
+            "clustering_outdir": args.outdir,
+            "outdir": args.outdir / "dimer_clusters",
+            "structure_refinement_mode": args.dimer_structure_mode,
+            "dimer_tm_score_threshold": args.dimer_tm_score_threshold,
             "model": args.model,
             "drop_hydrogens": not args.keep_hydrogens,
             "usalign_executable": args.usalign_executable,
@@ -552,31 +578,19 @@ def main(argv: list[str] | None = None) -> int:
         step_names = ", ".join(kind for kind, _, _, _, _, _ in build_specs)
         t3 = time.monotonic()
         LOGGER.info(
-            "Step 4/4: Building higher-order clusters [%s] (%d steps, %d parallel)",
+            "Step 4/4: Building higher-order clusters serially [%s] (%d steps)",
             step_names,
             len(build_specs),
-            min(len(build_specs), 4),
         )
-    if len(build_specs) <= 1:
-        for kind, _, _, _, _, kwargs in build_specs:
-            build_funcs[kind](**kwargs)
-            LOGGER.info("Higher-order step %s completed", kind)
-    elif build_specs:
-        with ThreadPoolExecutor(max_workers=min(len(build_specs), 4)) as executor:
-            futures = {
-                executor.submit(build_funcs[kind], **kwargs): kind
-                for kind, _, _, _, _, kwargs in build_specs
-            }
-            for future in as_completed(futures):
-                kind = futures[future]
-                try:
-                    future.result()
-                    LOGGER.info("Higher-order step %s completed", kind)
-                except Exception:
-                    LOGGER.exception("Higher-order clustering step %s failed", kind)
-                    raise
+    for kind, _, _, _, _, kwargs in build_specs:
+        step_t0 = time.monotonic()
+        build_funcs[kind](**kwargs)
+        LOGGER.info("Higher-order step %s completed (%.1fs)", kind, time.monotonic() - step_t0)
     if build_specs:
         LOGGER.info("Step 4 complete (%.1fs)", time.monotonic() - t3)
+    if prep_dir:
+        from cif_parse.clustering.prep import close_blob_handles
+        close_blob_handles()
     LOGGER.info("Clustering pipeline finished (%.1fs total)", time.monotonic() - t0)
 
     return 0

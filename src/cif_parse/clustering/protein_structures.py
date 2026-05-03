@@ -27,6 +27,8 @@ from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_a
 
 LOGGER = logging.getLogger(__name__)
 
+SKIP_QUALITY_METADATA = object()
+
 ALIGNED_LENGTH_RE = re.compile(
     r"Aligned length=\s*(?P<aligned_length>\d+),\s*RMSD=\s*(?P<rmsd>[0-9.]+),\s*Seq_ID=.*"
 )
@@ -194,7 +196,7 @@ def extract_protein_monomer_structure(
     outdir: str | Path,
     model: int = 1,
     drop_hydrogens: bool = True,
-    quality_metadata: EntryQualityMetadata | None = None,
+    quality_metadata: EntryQualityMetadata | object | None = None,
     atom_array: AtomArray | None = None,
 ) -> ExtractedMonomerStructure:
     """Extract one canonical monomer chain from source mmCIF and write a single-chain PDB."""
@@ -238,7 +240,11 @@ def extract_protein_monomer_structure(
     pdb_file.set_structure(chain_atoms)
     pdb_file.write(pdb_path)
 
-    quality = quality_metadata or read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+    quality = (
+        None
+        if quality_metadata is SKIP_QUALITY_METADATA
+        else quality_metadata or read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+    )
     resolved_from_segments = _resolved_residue_count_from_segments(monomer.parsed_coordinate_segments)
     denominator = sequence_length if sequence_length > 0 else max(1, resolved_residue_count)
     resolved_fraction = min(
@@ -444,11 +450,17 @@ def extract_protein_monomer_structures(
                 if _prep_atoms is not None:
                     atom_array_cache[_atom_key] = _prep_atoms
             if monomer.source_path not in quality_cache:
-                quality_cache[monomer.source_path] = read_entry_quality_metadata(
-                    monomer.source_path,
-                    pdb_id=monomer.pdb_id,
+                quality_cache[monomer.source_path] = (
+                    SKIP_QUALITY_METADATA
+                    if prep_dir
+                    else read_entry_quality_metadata(
+                        monomer.source_path,
+                        pdb_id=monomer.pdb_id,
+                    )
                 )
             if _atom_key not in atom_array_cache and monomer.source_path not in atom_array_cache:
+                if prep_dir:
+                    raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
                 cif_file = read_cif_file(monomer.source_path)
                 atom_array_cache[monomer.source_path] = get_structure(
                     cif_file,
@@ -492,7 +504,11 @@ def extract_protein_monomer_structures(
                     with cache_lock:
                         atom_array_cache[_atom_key_local] = _prep
             if _need_quality:
-                _q = read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+                _q = (
+                    SKIP_QUALITY_METADATA
+                    if prep_dir
+                    else read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+                )
                 with cache_lock:
                     if monomer.source_path not in quality_cache:
                         quality_cache[monomer.source_path] = _q
@@ -501,6 +517,8 @@ def extract_protein_monomer_structures(
             with cache_lock:
                 _need_atoms = (_atom_key_local not in atom_array_cache and monomer.source_path not in atom_array_cache)
             if _need_atoms:
+                if prep_dir:
+                    raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
                 cf = read_cif_file(monomer.source_path)
                 _atoms_fb = get_structure(cf, model=model, use_author_fields=False)
                 with cache_lock:
@@ -950,10 +968,15 @@ def greedy_cluster_protein_structures(
                     "label_asym_id": representative.label_asym_id,
                     "auth_asym_id": representative.auth_asym_id or "",
                     "resolved_fraction": representative.resolved_fraction,
-                    "primary_method": representative.quality.primary_method or "",
+                    "primary_method": (
+                        representative.quality.primary_method
+                        if representative.quality is not None
+                        else ""
+                    ),
                     "resolution": (
                         representative.quality.resolution
-                        if representative.quality.resolution is not None
+                        if representative.quality is not None
+                        and representative.quality.resolution is not None
                         else ""
                     ),
                 }

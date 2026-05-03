@@ -84,18 +84,17 @@ clustering_prep/
     └── ...                        (num_workers chunks total)
 ```
 
-Atoms are stored **per-chain** rather than per-assembly: monomer / dimer / multimer / complex extraction each reads only the chains they need via direct index lookup, eliminating repeated slicing of full assembly blobs.
+Atoms are stored **per-chain** rather than per-assembly: monomer / dimer / multimer / complex extraction each reads only the chains they need via direct index lookup, eliminating repeated slicing of full assembly blobs. During clustering, per-chain AtomArrays loaded from prep are also kept in a shared in-process LRU cache, so monomer structure extraction and later higher-order complex extraction can reuse the same chain coordinates.
 
-Pass `--prep-dir` to the clustering command to read from the prep directory:
+Pass `--prep-dir` to the clustering command to read only from the prep directory. In this mode `--inputs` is no longer required because the Parquet files contain the monomer, dimer, multimer, antibody-complex, and TCR-complex rows needed by clustering:
 
 ```bash
 cif-parse-cluster \
-  --inputs batch_outputs/cases \
   --prep-dir clustering_prep \
   --outdir cluster_outputs
 ```
 
-When `--prep-dir` is not provided, clustering falls back to reading individual `result.json.gz` files and original mmCIF files directly.
+When `--prep-dir` is not provided, `--inputs` is required and clustering falls back to reading individual `result.json.gz` files and original mmCIF files directly.
 
 Use `--no-cif-cache` to skip Phase 2 (atom caching) when only the Parquet files are needed.
 
@@ -136,9 +135,11 @@ Key clustering defaults:
 3. Protein monomer alignment coverage requires `aligned_length / shorter_length >= 0.80`.
 4. Dimer, multimer, antibody-antigen, and TCR-pMHC complex clustering default to signature clustering plus overall `USalign -mm 1 -ter 1` refinement with TM-score threshold `0.50`.
 5. Monomer extraction and structure clustering run in a **pipelined** mode: structures are extracted per sequence cluster on-the-fly while USalign runs on previously extracted clusters, overlapping I/O and computation.
-6. `--jobs N` automatically propagates to all subtask workers (`--mmseqs-threads`, `--sequence-cluster-jobs`, `--usalign-jobs`). Individual subtask counts can still be overridden explicitly.
-7. Use `--cif-files-directory` to override the location of original mmCIF files during structure extraction.
-8. Use `--prep-dir` to read case data from Parquet files and per-chain cached AtomArrays (built with `cif-parse-cluster prep`). Without it, the clustering pipeline falls back to reading individual case bundles and mmCIF files.
+6. Higher-order clustering stages run serially after monomer clustering in this order: TCR-pMHC, antibody-antigen, multimer, dimer. Parallelism is kept inside each stage through `--usalign-jobs`, avoiding cross-stage oversubscription on large machines.
+7. Higher-order structure refinement skips singleton signature groups: singletons are emitted directly as clusters without writing complex PDBs or running USalign.
+8. `--jobs N` automatically propagates to all subtask workers (`--mmseqs-threads`, `--sequence-cluster-jobs`, `--usalign-jobs`). Individual subtask counts can still be overridden explicitly.
+9. Use `--cif-files-directory` to override the location of original mmCIF files during structure extraction.
+10. Use `--prep-dir` as the full clustering input source for Parquet rows and per-chain cached AtomArrays. Without it, `--inputs` is required and the pipeline falls back to reading individual case bundles and mmCIF files.
 
 ## Configuration
 
@@ -182,7 +183,6 @@ cif-parse-cluster prep \
 
 # 3. Run clustering (consumes prep directory)
 cif-parse-cluster \
-  --inputs batch_outputs/cases \
   --prep-dir clustering_prep \
   --outdir cluster_outputs \
   --dimer-mode signature \

@@ -47,8 +47,12 @@ def _dimer_member_descriptor(
     }
 
 
-def _dimer_cluster_id(index: int) -> str:
-    return f"dim_{index}"
+def _signature_index(signature_cluster_id: str) -> str:
+    return signature_cluster_id.rsplit("_", 1)[-1]
+
+
+def _dimer_cluster_id(signature_cluster_id: str, local_index: int = 1) -> str:
+    return f"dim_{_signature_index(signature_cluster_id)}_{local_index}"
 
 
 def _dimer_signature_cluster_id(index: int) -> str:
@@ -416,6 +420,8 @@ def extract_dimer_structures(
     drop_hydrogens: bool = True,
     extraction_jobs: int = 1,
     prep_dir: str | Path | None = None,
+    show_progress: bool = True,
+    log_summary: bool = True,
 ) -> tuple[dict[str, ExtractedDimerStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -464,10 +470,19 @@ def extract_dimer_structures(
         atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
         import threading as _threading
         _lock = _threading.Lock()
-        for observation in tqdm(sorted_observations, desc="Extracting dimer structures", unit="dimer"):
+        observation_iter = (
+            tqdm(sorted_observations, desc="Extracting dimer structures", unit="dimer")
+            if show_progress
+            else sorted_observations
+        )
+        for observation in observation_iter:
             try:
                 atom_array = _try_assemble_from_chains(observation)
                 if atom_array is None:
+                    if prep_dir:
+                        raise ValueError(
+                            f"Prep coordinates missing for dimer {observation.dimer_observation_id}"
+                        )
                     atom_array = _load_atom_array(observation, atom_array_cache, _lock)
                 structures[observation.dimer_observation_id] = extract_dimer_structure(
                     observation,
@@ -490,6 +505,10 @@ def extract_dimer_structures(
         def _extract_one(observation: DimerObservation) -> ExtractedDimerStructure | None:
             atom_array = _try_assemble_from_chains(observation)
             if atom_array is None:
+                if prep_dir:
+                    raise ValueError(
+                        f"Prep coordinates missing for dimer {observation.dimer_observation_id}"
+                    )
                 atom_array = _load_atom_array(observation, atom_array_cache, cache_lock)
             return extract_dimer_structure(
                 observation,
@@ -504,8 +523,15 @@ def extract_dimer_structures(
                 executor.submit(_extract_one, observation): observation
                 for observation in sorted_observations
             }
-            for future in tqdm(as_completed(future_to_obs), total=len(future_to_obs),
-                               desc="Extracting dimer structures", unit="dimer"):
+            future_iter = as_completed(future_to_obs)
+            if show_progress:
+                future_iter = tqdm(
+                    future_iter,
+                    total=len(future_to_obs),
+                    desc="Extracting dimer structures",
+                    unit="dimer",
+                )
+            for future in future_iter:
                 observation = future_to_obs[future]
                 try:
                     extracted = future.result()
@@ -526,7 +552,8 @@ def extract_dimer_structures(
         "extraction_jobs": extraction_jobs,
     }
     dump_json(outdir / "dimer_structure_manifest.json", manifest, indent=2)
-    LOGGER.info("Extracted %d dimer structures (%d failures)", len(structures), len(failures))
+    if log_summary:
+        LOGGER.info("Extracted %d dimer structures (%d failures)", len(structures), len(failures))
     return structures, manifest
 
 
@@ -570,6 +597,8 @@ def refine_dimer_signature_clusters(
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
+    show_progress: bool = True,
+    log_summary: bool = True,
 ) -> dict[str, Any]:
     runner = alignment_runner or run_dimer_usalign_alignment
     alignment_jobs = normalize_worker_count(alignment_jobs)
@@ -583,14 +612,20 @@ def refine_dimer_signature_clusters(
 
     total_observations = sum(len(members) for _, members in signature_groups)
     multi_member = sum(1 for _, m in signature_groups if len(m) > 1)
-    LOGGER.info(
-        "Refining %d dimer signature clusters (%d observations, %d multi-member, %d alignment workers)",
-        len(signature_groups),
-        total_observations,
-        multi_member,
-        alignment_jobs,
+    if log_summary:
+        LOGGER.info(
+            "Refining %d dimer signature clusters (%d observations, %d multi-member, %d alignment workers)",
+            len(signature_groups),
+            total_observations,
+            multi_member,
+            alignment_jobs,
+        )
+    signature_iter = (
+        tqdm(signature_groups, desc="Refining dimer clusters", unit="sig-group")
+        if show_progress
+        else signature_groups
     )
-    for signature_cluster_id, members in tqdm(signature_groups, desc="Refining dimer clusters", unit="sig-group"):
+    for signature_cluster_id, members in signature_iter:
         extracted_members = [
             member for member in members if member.dimer_observation_id in extracted_structures
         ]
@@ -708,11 +743,10 @@ def refine_dimer_signature_clusters(
     membership_rows: list[dict[str, Any]] = []
     representative_rows: list[dict[str, Any]] = []
     signature_rows: list[dict[str, Any]] = []
-    for cluster_index, (signature_cluster_id, representative_id, members, representative) in enumerate(
-        cluster_members,
-        start=1,
-    ):
-        cluster_id = _dimer_cluster_id(cluster_index)
+    local_cluster_counts: dict[str, int] = {}
+    for signature_cluster_id, representative_id, members, representative in cluster_members:
+        local_cluster_counts[signature_cluster_id] = local_cluster_counts.get(signature_cluster_id, 0) + 1
+        cluster_id = _dimer_cluster_id(signature_cluster_id, local_cluster_counts[signature_cluster_id])
         representative_rows.append(
             {
                 "dimer_cluster_id": cluster_id,
@@ -772,14 +806,15 @@ def refine_dimer_signature_clusters(
         "dimer_tm_score_threshold": tm_score_threshold,
         "alignment_jobs": alignment_jobs,
     }
-    LOGGER.info(
-        "Dimer refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits)",
-        len(signature_groups),
-        len(cluster_members),
-        num_alignment_runs,
-        num_alignment_failures,
-        num_signature_clusters_split,
-    )
+    if log_summary:
+        LOGGER.info(
+            "Dimer refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits)",
+            len(signature_groups),
+            len(cluster_members),
+            num_alignment_runs,
+            num_alignment_failures,
+            num_signature_clusters_split,
+        )
     return {
         "manifest": manifest,
         "membership_rows": membership_rows,
@@ -870,36 +905,158 @@ def build_dimer_signature_clusters(
     extraction_manifest = {
         "num_extracted_dimer_structures": 0,
         "num_failed_dimer_structure_extractions": 0,
+        "num_dimer_structure_extraction_candidates": 0,
+        "num_singleton_dimer_observations_skipped_structure_extraction": 0,
     }
     extracted_structures: dict[str, ExtractedDimerStructure] = {}
     if structure_refinement_mode == "greedy":
-        extracted_structures, extraction_manifest = extract_dimer_structures(
-            observations,
-            outdir=outdir / "structures",
-            model=model,
-            drop_hydrogens=drop_hydrogens,
-            extraction_jobs=alignment_jobs,
-            prep_dir=prep_dir,
+        refinement_observations = [
+            observation
+            for _, members in signature_groups
+            if len(members) > 1
+            for observation in members
+        ]
+        extraction_manifest["num_dimer_structure_extraction_candidates"] = len(refinement_observations)
+        extraction_manifest["num_singleton_dimer_observations_skipped_structure_extraction"] = (
+            len(observations) - len(refinement_observations)
+        )
+        LOGGER.info(
+            "Dimer structure refinement will extract %d/%d observations; %d singleton observations need no USalign",
+            len(refinement_observations),
+            len(observations),
+            extraction_manifest["num_singleton_dimer_observations_skipped_structure_extraction"],
         )
 
     if structure_refinement_mode == "greedy":
-        refined = refine_dimer_signature_clusters(
-            signature_groups,
-            extracted_structures,
-            tm_score_threshold=dimer_tm_score_threshold,
-            usalign_executable=usalign_executable,
-            alignment_runner=alignment_runner,
-            alignment_jobs=alignment_jobs,
+        membership_rows = []
+        representative_rows = []
+        signature_rows = []
+        alignment_rows = []
+        warning_rows = []
+        refined_manifest = {
+            "num_dimer_clusters": 0,
+            "num_signature_clusters": 0,
+            "num_alignment_runs": 0,
+            "num_alignment_failures": 0,
+            "num_signature_clusters_split": 0,
+            "alignment_jobs": normalize_worker_count(alignment_jobs),
+        }
+        structure_rows: list[dict[str, Any]] = []
+        structure_failure_rows: list[dict[str, Any]] = []
+
+        def _merge_refined_group(refined_group: dict[str, Any]) -> None:
+            membership_rows.extend(refined_group["membership_rows"])
+            representative_rows.extend(refined_group["representative_rows"])
+            signature_rows.extend(refined_group["signature_rows"])
+            alignment_rows.extend(refined_group["alignment_rows"])
+            warning_rows.extend(refined_group["warning_rows"])
+            group_manifest = refined_group["manifest"]
+            refined_manifest["num_dimer_clusters"] += group_manifest["num_dimer_clusters"]
+            refined_manifest["num_signature_clusters"] += group_manifest["num_signature_clusters"]
+            refined_manifest["num_alignment_runs"] += group_manifest["num_alignment_runs"]
+            refined_manifest["num_alignment_failures"] += group_manifest["num_alignment_failures"]
+            refined_manifest["num_signature_clusters_split"] += group_manifest["num_signature_clusters_split"]
+
+        def _record_extraction_result(
+            structures: dict[str, ExtractedDimerStructure],
+            extract_manifest: dict[str, Any],
+            group_outdir: Path,
+        ) -> None:
+            extraction_manifest["num_extracted_dimer_structures"] += extract_manifest.get(
+                "num_extracted_dimer_structures",
+                0,
+            )
+            extraction_manifest["num_failed_dimer_structure_extractions"] += extract_manifest.get(
+                "num_failed_dimer_structure_extractions",
+                0,
+            )
+            structure_rows.extend(item.to_dict() for item in structures.values())
+            failures_path = group_outdir / "dimer_structure_extraction_failures.jsonl"
+            if failures_path.exists():
+                for line in failures_path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        structure_failure_rows.append(json.loads(line))
+
+        multi_member_groups = [
+            (signature_cluster_id, members)
+            for signature_cluster_id, members in signature_groups
+            if len(members) > 1
+        ]
+        for signature_cluster_id, members in signature_groups:
+            if len(members) == 1:
+                refined_group = refine_dimer_signature_clusters(
+                    [(signature_cluster_id, members)],
+                    {},
+                    tm_score_threshold=dimer_tm_score_threshold,
+                    usalign_executable=usalign_executable,
+                    alignment_runner=alignment_runner,
+                    alignment_jobs=alignment_jobs,
+                    show_progress=False,
+                    log_summary=False,
+                )
+                _merge_refined_group(refined_group)
+        if multi_member_groups:
+            max_extract_workers = min(normalize_worker_count(alignment_jobs), len(multi_member_groups))
+            with ThreadPoolExecutor(max_workers=max_extract_workers) as executor:
+                future_to_group = {}
+                for signature_cluster_id, members in multi_member_groups:
+                    group_outdir = outdir / "structures" / "groups" / signature_cluster_id
+                    future = executor.submit(
+                        extract_dimer_structures,
+                        members,
+                        outdir=group_outdir,
+                        model=model,
+                        drop_hydrogens=drop_hydrogens,
+                        extraction_jobs=1,
+                        prep_dir=prep_dir,
+                        show_progress=False,
+                        log_summary=False,
+                    )
+                    future_to_group[future] = (signature_cluster_id, members, group_outdir)
+                for future in as_completed(future_to_group):
+                    signature_cluster_id, members, group_outdir = future_to_group[future]
+                    structures, extract_manifest = future.result()
+                    _record_extraction_result(structures, extract_manifest, group_outdir)
+                    refined_group = refine_dimer_signature_clusters(
+                        [(signature_cluster_id, members)],
+                        structures,
+                        tm_score_threshold=dimer_tm_score_threshold,
+                        usalign_executable=usalign_executable,
+                        alignment_runner=alignment_runner,
+                        alignment_jobs=alignment_jobs,
+                        show_progress=False,
+                        log_summary=False,
+                    )
+                    _merge_refined_group(refined_group)
+
+        def _dimer_cluster_sort_key(cluster_id: str) -> tuple[int, int]:
+            _, sig_idx, local_idx = cluster_id.split("_")
+            return (int(sig_idx), int(local_idx))
+
+        membership_rows.sort(key=lambda row: (_dimer_cluster_sort_key(row["dimer_cluster_id"]), row["dimer_observation_id"]))
+        representative_rows.sort(key=lambda row: _dimer_cluster_sort_key(row["dimer_cluster_id"]))
+        signature_rows.sort(key=lambda row: _dimer_cluster_sort_key(row["dimer_cluster_id"]))
+
+        structures_dir = outdir / "structures"
+        dump_jsonl(structures_dir / "dimer_structure_extraction_failures.jsonl", structure_failure_rows)
+        dump_jsonl(structures_dir / "dimer_structures.jsonl", structure_rows)
+        dump_json(
+            structures_dir / "dimer_structure_manifest.json",
+            {
+                "num_dimer_observations": extraction_manifest["num_dimer_structure_extraction_candidates"],
+                "num_extracted_dimer_structures": extraction_manifest["num_extracted_dimer_structures"],
+                "num_failed_dimer_structure_extractions": extraction_manifest[
+                    "num_failed_dimer_structure_extractions"
+                ],
+                "extraction_jobs": normalize_worker_count(alignment_jobs),
+                "num_signature_groups_pipelined": len(multi_member_groups),
+            },
+            indent=2,
         )
-        membership_rows = refined["membership_rows"]
-        representative_rows = refined["representative_rows"]
-        signature_rows = refined["signature_rows"]
-        alignment_rows = refined["alignment_rows"]
-        warning_rows = refined["warning_rows"]
         manifest = {
             "num_dimer_observations": len(observations),
-            "num_dimer_clusters": refined["manifest"]["num_dimer_clusters"],
-            "num_signature_clusters": refined["manifest"]["num_signature_clusters"],
+            "num_dimer_clusters": refined_manifest["num_dimer_clusters"],
+            "num_signature_clusters": refined_manifest["num_signature_clusters"],
             "num_unique_signatures": len(grouped),
             "num_monomer_assignments_loaded": len(monomer_assignments),
             "num_observations_with_unclustered_member": sum(
@@ -907,12 +1064,12 @@ def build_dimer_signature_clusters(
                 for observation in observations
                 if "unclustered" in {observation.cluster_source_1, observation.cluster_source_2}
             ),
-            "num_alignment_runs": refined["manifest"]["num_alignment_runs"],
-            "num_alignment_failures": refined["manifest"]["num_alignment_failures"],
-            "num_signature_clusters_split": refined["manifest"]["num_signature_clusters_split"],
+            "num_alignment_runs": refined_manifest["num_alignment_runs"],
+            "num_alignment_failures": refined_manifest["num_alignment_failures"],
+            "num_signature_clusters_split": refined_manifest["num_signature_clusters_split"],
             "dimer_tm_score_threshold": dimer_tm_score_threshold,
             "structure_refinement_mode": structure_refinement_mode,
-            "alignment_jobs": refined["manifest"]["alignment_jobs"],
+            "alignment_jobs": refined_manifest["alignment_jobs"],
             **extraction_manifest,
         }
     else:
@@ -921,11 +1078,8 @@ def build_dimer_signature_clusters(
         signature_rows = []
         alignment_rows = []
         warning_rows = []
-        for cluster_index, (signature_cluster_id, members) in enumerate(
-            signature_groups,
-            start=1,
-        ):
-            cluster_id = _dimer_cluster_id(cluster_index)
+        for signature_cluster_id, members in signature_groups:
+            cluster_id = _dimer_cluster_id(signature_cluster_id)
             representative = min(members, key=lambda item: item.structural_sort_key())
             representative_rows.append(
                 {

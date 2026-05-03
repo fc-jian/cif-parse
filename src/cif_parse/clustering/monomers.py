@@ -138,6 +138,7 @@ def collect_canonical_monomers(
     """Collect canonical monomer samples, deduplicated by `(pdb_id, label_asym_id)`."""
 
     case_paths = [Path(path).resolve() for path in case_dirs]
+    prep_case_ids: set[str] = set()
     canonical: dict[tuple[str, str], MonomerSample] = {}
     counts_by_polymer_class: dict[str, int] = defaultdict(int)
     num_case_bundles = 0
@@ -150,7 +151,6 @@ def collect_canonical_monomers(
     # Fast path: read pre-parsed Parquet
     pf = open_prep_parquet(prep_dir, "monomers", required=True) if prep_dir else None
     if pf is not None:
-        num_case_bundles = pf.metadata.num_rows
         for row in tqdm(
             iter_parquet_rows(prep_dir, "monomers", required=True),
             desc="Collecting canonical monomers",
@@ -191,12 +191,16 @@ def collect_canonical_monomers(
                     observed_assembly_ids=[],
                 )
                 counts_by_polymer_class[str(row.get("polymer_class", "") or "")] += 1
+            source_case_dir = str(row.get("source_case_dir", "") or "")
+            if source_case_dir:
+                prep_case_ids.add(source_case_dir)
             sample = canonical[key]
             assembly_ids = json.loads(row.get("assembly_ids", "[]") or "[]")
             sample.observed_assembly_ids = sorted(
                 {*(sample.observed_assembly_ids), *(str(a) for a in assembly_ids if str(a))},
                 key=_assembly_sort_key,
             )
+        num_case_bundles = len(prep_case_ids)
     else:
         # Slow path: read individual JSON bundles
         from cif_parse.export import load_case_output_bundles as _load_bundles
@@ -428,11 +432,13 @@ def parse_mmseqs_cluster_tsv(
     """Parse `mmseqs easy-cluster` TSV output into normalized membership rows."""
 
     grouped: dict[str, list[str]] = defaultdict(list)
-    for line in Path(cluster_tsv_path).read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        representative, member = line.split("\t", maxsplit=1)
-        grouped[representative].append(member)
+    with Path(cluster_tsv_path).open(encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            representative, member = text.split("\t", maxsplit=1)
+            grouped[representative].append(member)
 
     rows: list[dict[str, Any]] = []
     for index, representative_id in enumerate(sorted(grouped), start=1):
@@ -472,7 +478,7 @@ def build_monomer_sequence_dataset(
 ) -> dict[str, Any]:
     """Build canonical monomer inventory and sequence-level grouping artifacts."""
 
-    case_dirs = discover_case_output_dirs(inputs)
+    case_dirs = [] if prep_dir else discover_case_output_dirs(inputs)
     inventory = collect_canonical_monomers(
         case_dirs,
         cif_files_directory=cif_files_directory,
@@ -513,7 +519,7 @@ def build_monomer_sequence_dataset(
                 )
                 copied_tsv = outdir / "sequence_clusters" / "protein_mmseqs_cluster.tsv"
                 copied_tsv.parent.mkdir(parents=True, exist_ok=True)
-                copied_tsv.write_text(Path(cluster_tsv).read_text(encoding="utf-8"), encoding="utf-8")
+                shutil.copyfile(cluster_tsv, copied_tsv)
                 monomer_index = {monomer.monomer_id: monomer for monomer in monomers}
                 membership_rows.extend(parse_mmseqs_cluster_tsv(copied_tsv, monomer_index))
     else:

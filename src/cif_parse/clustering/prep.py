@@ -43,6 +43,7 @@ import struct
 import threading
 import time
 import zlib
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -432,17 +433,17 @@ def _cache_sources_to_temp(
     idx_path = tmp_dir / f"temp_{worker_id}.idx"
     all_entries: list[dict[str, Any]] = []
 
-    for source_path, assembly_ids, cif_files_directory in chunk_tasks:
-        resolved_path = source_path
-        if cif_files_directory:
-            resolved_path = str(Path(cif_files_directory) / Path(source_path).name)
+    with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
+        for source_path, assembly_ids, cif_files_directory in chunk_tasks:
+            resolved_path = source_path
+            if cif_files_directory:
+                resolved_path = str(Path(cif_files_directory) / Path(source_path).name)
 
-        # Fast path: use atom cache from parsing stage
-        atoms_dir = atom_cache_map.get(source_path) if atom_cache_map else None
-        if atoms_dir:
-            atoms_dir = Path(atoms_dir)
-            try:
-                with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
+            # Fast path: use atom cache from parsing stage
+            atoms_dir = atom_cache_map.get(source_path) if atom_cache_map else None
+            if atoms_dir:
+                atoms_dir = Path(atoms_dir)
+                try:
                     for assembly_id in assembly_ids:
                         cache_key = f"{source_path}__{assembly_id or ''}"
                         pkl_name = f"{assembly_id or '_none'}.pkl"
@@ -479,19 +480,18 @@ def _cache_sources_to_temp(
                                     offset, len(wrapped),
                                 ))
                                 all_entries.append({"cache_key": cache_key, "status": "cached"})
-                continue  # skip slow path for this source_path
-            except Exception as exc:
-                LOGGER.debug("Atom cache read failed for %s, falling back to mmCIF: %s", source_path, exc)
+                    continue  # skip slow path for this source_path
+                except Exception as exc:
+                    LOGGER.debug("Atom cache read failed for %s, falling back to mmCIF: %s", source_path, exc)
 
-        # Slow path: read and parse original mmCIF
-        try:
-            from biotite.structure.io.pdbx import get_assembly, get_structure
-            from cif_parse.io import read_cif_file
+            # Slow path: read and parse original mmCIF
+            try:
+                from biotite.structure.io.pdbx import get_assembly, get_structure
+                from cif_parse.io import read_cif_file
 
-            cif_file = read_cif_file(resolved_path)
-            quality = _read_quality(resolved_path, cif_file)
+                cif_file = read_cif_file(resolved_path)
+                quality = _read_quality(resolved_path, cif_file)
 
-            with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
                 for assembly_id in assembly_ids:
                     cache_key = f"{source_path}__{assembly_id or ''}"
                     try:
@@ -521,11 +521,11 @@ def _cache_sources_to_temp(
                     except Exception as exc:
                         LOGGER.warning("Failed to cache assembly %s for %s: %s", assembly_id, source_path, exc)
                         all_entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
-        except Exception as exc:
-            LOGGER.warning("Failed to read mmCIF %s: %s", source_path, exc)
-            for assembly_id in assembly_ids:
-                cache_key = f"{source_path}__{assembly_id or ''}"
-                all_entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
+            except Exception as exc:
+                LOGGER.warning("Failed to read mmCIF %s: %s", source_path, exc)
+                for assembly_id in assembly_ids:
+                    cache_key = f"{source_path}__{assembly_id or ''}"
+                    all_entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
 
     return {"entries": all_entries,
             "bin_path": str(bin_path) if bin_path.exists() else None,
@@ -651,6 +651,22 @@ def _collect_source_paths_from_parquet(prep_dir: Path, sink: set[str]) -> None:
         pass
 
 
+def _group_source_tasks(
+    tasks: list[tuple[str, list[str | None], str | None]],
+    num_workers: int,
+    *,
+    target_chunks_per_worker: int = 4,
+    min_chunk_size: int = 50,
+) -> list[list[tuple[str, list[str | None], str | None]]]:
+    """Split source-cache work into smaller chunks for better load balancing."""
+
+    if not tasks:
+        return []
+    desired_chunks = max(1, num_workers * target_chunks_per_worker)
+    chunk_size = max(min_chunk_size, (len(tasks) + desired_chunks - 1) // desired_chunks)
+    return [tasks[i:i + chunk_size] for i in range(0, len(tasks), chunk_size)]
+
+
 # ── main builder ─────────────────────────────────────────────────────────────
 
 
@@ -722,18 +738,23 @@ def build_prep_database(
     # Collect source_paths and atom cache map from temp files
     atom_cache_map: dict[str, str] = {}
     for sources_file in sorted(tmp_phase1.glob("temp_*_sources.txt")):
-        for line in sources_file.read_text(encoding="utf-8").splitlines():
-            sp = line.strip()
-            if sp:
-                all_source_paths.add(sp)
+        with sources_file.open(encoding="utf-8") as handle:
+            for line in handle:
+                sp = line.strip()
+                if sp:
+                    all_source_paths.add(sp)
         sources_file.unlink()
     for atoms_file in sorted(tmp_phase1.glob("temp_*_atoms.jsonl")):
-        for line in atoms_file.read_text(encoding="utf-8").splitlines():
-            entry = json.loads(line.strip())
-            sp = entry.get("source_path", "")
-            ad = entry.get("atoms_dir", "")
-            if sp and ad and sp not in atom_cache_map:
-                atom_cache_map[sp] = ad
+        with atoms_file.open(encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                entry = json.loads(text)
+                sp = entry.get("source_path", "")
+                ad = entry.get("atoms_dir", "")
+                if sp and ad and sp not in atom_cache_map:
+                    atom_cache_map[sp] = ad
         atoms_file.unlink()
 
     # Merge temp Parquet files into final Parquet files (metadata-only concatenation)
@@ -813,12 +834,9 @@ def build_prep_database(
                 result = _cache_sources_to_temp((chunk_tasks, tmp_phase2, 0, atom_cache_map))
                 _count_cif_entries(result, cif_stats)
             else:
-                # Split tasks into num_workers groups; each group → one chunk file
-                chunk_size = max(1, len(tasks) // num_workers)
-                grouped: list[list[tuple]] = [[] for _ in range(num_workers)]
-                for i, (sp, aids, cfd) in enumerate(tasks):
-                    grouped[min(i // chunk_size, num_workers - 1)].append((sp, aids, cfd))
-                grouped = [g for g in grouped if g]  # drop empty groups
+                # Split source files into more chunks than workers so that large
+                # CIF files do not leave a single slow worker at the end.
+                grouped = _group_source_tasks(tasks, num_workers)
                 task_args = [(chunk_tasks, tmp_phase2, wid, atom_cache_map)
                              for wid, chunk_tasks in enumerate(grouped)]
                 with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -902,9 +920,9 @@ def iter_parquet_rows(
         return
     for rg_idx in range(pf.metadata.num_row_groups):
         tbl = pf.read_row_group(rg_idx, columns=columns)
-        cols = tbl.column_names
+        column_data = tbl.to_pydict()
         for i in range(tbl.num_rows):
-            yield {c: tbl.column(c)[i].as_py() for c in cols}
+            yield {c: values[i] for c, values in column_data.items()}
 
 
 # Shared index: set by CLI so that dimer/multimer/antibody/TCR builders
@@ -1032,6 +1050,29 @@ def load_chain_from_prep(
 # on the same chunk file never interfere.
 _blob_fd_cache: dict[Path, int] = {}
 _blob_fd_cache_lock = threading.Lock()
+_chain_atom_cache: OrderedDict[tuple[str, str | None, str], Any] = OrderedDict()
+_chain_atom_cache_lock = threading.Lock()
+_chain_atom_cache_max_items = 200_000
+
+
+def set_chain_atom_cache_limit(max_items: int | None) -> None:
+    """Set the in-process chain AtomArray cache size used by prep readers."""
+
+    global _chain_atom_cache_max_items
+    _chain_atom_cache_max_items = max(0, int(max_items or 0))
+    if _chain_atom_cache_max_items == 0:
+        clear_chain_atom_cache()
+        return
+    with _chain_atom_cache_lock:
+        while len(_chain_atom_cache) > _chain_atom_cache_max_items:
+            _chain_atom_cache.popitem(last=False)
+
+
+def clear_chain_atom_cache() -> None:
+    """Clear cached single-chain AtomArrays loaded from prep chunks."""
+
+    with _chain_atom_cache_lock:
+        _chain_atom_cache.clear()
 
 
 def _read_blob(entry: tuple[Path, int, int]) -> dict[str, Any] | None:
@@ -1053,6 +1094,7 @@ def _read_blob(entry: tuple[Path, int, int]) -> dict[str, Any] | None:
 
 def close_blob_handles() -> None:
     """Close all cached chunk file descriptors (call after extraction finishes)."""
+    clear_chain_atom_cache()
     with _blob_fd_cache_lock:
         for fd in _blob_fd_cache.values():
             try:
@@ -1075,11 +1117,24 @@ def load_chain_atoms(
     Convenience wrapper around :func:`load_chain_from_prep` that returns
     just the atom array (or None).  Imported by extraction functions.
     """
+    cache_key = (str(source_path), assembly_id, str(label_asym_id))
+    with _chain_atom_cache_lock:
+        cached_atoms = _chain_atom_cache.get(cache_key)
+        if cached_atoms is not None:
+            _chain_atom_cache.move_to_end(cache_key)
+            return cached_atoms
     cached = load_chain_from_prep(prep_dir, source_path, label_asym_id,
                                   assembly_id=assembly_id, index=index)
     if cached is None:
         return None
-    return cached.get("atom_array")
+    atoms = cached.get("atom_array")
+    if atoms is not None and _chain_atom_cache_max_items > 0:
+        with _chain_atom_cache_lock:
+            _chain_atom_cache[cache_key] = atoms
+            _chain_atom_cache.move_to_end(cache_key)
+            while len(_chain_atom_cache) > _chain_atom_cache_max_items:
+                _chain_atom_cache.popitem(last=False)
+    return atoms
 
 
 def assemble_atom_array_from_chains(
