@@ -1075,8 +1075,12 @@ def build_tcr_complex_signature_clusters(
     alignment_jobs: int = 1,
     cif_files_directory: str | None = None,
     prep_dir: str | Path | None = None,
+    include_structure_assignments: bool = True,
 ) -> dict[str, Any]:
-    monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
+    monomer_assignments = load_monomer_cluster_assignments(
+        clustering_outdir,
+        include_structure=include_structure_assignments,
+    )
     monomer_inventory = load_monomer_inventory(clustering_outdir)
     observations = collect_tcr_complex_observations(
         case_dirs,

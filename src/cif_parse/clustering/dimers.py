@@ -185,10 +185,17 @@ class ExtractedDimerStructure:
         return asdict(self)
 
 
-def load_monomer_cluster_assignments(clustering_outdir: str | Path) -> dict[str, dict[str, str]]:
+def load_monomer_cluster_assignments(
+    clustering_outdir: str | Path,
+    *,
+    include_structure: bool = True,
+) -> dict[str, dict[str, str]]:
     """Load monomer sequence / structure cluster assignments from clustering artifacts."""
 
-    return _load_monomer_cluster_assignments(clustering_outdir)
+    return _load_monomer_cluster_assignments(
+        clustering_outdir,
+        include_structure=include_structure,
+    )
 
 
 def _resolve_monomer_cluster(
@@ -876,10 +883,14 @@ def build_dimer_signature_clusters(
     alignment_jobs: int = 1,
     cif_files_directory: str | None = None,
     prep_dir: str | Path | None = None,
+    include_structure_assignments: bool = True,
 ) -> dict[str, Any]:
     """Build dimer clusters from monomer assignments and optional structure refinement."""
 
-    monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
+    monomer_assignments = load_monomer_cluster_assignments(
+        clustering_outdir,
+        include_structure=include_structure_assignments,
+    )
     observations = collect_dimer_observations(
         case_dirs, monomer_assignments,
         cif_files_directory=cif_files_directory,

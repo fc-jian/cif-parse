@@ -30,7 +30,11 @@ def load_monomer_inventory(clustering_outdir: str | Path) -> dict[str, dict[str,
     return inventory
 
 
-def load_monomer_cluster_assignments(clustering_outdir: str | Path) -> dict[str, dict[str, str]]:
+def load_monomer_cluster_assignments(
+    clustering_outdir: str | Path,
+    *,
+    include_structure: bool = True,
+) -> dict[str, dict[str, str]]:
     """Load monomer sequence / structure cluster assignments from clustering artifacts."""
 
     clustering_outdir = Path(clustering_outdir)
@@ -48,10 +52,8 @@ def load_monomer_cluster_assignments(clustering_outdir: str | Path) -> dict[str,
                     row.get("cluster_id", "") or ""
                 )
 
-    structure_membership = (
-        clustering_outdir / "structure_clusters" / "protein_structure_cluster_membership.csv"
-    )
-    if structure_membership.exists():
+    structure_membership = clustering_outdir / "structure_clusters" / "protein_structure_cluster_membership.csv"
+    if include_structure and structure_membership.exists():
         with structure_membership.open(encoding="utf-8", newline="") as handle:
             for row in csv.DictReader(handle):
                 member_monomer_id = str(row.get("member_monomer_id", "") or "")

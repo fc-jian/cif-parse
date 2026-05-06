@@ -100,6 +100,24 @@ Use `--no-cif-cache` to skip Phase 2 (atom caching) when only the Parquet files 
 
 ### Running Clustering
 
+For large runs, split clustering by stage. `seq` must run first because it writes `monomer_inventory.jsonl` and `sequence_clusters/membership.csv`; `structure` normally runs second because downstream high-order signatures use both sequence and structure cluster ids by default. After `seq + structure` complete, the high-order stages consume the same `--prep-dir` and `--outdir`; they are independent and can be submitted in parallel:
+
+```bash
+# Run first
+cif-parse-cluster seq --prep-dir clustering_prep --outdir cluster_outputs
+
+# Run second by default
+cif-parse-cluster structure --prep-dir clustering_prep --outdir cluster_outputs
+
+# After seq + structure, high-order stages can run in parallel:
+cif-parse-cluster dimer     --prep-dir clustering_prep --outdir cluster_outputs
+cif-parse-cluster multimer  --prep-dir clustering_prep --outdir cluster_outputs
+cif-parse-cluster tcr       --prep-dir clustering_prep --outdir cluster_outputs
+cif-parse-cluster abag      --prep-dir clustering_prep --outdir cluster_outputs
+```
+
+Pass `--ignore-structure` to a high-order stage only when you intentionally want signatures based on sequence cluster ids alone.
+
 Run monomer-only clustering:
 
 ```bash
@@ -135,7 +153,7 @@ Key clustering defaults:
 3. Protein monomer alignment coverage requires `aligned_length / shorter_length >= 0.80`.
 4. Dimer, multimer, antibody-antigen, and TCR-pMHC complex clustering default to signature clustering plus overall `USalign -mm 1 -ter 1` refinement with TM-score threshold `0.50`.
 5. Monomer extraction and structure clustering run in a **pipelined** mode: structures are extracted per sequence cluster on-the-fly while USalign runs on previously extracted clusters, overlapping I/O and computation.
-6. Higher-order clustering stages run serially after monomer clustering in this order: TCR-pMHC, antibody-antigen, multimer, dimer. Parallelism is kept inside each stage through `--usalign-jobs`, avoiding cross-stage oversubscription on large machines.
+6. The legacy full command now calls the split stages as `seq -> structure -> parallel(tcr, abag, multimer, dimer)`. For maximum throughput on a scheduler, run `seq` and `structure` first, then submit high-order stage subcommands in parallel.
 7. Higher-order structure refinement skips singleton signature groups: singletons are emitted directly as clusters without writing complex PDBs or running USalign.
 8. `--jobs N` automatically propagates to all subtask workers (`--mmseqs-threads`, `--sequence-cluster-jobs`, `--usalign-jobs`). Individual subtask counts can still be overridden explicitly.
 9. Use `--cif-files-directory` to override the location of original mmCIF files during structure extraction.

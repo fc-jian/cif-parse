@@ -945,8 +945,12 @@ def build_multimer_signature_clusters(
     alignment_jobs: int = 1,
     cif_files_directory: str | None = None,
     prep_dir: str | Path | None = None,
+    include_structure_assignments: bool = True,
 ) -> dict[str, Any]:
-    monomer_assignments = load_monomer_cluster_assignments(clustering_outdir)
+    monomer_assignments = load_monomer_cluster_assignments(
+        clustering_outdir,
+        include_structure=include_structure_assignments,
+    )
     observations = collect_multimer_observations(
         case_dirs, monomer_assignments,
         cif_files_directory=cif_files_directory,
