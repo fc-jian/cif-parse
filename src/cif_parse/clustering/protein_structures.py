@@ -317,7 +317,7 @@ def run_usalign_alignment(
     target: ExtractedMonomerStructure,
     *,
     usalign_executable: str = "USalign",
-    mol: str = "prot",
+    mol: str = "auto",
     tm_score_threshold: float = 0.50,
     min_alignment_coverage_ratio: float = 0.80,
 ) -> USalignAlignmentResult:

@@ -22,11 +22,12 @@ from cif_parse.clustering.common import (
     load_monomer_inventory,
     resolve_monomer_cluster,
 )
+from cif_parse.clustering.high_order_refinement import refine_signature_groups_greedy
 from cif_parse.clustering.protein_structures import (
     USalignAlignmentResult,
     parse_usalign_output,
 )
-from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
+from cif_parse.clustering.parallel import normalize_worker_count
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.io import read_cif_file
 from cif_parse.settings import resolve_source_path
@@ -176,10 +177,12 @@ def _pdb_chain_id(index: int) -> str:
     return PDB_CHAIN_IDS[index]
 
 
-def _select_chain_atoms(atom_array: AtomArray, chain_id: str) -> AtomArray:
+def _select_chain_atoms(atom_array: AtomArray, chain_id: str, sym_id: int | None = None) -> AtomArray:
     mask = atom_array.chain_id == chain_id
     if hasattr(atom_array, "hetero"):
         mask &= ~atom_array.hetero
+    if sym_id is not None and hasattr(atom_array, "sym_id"):
+        mask &= atom_array.sym_id == sym_id
     return atom_array[mask]
 
 
@@ -624,9 +627,43 @@ def extract_antibody_complex_structure(
                 use_author_fields=False,
             )
 
+    chain_ids = _structure_chain_ids(observation)
+    # In assembly mode, sym copies of the same chain exist. Pick one
+    # representative sym_id per chain so the extracted PDB only contains
+    # the complex members, not 60x copies of every chain.
+    chain_sym: dict[str, int | None] = {}
+    _has_sym = hasattr(atom_array, "sym_id")
+    for chain_id in chain_ids:
+        chain_mask = atom_array.chain_id == chain_id
+        if not chain_mask.any():
+            continue
+        if _has_sym:
+            chain_syms = frozenset(atom_array.sym_id[chain_mask])
+            if chain_syms:
+                chain_sym[chain_id] = min(chain_syms)
+            else:
+                chain_sym[chain_id] = None
+        else:
+            chain_sym[chain_id] = None
+
+    # Try to pick a common sym_id across all chains to keep the complex
+    # geometrically consistent.
+    sym_sets = [frozenset(atom_array.sym_id[atom_array.chain_id == cid])
+                for cid in chain_ids
+                if _has_sym and (atom_array.chain_id == cid).any()
+                and frozenset(atom_array.sym_id[atom_array.chain_id == cid])]
+    common_sym: int | None = None
+    if sym_sets:
+        common = sym_sets[0]
+        for s in sym_sets[1:]:
+            common = common & s
+        if common:
+            common_sym = min(common)
+
     chain_arrays: list[AtomArray] = []
-    for chain_index, chain_id in enumerate(_structure_chain_ids(observation)):
-        selected = _select_chain_atoms(atom_array, chain_id)
+    for chain_index, chain_id in enumerate(chain_ids):
+        sym = common_sym if common_sym is not None else chain_sym.get(chain_id)
+        selected = _select_chain_atoms(atom_array, chain_id, sym_id=sym)
         if selected.array_length() == 0:
             continue
         chain_arrays.append(_coerce_chain_id(selected, _pdb_chain_id(chain_index)))
@@ -833,7 +870,7 @@ def run_antibody_complex_usalign_alignment(
         query.extracted_pdb_path,
         target.extracted_pdb_path,
         "-mol",
-        "prot",
+        "auto",
         "-mm",
         "1",
         "-ter",
@@ -874,137 +911,57 @@ def refine_antibody_complex_signature_clusters(
             multi_member,
             alignment_jobs,
         )
-    alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}
-    alignment_rows: list[dict[str, Any]] = []
-    warning_rows: list[dict[str, Any]] = []
-    cluster_members: list[
-        tuple[str, str, list[AntibodyComplexObservation], AntibodyComplexObservation]
-    ] = []
-    num_alignment_runs = 0
-    num_alignment_failures = 0
-    num_signature_clusters_split = 0
-
-    signature_iter = (
+    signature_iter = list(
         tqdm(signature_groups, desc="Refining antibody complex clusters", unit="sig-group")
         if show_progress
         else signature_groups
     )
-    for signature_cluster_id, members in signature_iter:
-        extracted_members = [
-            member for member in members if member.complex_observation_id in extracted_structures
-        ]
-        unresolved_members = [
-            member for member in members if member.complex_observation_id not in extracted_structures
-        ]
-        local_clusters: list[
-            tuple[list[AntibodyComplexObservation], AntibodyComplexObservation]
-        ] = []
-        if extracted_members:
-            pending = sorted(extracted_members, key=lambda item: item.structural_sort_key())
-            while pending:
-                representative = pending[0]
-                assigned = [representative]
-                remaining: list[AntibodyComplexObservation] = []
-                alignment_tasks: list[AlignmentTask] = []
-                for candidate in pending[1:]:
-                    pair_key = tuple(
-                        sorted(
-                            (
-                                representative.complex_observation_id,
-                                candidate.complex_observation_id,
-                            )
-                        )
-                    )
-                    if pair_key not in alignment_cache:
-                        alignment_tasks.append(
-                            AlignmentTask(
-                                key=pair_key,
-                                query=extracted_structures[representative.complex_observation_id],
-                                target=extracted_structures[candidate.complex_observation_id],
-                                context={"candidate": candidate},
-                            )
-                        )
-                successes, failures = run_alignment_tasks(
-                    alignment_tasks,
-                    runner,
-                    max_workers=alignment_jobs,
-                    usalign_executable=usalign_executable,
-                    tm_score_threshold=tm_score_threshold,
-                )
-                failure_by_candidate_id = {
-                    task.context["candidate"].complex_observation_id: exc for task, exc in failures
-                }
-                for task, result in successes:
-                    alignment_cache[task.key] = result
-                success_keys = {task.key for task, _ in successes}
-                for candidate in pending[1:]:
-                    pair_key = tuple(
-                        sorted((representative.complex_observation_id, candidate.complex_observation_id))
-                    )
-                    if candidate.complex_observation_id in failure_by_candidate_id:
-                        exc = failure_by_candidate_id[candidate.complex_observation_id]
-                        num_alignment_failures += 1
-                        warning_rows.append(
-                            {
-                                "warning_code": "antibody_complex_usalign_failed",
-                                "signature_cluster_id": signature_cluster_id,
-                                "representative_complex_observation_id": representative.complex_observation_id,
-                                "candidate_complex_observation_id": candidate.complex_observation_id,
-                                "error": str(exc),
-                            }
-                        )
-                        remaining.append(candidate)
-                        continue
-                    result = alignment_cache[pair_key]
-                    if pair_key in success_keys:
-                        alignment_rows.append(
-                            {
-                                "signature_cluster_id": signature_cluster_id,
-                                "query_complex_observation_id": result.query_monomer_id,
-                                "target_complex_observation_id": result.target_monomer_id,
-                                "aligned_length": result.aligned_length,
-                                "rmsd": result.rmsd,
-                                "tm_score_query": result.tm_score_query,
-                                "tm_score_target": result.tm_score_target,
-                                "tm_score_min": result.min_tm_score,
-                                "tm_score_max": result.max_tm_score,
-                                "tm_score_for_clustering": result.max_tm_score,
-                            }
-                        )
-                        num_alignment_runs += 1
-                    if result.max_tm_score >= tm_score_threshold:
-                        assigned.append(candidate)
-                    else:
-                        remaining.append(candidate)
-                local_clusters.append((assigned, representative))
-                pending = remaining
-        elif members:
-            representative = min(members, key=lambda item: item.structural_sort_key())
-            local_clusters.append((list(members), representative))
-
-        if unresolved_members and extracted_members:
-            for unresolved in sorted(unresolved_members, key=lambda item: item.structural_sort_key()):
-                local_clusters.append(([unresolved], unresolved))
-                warning_rows.append(
-                    {
-                        "warning_code": "antibody_complex_structure_unavailable_singleton_cluster",
-                        "signature_cluster_id": signature_cluster_id,
-                        "complex_observation_id": unresolved.complex_observation_id,
-                    }
-                )
-
-        if len(local_clusters) > 1:
-            num_signature_clusters_split += 1
-
-        for members_in_cluster, representative in local_clusters:
-            cluster_members.append(
-                (
-                    signature_cluster_id,
-                    representative.complex_observation_id,
-                    sorted(members_in_cluster, key=lambda item: item.complex_observation_id),
-                    representative,
-                )
-            )
+    refined = refine_signature_groups_greedy(
+        signature_iter,
+        extracted_structures,
+        member_id=lambda item: item.complex_observation_id,
+        structural_sort_key=lambda item: item.structural_sort_key(),
+        alignment_row=lambda signature_cluster_id, result: {
+            "signature_cluster_id": signature_cluster_id,
+            "query_complex_observation_id": result.query_monomer_id,
+            "target_complex_observation_id": result.target_monomer_id,
+            "aligned_length": result.aligned_length,
+            "rmsd": result.rmsd,
+            "tm_score_query": result.tm_score_query,
+            "tm_score_target": result.tm_score_target,
+            "tm_score_min": result.min_tm_score,
+            "tm_score_max": result.max_tm_score,
+            "tm_score_for_clustering": result.max_tm_score,
+        },
+        alignment_failure_warning=lambda signature_cluster_id, representative, candidate, exc: {
+            "warning_code": "antibody_complex_usalign_failed",
+            "signature_cluster_id": signature_cluster_id,
+            "representative_complex_observation_id": representative.complex_observation_id,
+            "candidate_complex_observation_id": candidate.complex_observation_id,
+            "error": str(exc),
+        },
+        unavailable_warning=lambda signature_cluster_id, member: {
+            "warning_code": "antibody_complex_structure_unavailable_singleton_cluster",
+            "signature_cluster_id": signature_cluster_id,
+            "complex_observation_id": member.complex_observation_id,
+        },
+        runner=runner,
+        alignment_jobs=alignment_jobs,
+        usalign_executable=usalign_executable,
+        tm_score_threshold=tm_score_threshold,
+        can_skip_alignment=lambda a, b: (
+            a.source_path == b.source_path
+            and sorted(a.antibody_chain_ids) == sorted(b.antibody_chain_ids)
+            and sorted(a.antigen_chain_ids) == sorted(b.antigen_chain_ids)
+        ),
+    )
+    alignment_cache = refined.alignment_cache
+    alignment_rows = refined.alignment_rows
+    warning_rows = refined.warning_rows
+    cluster_members = refined.cluster_members
+    num_alignment_runs = refined.num_alignment_runs
+    num_alignment_failures = refined.num_alignment_failures
+    num_signature_clusters_split = refined.num_signature_clusters_split
 
     grouped_signature_sizes = {signature_cluster_id: 0 for signature_cluster_id, _ in signature_groups}
     for signature_cluster_id, _, _, _ in cluster_members:
@@ -1199,36 +1156,9 @@ def build_antibody_complex_signature_clusters(
         )
 
     if structure_refinement_mode == "greedy":
-        membership_rows = []
-        representative_rows = []
-        signature_rows = []
-        alignment_rows = []
-        warning_rows = []
-        refined_manifest = {
-            "num_antibody_complex_clusters": 0,
-            "num_signature_clusters": 0,
-            "num_alignment_runs": 0,
-            "num_alignment_failures": 0,
-            "num_signature_clusters_split": 0,
-            "alignment_jobs": normalize_worker_count(alignment_jobs),
-        }
+        extracted_structures: dict[str, ExtractedAntibodyComplexStructure] = {}
         structure_rows: list[dict[str, Any]] = []
         structure_failure_rows: list[dict[str, Any]] = []
-
-        def _merge_refined_group(refined_group: dict[str, Any]) -> None:
-            membership_rows.extend(refined_group["membership_rows"])
-            representative_rows.extend(refined_group["representative_rows"])
-            signature_rows.extend(refined_group["signature_rows"])
-            alignment_rows.extend(refined_group["alignment_rows"])
-            warning_rows.extend(refined_group["warning_rows"])
-            group_manifest = refined_group["manifest"]
-            refined_manifest["num_antibody_complex_clusters"] += group_manifest[
-                "num_antibody_complex_clusters"
-            ]
-            refined_manifest["num_signature_clusters"] += group_manifest["num_signature_clusters"]
-            refined_manifest["num_alignment_runs"] += group_manifest["num_alignment_runs"]
-            refined_manifest["num_alignment_failures"] += group_manifest["num_alignment_failures"]
-            refined_manifest["num_signature_clusters_split"] += group_manifest["num_signature_clusters_split"]
 
         def _record_extraction_result(
             structures: dict[str, ExtractedAntibodyComplexStructure],
@@ -1255,19 +1185,6 @@ def build_antibody_complex_signature_clusters(
             for signature_cluster_id, members in signature_groups
             if len(members) > 1
         ]
-        for signature_cluster_id, members in signature_groups:
-            if len(members) == 1:
-                refined_group = refine_antibody_complex_signature_clusters(
-                    [(signature_cluster_id, members)],
-                    {},
-                    tm_score_threshold=antibody_complex_tm_score_threshold,
-                    usalign_executable=usalign_executable,
-                    alignment_runner=alignment_runner,
-                    alignment_jobs=alignment_jobs,
-                    show_progress=False,
-                    log_summary=False,
-                )
-                _merge_refined_group(refined_group)
         if multi_member_groups:
             max_extract_workers = min(normalize_worker_count(alignment_jobs), len(multi_member_groups))
             with ThreadPoolExecutor(max_workers=max_extract_workers) as executor:
@@ -1289,18 +1206,25 @@ def build_antibody_complex_signature_clusters(
                 for future in as_completed(future_to_group):
                     signature_cluster_id, members, group_outdir = future_to_group[future]
                     structures, extract_manifest = future.result()
+                    extracted_structures.update(structures)
                     _record_extraction_result(structures, extract_manifest, group_outdir)
-                    refined_group = refine_antibody_complex_signature_clusters(
-                        [(signature_cluster_id, members)],
-                        structures,
-                        tm_score_threshold=antibody_complex_tm_score_threshold,
-                        usalign_executable=usalign_executable,
-                        alignment_runner=alignment_runner,
-                        alignment_jobs=alignment_jobs,
-                        show_progress=False,
-                        log_summary=False,
-                    )
-                    _merge_refined_group(refined_group)
+
+        refined = refine_antibody_complex_signature_clusters(
+            signature_groups,
+            extracted_structures,
+            tm_score_threshold=antibody_complex_tm_score_threshold,
+            usalign_executable=usalign_executable,
+            alignment_runner=alignment_runner,
+            alignment_jobs=alignment_jobs,
+            show_progress=True,
+            log_summary=True,
+        )
+        membership_rows = refined["membership_rows"]
+        representative_rows = refined["representative_rows"]
+        signature_rows = refined["signature_rows"]
+        alignment_rows = refined["alignment_rows"]
+        warning_rows = refined["warning_rows"]
+        refined_manifest = refined["manifest"]
 
         def _antibody_cluster_sort_key(cluster_id: str) -> tuple[int, int]:
             _, sig_idx, local_idx = cluster_id.split("_")

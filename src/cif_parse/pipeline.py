@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 import logging
 import pickle
@@ -234,6 +235,13 @@ def process_single_structure(
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
     if settings.assembly_mode != "all":
+        _dump_atom_cache(
+            outdir=outdir,
+            input_path=input_path,
+            assembly_mode=settings.assembly_mode,
+            selected_assembly_id=None,
+            model=settings.model,
+        )
         result = _process_single_structure_for_mode(
             input_path=input_path,
             outdir=outdir,
@@ -269,28 +277,62 @@ def process_single_structure(
     total_multimers = 0
     total_antibody_complexes = 0
     total_tcr_complexes = 0
-    for assembly_id in available_assembly_ids:
-        assembly_outdir, bundle_name = _resolve_all_mode_output_target(
-            outdir,
-            settings,
-            assembly_id,
-        )
-        assembly_result = _process_single_structure_for_mode(
-            input_path=input_path,
-            outdir=assembly_outdir,
-            settings=settings,
-            summary=summary,
-            chain_inventory=chain_inventory,
-            analysis_assembly_mode="all",
-            selected_assembly_id=assembly_id,
-            bundle_name=bundle_name,
-        )
-        assembly_results.append(assembly_result)
-        output_paths.extend(assembly_result["output_paths"])
-        total_dimers += int(assembly_result["num_dimers"])
-        total_multimers += int(assembly_result["num_multimers"])
-        total_antibody_complexes += int(assembly_result["num_antibody_antigen_complexes"])
-        total_tcr_complexes += int(assembly_result["num_tcr_pmhc_complexes"])
+
+    # Pre-cache asymmetric unit atoms (shared by all assemblies).
+    _dump_atom_cache_au(
+        outdir=outdir,
+        input_path=input_path,
+        model=settings.model,
+    )
+
+    assembly_jobs = getattr(settings, "jobs", 1) or 1
+    max_workers = max(1, min(assembly_jobs, len(available_assembly_ids)))
+    if max_workers > 1:
+        futures: dict[Any, str] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for assembly_id in available_assembly_ids:
+                assembly_outdir, bundle_name = _resolve_all_mode_output_target(
+                    outdir, settings, assembly_id
+                )
+                future = executor.submit(
+                    _process_single_assembly_parallel,
+                    input_path=input_path,
+                    outdir=assembly_outdir,
+                    settings=settings,
+                    summary=summary,
+                    chain_inventory=chain_inventory,
+                    selected_assembly_id=assembly_id,
+                    bundle_name=bundle_name,
+                )
+                futures[future] = assembly_id
+            for future in as_completed(futures):
+                assembly_result = future.result()
+                assembly_results.append(assembly_result)
+                output_paths.extend(assembly_result["output_paths"])
+                total_dimers += int(assembly_result["num_dimers"])
+                total_multimers += int(assembly_result["num_multimers"])
+                total_antibody_complexes += int(assembly_result["num_antibody_antigen_complexes"])
+                total_tcr_complexes += int(assembly_result["num_tcr_pmhc_complexes"])
+    else:
+        for assembly_id in available_assembly_ids:
+            assembly_outdir, bundle_name = _resolve_all_mode_output_target(
+                outdir, settings, assembly_id
+            )
+            assembly_result = _process_single_assembly_parallel(
+                input_path=input_path,
+                outdir=assembly_outdir,
+                settings=settings,
+                summary=summary,
+                chain_inventory=chain_inventory,
+                selected_assembly_id=assembly_id,
+                bundle_name=bundle_name,
+            )
+            assembly_results.append(assembly_result)
+            output_paths.extend(assembly_result["output_paths"])
+            total_dimers += int(assembly_result["num_dimers"])
+            total_multimers += int(assembly_result["num_multimers"])
+            total_antibody_complexes += int(assembly_result["num_antibody_antigen_complexes"])
+            total_tcr_complexes += int(assembly_result["num_tcr_pmhc_complexes"])
 
     LOGGER.info(
         "Finished %s across %d assemblies: %d chains, %d dimers, %d multimers, %d antibody complexes, %d TCR complexes",
@@ -317,6 +359,67 @@ def process_single_structure(
         "processed_assembly_ids": available_assembly_ids,
         "assembly_results": assembly_results,
     }
+
+
+def _dump_atom_cache_au(
+    *,
+    outdir: Path,
+    input_path: Path,
+    model: int,
+) -> None:
+    """Write the asymmetric unit atom cache (``atoms/_none.pkl``) once.
+
+    This must be called *before* parallel per-assembly processing so that
+    concurrent threads never race to write the same shared file.
+    """
+    atoms_dir = outdir / "atoms"
+    atoms_dir.mkdir(parents=True, exist_ok=True)
+    au_cache_path = atoms_dir / "_none.pkl"
+    if au_cache_path.exists():
+        return
+    try:
+        from biotite.structure.io.pdbx import get_structure
+        cif_file = read_cif_file(input_path)
+        atom_array = get_structure(cif_file, model=model, use_author_fields=False)
+        if atom_array is not None and len(atom_array) > 0:
+            au_cache_path.write_bytes(
+                zlib.compress(pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL), 3)
+            )
+    except Exception:
+        LOGGER.debug("Failed to cache asymmetric unit for %s", input_path)
+
+
+def _process_single_assembly_parallel(
+    *,
+    input_path: Path,
+    outdir: Path,
+    settings: Any,
+    summary: Any,
+    chain_inventory: list[Any],
+    selected_assembly_id: str,
+    bundle_name: str,
+) -> dict[str, Any]:
+    """Wrapper around ``_process_single_structure_for_mode`` for parallel use.
+
+    Handles the per-assembly atom cache write before delegating.
+    """
+    _dump_atom_cache(
+        outdir=outdir,
+        input_path=input_path,
+        assembly_mode="all",
+        selected_assembly_id=selected_assembly_id,
+        model=settings.model,
+    )
+    return _process_single_structure_for_mode(
+        input_path=input_path,
+        outdir=outdir,
+        settings=settings,
+        summary=summary,
+        chain_inventory=chain_inventory,
+        analysis_assembly_mode="all",
+        selected_assembly_id=selected_assembly_id,
+        bundle_name=bundle_name,
+    )
 
 
 def _resolve_all_mode_output_target(
@@ -410,13 +513,6 @@ def _process_single_structure_for_mode(
     selected_assembly_id: str | None,
     bundle_name: str,
 ) -> dict[str, Any]:
-    _dump_atom_cache(
-        outdir=outdir,
-        input_path=input_path,
-        assembly_mode=analysis_assembly_mode,
-        selected_assembly_id=selected_assembly_id,
-        model=settings.model,
-    )
     working_chain_inventory = deepcopy(chain_inventory)
     dimer_interfaces = identify_dimer_interfaces(
         input_path,

@@ -311,6 +311,12 @@ def build_parser(
         help="Minimum overall multimer max(TM(query,target), TM(target,query)) to keep two multimers together",
     )
     parser.add_argument(
+        "--multimer-max-atoms-for-refinement",
+        type=int,
+        default=int(clustering_defaults.get("multimer_max_atoms_for_refinement", 10_000)),
+        help="Skip USalign refinement for multimer signature groups containing any member with more than this many atoms",
+    )
+    parser.add_argument(
         "--antibody-complex-mode",
         choices=sorted(SUPPORTED_CLUSTERING_OBJECT_MODES),
         default=str(clustering_defaults.get("antibody_complex_mode", "signature")),
@@ -695,6 +701,7 @@ def _build_high_order_specs(args: argparse.Namespace, sequence_dataset: dict[str
             "outdir": args.outdir / "multimer_clusters",
             "structure_refinement_mode": args.multimer_structure_mode,
             "multimer_tm_score_threshold": args.multimer_tm_score_threshold,
+            "max_atoms_for_refinement": args.multimer_max_atoms_for_refinement,
         }))
     if args.dimer_mode == "signature":
         specs.append(("dimer", {

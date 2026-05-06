@@ -21,11 +21,12 @@ from cif_parse.clustering.common import (
     load_monomer_cluster_assignments,
     resolve_monomer_cluster,
 )
+from cif_parse.clustering.high_order_refinement import refine_signature_groups_greedy
 from cif_parse.clustering.protein_structures import (
     USalignAlignmentResult,
     parse_usalign_output,
 )
-from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
+from cif_parse.clustering.parallel import normalize_worker_count
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.io import read_assembly_chain_operations, read_cif_file
 from cif_parse.settings import resolve_source_path
@@ -645,7 +646,7 @@ def run_multimer_usalign_alignment(
         query.extracted_pdb_path,
         target.extracted_pdb_path,
         "-mol",
-        "prot",
+        "auto",
         "-mm",
         "1",
         "-ter",
@@ -673,147 +674,133 @@ def refine_multimer_signature_clusters(
     alignment_jobs: int = 1,
     show_progress: bool = True,
     log_summary: bool = True,
+    max_atoms_for_refinement: int | None = 10_000,
 ) -> dict[str, Any]:
     runner = alignment_runner or run_multimer_usalign_alignment
     alignment_jobs = normalize_worker_count(alignment_jobs)
+
+    # Split signature groups: skip USalign refinement for groups where any
+    # member is too large (e.g. viral capsids with 10k+ atoms).
+    small_groups: list[tuple[str, list[MultimerObservation]]] = []
+    large_groups: list[tuple[str, list[MultimerObservation]]] = []
+    if max_atoms_for_refinement is not None:
+        for sig_id, members in signature_groups:
+            if any(
+                (s := extracted_structures.get(m.multimer_observation_id)) is not None
+                and s.atom_count > max_atoms_for_refinement
+                for m in members
+            ):
+                large_groups.append((sig_id, members))
+            else:
+                small_groups.append((sig_id, members))
+    else:
+        small_groups = list(signature_groups)
+
     total_observations = sum(len(members) for _, members in signature_groups)
     multi_member = sum(1 for _, m in signature_groups if len(m) > 1)
     if log_summary:
-        LOGGER.info(
-            "Refining %d multimer signature clusters (%d observations, %d multi-member, %d alignment workers)",
-            len(signature_groups),
-            total_observations,
-            multi_member,
-            alignment_jobs,
-        )
-    alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}
-    alignment_rows: list[dict[str, Any]] = []
-    warning_rows: list[dict[str, Any]] = []
-    cluster_members: list[tuple[str, str, list[MultimerObservation], MultimerObservation]] = []
-    num_alignment_runs = 0
-    num_alignment_failures = 0
-    num_signature_clusters_split = 0
+        parts = [f"Refining {len(small_groups)} multimer signature clusters"]
+        if large_groups:
+            parts.append(f"{len(large_groups)} skipped (too large, kept as single clusters)")
+        parts.append(f"({total_observations} observations, {multi_member} multi-member, {alignment_jobs} alignment workers)")
+        LOGGER.info(", ".join(parts))
 
-    signature_iter = (
-        tqdm(signature_groups, desc="Refining multimer clusters", unit="sig-group")
-        if show_progress
-        else signature_groups
-    )
-    for signature_cluster_id, members in signature_iter:
-        extracted_members = [
-            member for member in members if member.multimer_observation_id in extracted_structures
-        ]
-        unresolved_members = [
-            member for member in members if member.multimer_observation_id not in extracted_structures
-        ]
+    # Pre-populate cluster_members for large groups (no USalign, one cluster each).
+    large_cluster_members: list[tuple[str, str, list[Any], Any]] = []
+    large_warning_rows: list[dict[str, Any]] = []
+    for sig_id, members in large_groups:
+        extracted = [m for m in members if m.multimer_observation_id in extracted_structures]
+        representative = max(extracted, key=lambda m: (extracted_structures[m.multimer_observation_id].atom_count), default=extracted[0] if extracted else members[0])
+        large_cluster_members.append((sig_id, representative.multimer_observation_id, sorted(members, key=lambda m: m.multimer_observation_id), representative))
+        for m in members:
+            if m.multimer_observation_id not in extracted_structures:
+                large_warning_rows.append({
+                    "warning_code": "multimer_structure_unavailable_single_cluster",
+                    "signature_cluster_id": sig_id,
+                    "multimer_observation_id": m.multimer_observation_id,
+                })
 
-        local_clusters: list[tuple[list[MultimerObservation], MultimerObservation]] = []
-        if extracted_members:
-            pending = sorted(extracted_members, key=lambda item: item.structural_sort_key())
-            while pending:
-                representative = pending[0]
-                assigned = [representative]
-                remaining: list[MultimerObservation] = []
-                alignment_tasks: list[AlignmentTask] = []
-                for candidate in pending[1:]:
-                    pair_key = tuple(
-                        sorted(
-                            (
-                                representative.multimer_observation_id,
-                                candidate.multimer_observation_id,
-                            )
-                        )
-                    )
-                    if pair_key not in alignment_cache:
-                        alignment_tasks.append(
-                            AlignmentTask(
-                                key=pair_key,
-                                query=extracted_structures[representative.multimer_observation_id],
-                                target=extracted_structures[candidate.multimer_observation_id],
-                                context={"candidate": candidate},
-                            )
-                        )
-                successes, failures = run_alignment_tasks(
-                    alignment_tasks,
-                    runner,
-                    max_workers=alignment_jobs,
-                    usalign_executable=usalign_executable,
-                    tm_score_threshold=tm_score_threshold,
-                )
-                failure_by_candidate_id = {
-                    task.context["candidate"].multimer_observation_id: exc for task, exc in failures
-                }
-                for task, result in successes:
-                    alignment_cache[task.key] = result
-                success_keys = {task.key for task, _ in successes}
-                for candidate in pending[1:]:
-                    pair_key = tuple(
-                        sorted((representative.multimer_observation_id, candidate.multimer_observation_id))
-                    )
-                    if candidate.multimer_observation_id in failure_by_candidate_id:
-                        exc = failure_by_candidate_id[candidate.multimer_observation_id]
-                        num_alignment_failures += 1
-                        warning_rows.append(
-                            {
-                                "warning_code": "multimer_usalign_failed",
-                                "signature_cluster_id": signature_cluster_id,
-                                "representative_multimer_observation_id": representative.multimer_observation_id,
-                                "candidate_multimer_observation_id": candidate.multimer_observation_id,
-                                "error": str(exc),
-                            }
-                        )
-                        remaining.append(candidate)
-                        continue
-                    result = alignment_cache[pair_key]
-                    if pair_key in success_keys:
-                        alignment_rows.append(
-                            {
-                                "signature_cluster_id": signature_cluster_id,
-                                "query_multimer_observation_id": result.query_monomer_id,
-                                "target_multimer_observation_id": result.target_monomer_id,
-                                "aligned_length": result.aligned_length,
-                                "rmsd": result.rmsd,
-                                "tm_score_query": result.tm_score_query,
-                                "tm_score_target": result.tm_score_target,
-                                "tm_score_min": result.min_tm_score,
-                                "tm_score_max": result.max_tm_score,
-                                "tm_score_for_clustering": result.max_tm_score,
-                            }
-                        )
-                        num_alignment_runs += 1
-                    if result.max_tm_score >= tm_score_threshold:
-                        assigned.append(candidate)
-                    else:
-                        remaining.append(candidate)
-                local_clusters.append((assigned, representative))
-                pending = remaining
-        elif members:
-            representative = min(members, key=lambda item: item.structural_sort_key())
-            local_clusters.append((list(members), representative))
-
-        if unresolved_members and extracted_members:
-            for unresolved in sorted(unresolved_members, key=lambda item: item.structural_sort_key()):
-                local_clusters.append(([unresolved], unresolved))
-                warning_rows.append(
-                    {
-                        "warning_code": "multimer_structure_unavailable_singleton_cluster",
-                        "signature_cluster_id": signature_cluster_id,
-                        "multimer_observation_id": unresolved.multimer_observation_id,
-                    }
-                )
-
-        if len(local_clusters) > 1:
-            num_signature_clusters_split += 1
-
-        for members_in_cluster, representative in local_clusters:
-            cluster_members.append(
-                (
-                    signature_cluster_id,
-                    representative.multimer_observation_id,
-                    sorted(members_in_cluster, key=lambda item: item.multimer_observation_id),
-                    representative,
-                )
+    if not small_groups:
+        manifest = {
+            "num_signature_clusters": len(signature_groups),
+            "num_multimer_clusters": len(large_cluster_members),
+            "num_alignment_runs": 0,
+            "num_alignment_failures": 0,
+            "num_signature_clusters_split": 0,
+            "multimer_tm_score_threshold": tm_score_threshold,
+            "alignment_jobs": alignment_jobs,
+        }
+        if log_summary:
+            LOGGER.info(
+                "Multimer refinement: %d signature clusters -> %d refined clusters (0 alignments, 0 failures, 0 splits — all skipped: too large)",
+                len(signature_groups),
+                len(large_cluster_members),
             )
+        return {
+            "manifest": manifest,
+            "alignment_cache": {},
+            "alignment_rows": [],
+            "warning_rows": large_warning_rows,
+            "cluster_members": large_cluster_members,
+            "num_alignment_runs": 0,
+            "num_alignment_failures": 0,
+            "num_signature_clusters_split": 0,
+            "membership_rows": [],
+            "representative_rows": [],
+            "signature_rows": [],
+            "grouped_signature_sizes": {sig_id: len(members) for sig_id, members in large_groups},
+        }
+
+    signature_iter = list(
+        tqdm(small_groups, desc="Refining multimer clusters", unit="sig-group")
+        if show_progress
+        else small_groups
+    )
+    refined = refine_signature_groups_greedy(
+        signature_iter,
+        extracted_structures,
+        member_id=lambda item: item.multimer_observation_id,
+        structural_sort_key=lambda item: item.structural_sort_key(),
+        alignment_row=lambda signature_cluster_id, result: {
+            "signature_cluster_id": signature_cluster_id,
+            "query_multimer_observation_id": result.query_monomer_id,
+            "target_multimer_observation_id": result.target_monomer_id,
+            "aligned_length": result.aligned_length,
+            "rmsd": result.rmsd,
+            "tm_score_query": result.tm_score_query,
+            "tm_score_target": result.tm_score_target,
+            "tm_score_min": result.min_tm_score,
+            "tm_score_max": result.max_tm_score,
+            "tm_score_for_clustering": result.max_tm_score,
+        },
+        alignment_failure_warning=lambda signature_cluster_id, representative, candidate, exc: {
+            "warning_code": "multimer_usalign_failed",
+            "signature_cluster_id": signature_cluster_id,
+            "representative_multimer_observation_id": representative.multimer_observation_id,
+            "candidate_multimer_observation_id": candidate.multimer_observation_id,
+            "error": str(exc),
+        },
+        unavailable_warning=lambda signature_cluster_id, member: {
+            "warning_code": "multimer_structure_unavailable_singleton_cluster",
+            "signature_cluster_id": signature_cluster_id,
+            "multimer_observation_id": member.multimer_observation_id,
+        },
+        runner=runner,
+        alignment_jobs=alignment_jobs,
+        usalign_executable=usalign_executable,
+        tm_score_threshold=tm_score_threshold,
+        can_skip_alignment=lambda a, b: (
+            a.source_path == b.source_path
+            and sorted(a.member_chain_ids) == sorted(b.member_chain_ids)
+        ),
+    )
+    alignment_cache = refined.alignment_cache
+    alignment_rows = refined.alignment_rows
+    warning_rows = refined.warning_rows + large_warning_rows
+    cluster_members = refined.cluster_members + large_cluster_members
+    num_alignment_runs = refined.num_alignment_runs
+    num_alignment_failures = refined.num_alignment_failures
+    num_signature_clusters_split = refined.num_signature_clusters_split
 
     membership_rows: list[dict[str, Any]] = []
     representative_rows: list[dict[str, Any]] = []
@@ -946,6 +933,7 @@ def build_multimer_signature_clusters(
     cif_files_directory: str | None = None,
     prep_dir: str | Path | None = None,
     include_structure_assignments: bool = True,
+    max_atoms_for_refinement: int | None = 10_000,
 ) -> dict[str, Any]:
     monomer_assignments = load_monomer_cluster_assignments(
         clustering_outdir,
@@ -998,34 +986,9 @@ def build_multimer_signature_clusters(
         )
 
     if structure_refinement_mode == "greedy":
-        membership_rows = []
-        representative_rows = []
-        signature_rows = []
-        alignment_rows = []
-        warning_rows = []
-        refined_manifest = {
-            "num_multimer_clusters": 0,
-            "num_signature_clusters": 0,
-            "num_alignment_runs": 0,
-            "num_alignment_failures": 0,
-            "num_signature_clusters_split": 0,
-            "alignment_jobs": normalize_worker_count(alignment_jobs),
-        }
+        extracted_structures: dict[str, ExtractedMultimerStructure] = {}
         structure_rows: list[dict[str, Any]] = []
         structure_failure_rows: list[dict[str, Any]] = []
-
-        def _merge_refined_group(refined_group: dict[str, Any]) -> None:
-            membership_rows.extend(refined_group["membership_rows"])
-            representative_rows.extend(refined_group["representative_rows"])
-            signature_rows.extend(refined_group["signature_rows"])
-            alignment_rows.extend(refined_group["alignment_rows"])
-            warning_rows.extend(refined_group["warning_rows"])
-            group_manifest = refined_group["manifest"]
-            refined_manifest["num_multimer_clusters"] += group_manifest["num_multimer_clusters"]
-            refined_manifest["num_signature_clusters"] += group_manifest["num_signature_clusters"]
-            refined_manifest["num_alignment_runs"] += group_manifest["num_alignment_runs"]
-            refined_manifest["num_alignment_failures"] += group_manifest["num_alignment_failures"]
-            refined_manifest["num_signature_clusters_split"] += group_manifest["num_signature_clusters_split"]
 
         def _record_extraction_result(
             structures: dict[str, ExtractedMultimerStructure],
@@ -1052,19 +1015,6 @@ def build_multimer_signature_clusters(
             for signature_cluster_id, members in signature_groups
             if len(members) > 1
         ]
-        for signature_cluster_id, members in signature_groups:
-            if len(members) == 1:
-                refined_group = refine_multimer_signature_clusters(
-                    [(signature_cluster_id, members)],
-                    {},
-                    tm_score_threshold=multimer_tm_score_threshold,
-                    usalign_executable=usalign_executable,
-                    alignment_runner=alignment_runner,
-                    alignment_jobs=alignment_jobs,
-                    show_progress=False,
-                    log_summary=False,
-                )
-                _merge_refined_group(refined_group)
         if multi_member_groups:
             max_extract_workers = min(normalize_worker_count(alignment_jobs), len(multi_member_groups))
             with ThreadPoolExecutor(max_workers=max_extract_workers) as executor:
@@ -1086,18 +1036,26 @@ def build_multimer_signature_clusters(
                 for future in as_completed(future_to_group):
                     signature_cluster_id, members, group_outdir = future_to_group[future]
                     structures, extract_manifest = future.result()
+                    extracted_structures.update(structures)
                     _record_extraction_result(structures, extract_manifest, group_outdir)
-                    refined_group = refine_multimer_signature_clusters(
-                        [(signature_cluster_id, members)],
-                        structures,
-                        tm_score_threshold=multimer_tm_score_threshold,
-                        usalign_executable=usalign_executable,
-                        alignment_runner=alignment_runner,
-                        alignment_jobs=alignment_jobs,
-                        show_progress=False,
-                        log_summary=False,
-                    )
-                    _merge_refined_group(refined_group)
+
+        refined = refine_multimer_signature_clusters(
+            signature_groups,
+            extracted_structures,
+            tm_score_threshold=multimer_tm_score_threshold,
+            usalign_executable=usalign_executable,
+            alignment_runner=alignment_runner,
+            alignment_jobs=alignment_jobs,
+            show_progress=True,
+            log_summary=True,
+            max_atoms_for_refinement=max_atoms_for_refinement,
+        )
+        membership_rows = refined["membership_rows"]
+        representative_rows = refined["representative_rows"]
+        signature_rows = refined["signature_rows"]
+        alignment_rows = refined["alignment_rows"]
+        warning_rows = refined["warning_rows"]
+        refined_manifest = refined["manifest"]
 
         def _multimer_cluster_sort_key(cluster_id: str) -> tuple[int, int]:
             _, sig_idx, local_idx = cluster_id.split("_")

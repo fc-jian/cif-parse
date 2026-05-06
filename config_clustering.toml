@@ -50,6 +50,12 @@ multimer_structure_mode = "greedy"
 # Allowed values: float in [0, 1].
 multimer_tm_score_threshold = 0.50
 
+# Skip USalign structure refinement for multimer signature groups that contain
+# any member exceeding this atom count. Large multimers (e.g. viral capsids)
+# are kept as a single cluster without pairwise USalign.
+# Allowed values: integer >= 1.
+multimer_max_atoms_for_refinement = 10000
+
 # Antibody-antigen complex clustering mode.
 # Options:
 # - "skip": do not cluster antibody-antigen complexes.

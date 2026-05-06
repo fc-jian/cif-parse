@@ -21,11 +21,12 @@ from cif_parse.clustering.common import (
     load_monomer_cluster_assignments as _load_monomer_cluster_assignments,
     resolve_monomer_cluster as _common_resolve_monomer_cluster,
 )
+from cif_parse.clustering.high_order_refinement import refine_signature_groups_greedy
 from cif_parse.clustering.protein_structures import (
     USalignAlignmentResult,
     parse_usalign_output,
 )
-from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
+from cif_parse.clustering.parallel import normalize_worker_count
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.io import read_cif_file
 from cif_parse.settings import resolve_source_path
@@ -578,7 +579,7 @@ def run_dimer_usalign_alignment(
         query.extracted_pdb_path,
         target.extracted_pdb_path,
         "-mol",
-        "prot",
+        "auto",
         "-mm",
         "1",
         "-ter",
@@ -609,13 +610,6 @@ def refine_dimer_signature_clusters(
 ) -> dict[str, Any]:
     runner = alignment_runner or run_dimer_usalign_alignment
     alignment_jobs = normalize_worker_count(alignment_jobs)
-    alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}
-    alignment_rows: list[dict[str, Any]] = []
-    warning_rows: list[dict[str, Any]] = []
-    cluster_members: list[tuple[str, str, list[DimerObservation], DimerObservation]] = []
-    num_alignment_runs = 0
-    num_alignment_failures = 0
-    num_signature_clusters_split = 0
 
     total_observations = sum(len(members) for _, members in signature_groups)
     multi_member = sum(1 for _, m in signature_groups if len(m) > 1)
@@ -627,121 +621,56 @@ def refine_dimer_signature_clusters(
             multi_member,
             alignment_jobs,
         )
-    signature_iter = (
+    signature_iter = list(
         tqdm(signature_groups, desc="Refining dimer clusters", unit="sig-group")
         if show_progress
         else signature_groups
     )
-    for signature_cluster_id, members in signature_iter:
-        extracted_members = [
-            member for member in members if member.dimer_observation_id in extracted_structures
-        ]
-        unresolved_members = [
-            member for member in members if member.dimer_observation_id not in extracted_structures
-        ]
-
-        local_clusters: list[tuple[list[DimerObservation], DimerObservation]] = []
-        if extracted_members:
-            pending = sorted(extracted_members, key=lambda item: item.structural_sort_key())
-            while pending:
-                representative = pending[0]
-                assigned = [representative]
-                remaining: list[DimerObservation] = []
-                alignment_tasks: list[AlignmentTask] = []
-                for candidate in pending[1:]:
-                    pair_key = tuple(
-                        sorted((representative.dimer_observation_id, candidate.dimer_observation_id))
-                    )
-                    if pair_key not in alignment_cache:
-                        alignment_tasks.append(
-                            AlignmentTask(
-                                key=pair_key,
-                                query=extracted_structures[representative.dimer_observation_id],
-                                target=extracted_structures[candidate.dimer_observation_id],
-                                context={"candidate": candidate},
-                            )
-                        )
-                successes, failures = run_alignment_tasks(
-                    alignment_tasks,
-                    runner,
-                    max_workers=alignment_jobs,
-                    usalign_executable=usalign_executable,
-                    tm_score_threshold=tm_score_threshold,
-                )
-                failure_by_candidate_id = {
-                    task.context["candidate"].dimer_observation_id: exc for task, exc in failures
-                }
-                for task, result in successes:
-                    alignment_cache[task.key] = result
-                success_keys = {task.key for task, _ in successes}
-                for candidate in pending[1:]:
-                    pair_key = tuple(
-                        sorted((representative.dimer_observation_id, candidate.dimer_observation_id))
-                    )
-                    if candidate.dimer_observation_id in failure_by_candidate_id:
-                        exc = failure_by_candidate_id[candidate.dimer_observation_id]
-                        num_alignment_failures += 1
-                        warning_rows.append(
-                            {
-                                "warning_code": "dimer_usalign_failed",
-                                "signature_cluster_id": signature_cluster_id,
-                                "representative_dimer_observation_id": representative.dimer_observation_id,
-                                "candidate_dimer_observation_id": candidate.dimer_observation_id,
-                                "error": str(exc),
-                            }
-                        )
-                        remaining.append(candidate)
-                        continue
-                    result = alignment_cache[pair_key]
-                    if pair_key in success_keys:
-                        alignment_rows.append(
-                            {
-                                "signature_cluster_id": signature_cluster_id,
-                                "query_dimer_observation_id": result.query_monomer_id,
-                                "target_dimer_observation_id": result.target_monomer_id,
-                                "aligned_length": result.aligned_length,
-                                "rmsd": result.rmsd,
-                                "tm_score_query": result.tm_score_query,
-                                "tm_score_target": result.tm_score_target,
-                                "tm_score_min": result.min_tm_score,
-                                "tm_score_max": result.max_tm_score,
-                                "tm_score_for_clustering": result.max_tm_score,
-                            }
-                        )
-                        num_alignment_runs += 1
-                    if result.max_tm_score >= tm_score_threshold:
-                        assigned.append(candidate)
-                    else:
-                        remaining.append(candidate)
-                local_clusters.append((assigned, representative))
-                pending = remaining
-        elif members:
-            representative = min(members, key=lambda item: item.structural_sort_key())
-            local_clusters.append((list(members), representative))
-
-        if unresolved_members and extracted_members:
-            for unresolved in sorted(unresolved_members, key=lambda item: item.structural_sort_key()):
-                local_clusters.append(([unresolved], unresolved))
-                warning_rows.append(
-                    {
-                        "warning_code": "dimer_structure_unavailable_singleton_cluster",
-                        "signature_cluster_id": signature_cluster_id,
-                        "dimer_observation_id": unresolved.dimer_observation_id,
-                    }
-                )
-
-        if len(local_clusters) > 1:
-            num_signature_clusters_split += 1
-
-        for members_in_cluster, representative in local_clusters:
-            cluster_members.append(
-                (
-                    signature_cluster_id,
-                    representative.dimer_observation_id,
-                    sorted(members_in_cluster, key=lambda item: item.dimer_observation_id),
-                    representative,
-                )
-            )
+    refined = refine_signature_groups_greedy(
+        signature_iter,
+        extracted_structures,
+        member_id=lambda item: item.dimer_observation_id,
+        structural_sort_key=lambda item: item.structural_sort_key(),
+        alignment_row=lambda signature_cluster_id, result: {
+            "signature_cluster_id": signature_cluster_id,
+            "query_dimer_observation_id": result.query_monomer_id,
+            "target_dimer_observation_id": result.target_monomer_id,
+            "aligned_length": result.aligned_length,
+            "rmsd": result.rmsd,
+            "tm_score_query": result.tm_score_query,
+            "tm_score_target": result.tm_score_target,
+            "tm_score_min": result.min_tm_score,
+            "tm_score_max": result.max_tm_score,
+            "tm_score_for_clustering": result.max_tm_score,
+        },
+        alignment_failure_warning=lambda signature_cluster_id, representative, candidate, exc: {
+            "warning_code": "dimer_usalign_failed",
+            "signature_cluster_id": signature_cluster_id,
+            "representative_dimer_observation_id": representative.dimer_observation_id,
+            "candidate_dimer_observation_id": candidate.dimer_observation_id,
+            "error": str(exc),
+        },
+        unavailable_warning=lambda signature_cluster_id, member: {
+            "warning_code": "dimer_structure_unavailable_singleton_cluster",
+            "signature_cluster_id": signature_cluster_id,
+            "dimer_observation_id": member.dimer_observation_id,
+        },
+        runner=runner,
+        alignment_jobs=alignment_jobs,
+        usalign_executable=usalign_executable,
+        tm_score_threshold=tm_score_threshold,
+        can_skip_alignment=lambda a, b: (
+            a.source_path == b.source_path
+            and {a.label_asym_id_1, a.label_asym_id_2} == {b.label_asym_id_1, b.label_asym_id_2}
+        ),
+    )
+    alignment_cache = refined.alignment_cache
+    alignment_rows = refined.alignment_rows
+    warning_rows = refined.warning_rows
+    cluster_members = refined.cluster_members
+    num_alignment_runs = refined.num_alignment_runs
+    num_alignment_failures = refined.num_alignment_failures
+    num_signature_clusters_split = refined.num_signature_clusters_split
 
     grouped_signature_sizes = {signature_cluster_id: 0 for signature_cluster_id, _ in signature_groups}
     for signature_cluster_id, _, _, _ in cluster_members:
@@ -939,34 +868,8 @@ def build_dimer_signature_clusters(
         )
 
     if structure_refinement_mode == "greedy":
-        membership_rows = []
-        representative_rows = []
-        signature_rows = []
-        alignment_rows = []
-        warning_rows = []
-        refined_manifest = {
-            "num_dimer_clusters": 0,
-            "num_signature_clusters": 0,
-            "num_alignment_runs": 0,
-            "num_alignment_failures": 0,
-            "num_signature_clusters_split": 0,
-            "alignment_jobs": normalize_worker_count(alignment_jobs),
-        }
         structure_rows: list[dict[str, Any]] = []
         structure_failure_rows: list[dict[str, Any]] = []
-
-        def _merge_refined_group(refined_group: dict[str, Any]) -> None:
-            membership_rows.extend(refined_group["membership_rows"])
-            representative_rows.extend(refined_group["representative_rows"])
-            signature_rows.extend(refined_group["signature_rows"])
-            alignment_rows.extend(refined_group["alignment_rows"])
-            warning_rows.extend(refined_group["warning_rows"])
-            group_manifest = refined_group["manifest"]
-            refined_manifest["num_dimer_clusters"] += group_manifest["num_dimer_clusters"]
-            refined_manifest["num_signature_clusters"] += group_manifest["num_signature_clusters"]
-            refined_manifest["num_alignment_runs"] += group_manifest["num_alignment_runs"]
-            refined_manifest["num_alignment_failures"] += group_manifest["num_alignment_failures"]
-            refined_manifest["num_signature_clusters_split"] += group_manifest["num_signature_clusters_split"]
 
         def _record_extraction_result(
             structures: dict[str, ExtractedDimerStructure],
@@ -993,19 +896,6 @@ def build_dimer_signature_clusters(
             for signature_cluster_id, members in signature_groups
             if len(members) > 1
         ]
-        for signature_cluster_id, members in signature_groups:
-            if len(members) == 1:
-                refined_group = refine_dimer_signature_clusters(
-                    [(signature_cluster_id, members)],
-                    {},
-                    tm_score_threshold=dimer_tm_score_threshold,
-                    usalign_executable=usalign_executable,
-                    alignment_runner=alignment_runner,
-                    alignment_jobs=alignment_jobs,
-                    show_progress=False,
-                    log_summary=False,
-                )
-                _merge_refined_group(refined_group)
         if multi_member_groups:
             max_extract_workers = min(normalize_worker_count(alignment_jobs), len(multi_member_groups))
             with ThreadPoolExecutor(max_workers=max_extract_workers) as executor:
@@ -1027,18 +917,25 @@ def build_dimer_signature_clusters(
                 for future in as_completed(future_to_group):
                     signature_cluster_id, members, group_outdir = future_to_group[future]
                     structures, extract_manifest = future.result()
+                    extracted_structures.update(structures)
                     _record_extraction_result(structures, extract_manifest, group_outdir)
-                    refined_group = refine_dimer_signature_clusters(
-                        [(signature_cluster_id, members)],
-                        structures,
-                        tm_score_threshold=dimer_tm_score_threshold,
-                        usalign_executable=usalign_executable,
-                        alignment_runner=alignment_runner,
-                        alignment_jobs=alignment_jobs,
-                        show_progress=False,
-                        log_summary=False,
-                    )
-                    _merge_refined_group(refined_group)
+
+        refined = refine_dimer_signature_clusters(
+            signature_groups,
+            extracted_structures,
+            tm_score_threshold=dimer_tm_score_threshold,
+            usalign_executable=usalign_executable,
+            alignment_runner=alignment_runner,
+            alignment_jobs=alignment_jobs,
+            show_progress=True,
+            log_summary=True,
+        )
+        membership_rows = refined["membership_rows"]
+        representative_rows = refined["representative_rows"]
+        signature_rows = refined["signature_rows"]
+        alignment_rows = refined["alignment_rows"]
+        warning_rows = refined["warning_rows"]
+        refined_manifest = refined["manifest"]
 
         def _dimer_cluster_sort_key(cluster_id: str) -> tuple[int, int]:
             _, sig_idx, local_idx = cluster_id.split("_")
