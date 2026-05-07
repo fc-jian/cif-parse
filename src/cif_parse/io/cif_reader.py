@@ -67,6 +67,40 @@ def read_structure_preflight(path: str | Path) -> dict[str, Any]:
     }
 
 
+def preflight_assembly_atom_counts(path: str | Path) -> dict[str, int]:
+    """Estimate atom count per assembly by scanning ``atom_site`` + ``pdbx_struct_assembly_gen``.
+
+    Reads only the ``label_asym_id`` column (no coordinate parsing) and multiplies
+    chain atom counts by the assembly copy number.  Returns ``{assembly_id: atom_count}``.
+    """
+    cif_path = Path(path)
+    cif_file = read_cif_file(cif_path)
+    block = cif_file[_default_block_name(cif_file)]
+
+    chain_atom_counts: dict[str, int] = defaultdict(int)
+    if "atom_site" in block and "label_asym_id" in block["atom_site"]:
+        for val in block["atom_site"]["label_asym_id"].as_array():
+            label = str(val).strip() if val is not None else ""
+            if label:
+                chain_atom_counts[label] += 1
+
+    assembly_atoms: dict[str, int] = {}
+    for row in _category_rows(cif_file, "pdbx_struct_assembly_gen"):
+        assembly_id = row.get("assembly_id")
+        asym_id_list = row.get("asym_id_list")
+        oper_expr = row.get("oper_expression")
+        if not assembly_id or not asym_id_list:
+            continue
+        copies = count_oper_expression_copies(oper_expr)
+        total = 0
+        for asym_id in (a.strip() for a in asym_id_list.split(",") if a.strip()):
+            total += chain_atom_counts.get(asym_id, 0) * copies
+        if total > 0:
+            assembly_atoms[assembly_id] = total
+
+    return assembly_atoms
+
+
 @contextmanager
 def _open_cif_text(path: Path) -> Iterator[TextIO]:
     if path.suffix == ".gz":

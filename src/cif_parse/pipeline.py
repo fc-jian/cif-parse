@@ -210,6 +210,8 @@ def process_single_structure(
     input_path: str | Path,
     outdir: str | Path,
     settings: AppSettings,
+    *,
+    _preflight_assembly_atoms: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Run the full processing pipeline for one structure and persist outputs."""
 
@@ -271,6 +273,44 @@ def process_single_structure(
             details={"assembly_ids": []},
         )
 
+    # Read or use preflight atom counts for skip + scheduling.
+    atom_counts = _preflight_assembly_atoms
+    if atom_counts is None:
+        try:
+            from cif_parse.io.cif_reader import preflight_assembly_atom_counts
+            atom_counts = preflight_assembly_atom_counts(input_path)
+        except Exception:
+            atom_counts = {}
+
+    max_assembly_atoms = getattr(settings, "max_assembly_atoms", None)
+    if max_assembly_atoms is not None and max_assembly_atoms > 0:
+        skipped_large = [
+            aid for aid in available_assembly_ids
+            if atom_counts.get(aid, 0) > max_assembly_atoms
+        ]
+        if skipped_large:
+            LOGGER.warning(
+                "Skipping %d assembly(s) in %s exceeding %d atoms: %s",
+                len(skipped_large), summary.pdb_id,
+                max_assembly_atoms, ", ".join(skipped_large),
+            )
+        assembly_ids = [
+            aid for aid in available_assembly_ids
+            if aid not in skipped_large
+        ]
+        if not assembly_ids:
+            raise StructureSkipWarning(
+                "all_assemblies_exceed_max_atoms",
+                f"Skipping {summary.pdb_id}: all {len(available_assembly_ids)} assemblies exceed {max_assembly_atoms} atoms",
+                details={"assembly_ids": available_assembly_ids, "max_assembly_atoms": max_assembly_atoms},
+            )
+    else:
+        assembly_ids = list(available_assembly_ids)
+
+    # Sort by atom count descending so largest assemblies start first.
+    if len(assembly_ids) > 1:
+        assembly_ids.sort(key=lambda aid: atom_counts.get(aid, 0), reverse=True)
+
     assembly_results: list[dict[str, Any]] = []
     output_paths: list[str] = []
     total_dimers = 0
@@ -286,11 +326,11 @@ def process_single_structure(
     )
 
     assembly_jobs = getattr(settings, "jobs", 1) or 1
-    max_workers = max(1, min(assembly_jobs, len(available_assembly_ids)))
+    max_workers = max(1, min(assembly_jobs, len(assembly_ids)))
     if max_workers > 1:
         futures: dict[Any, str] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for assembly_id in available_assembly_ids:
+            for assembly_id in assembly_ids:
                 assembly_outdir, bundle_name = _resolve_all_mode_output_target(
                     outdir, settings, assembly_id
                 )
@@ -314,7 +354,7 @@ def process_single_structure(
                 total_antibody_complexes += int(assembly_result["num_antibody_antigen_complexes"])
                 total_tcr_complexes += int(assembly_result["num_tcr_pmhc_complexes"])
     else:
-        for assembly_id in available_assembly_ids:
+        for assembly_id in assembly_ids:
             assembly_outdir, bundle_name = _resolve_all_mode_output_target(
                 outdir, settings, assembly_id
             )
@@ -356,7 +396,7 @@ def process_single_structure(
         "num_tcr_pmhc_complexes": total_tcr_complexes,
         "chain_type_counts": summary.chain_type_counts,
         "num_assemblies_processed": len(assembly_results),
-        "processed_assembly_ids": available_assembly_ids,
+        "processed_assembly_ids": assembly_ids,
         "assembly_results": assembly_results,
     }
 

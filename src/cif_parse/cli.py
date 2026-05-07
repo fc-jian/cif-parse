@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import tomllib
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -182,6 +182,12 @@ def _add_runtime_args(
         type=int,
         default=int(settings_defaults.get("max_polymer_chains", 100)),
         help="Skip structures with more than this many polymer chains",
+    )
+    parser.add_argument(
+        "--max-assembly-atoms",
+        type=int,
+        default=int(settings_defaults.get("max_assembly_atoms", 300_000)),
+        help="Skip assemblies estimated to contain more than this many atoms",
     )
     parser.add_argument(
         "--min-polymer-chain-length",
@@ -415,8 +421,12 @@ def _process_batch_case(task: dict[str, Any]) -> dict[str, Any]:
 
     settings = AppSettings(**task["settings"])
     configure_logging(settings.log_level)
+    assembly_atom_counts = task.get("_preflight_assembly_atoms")
     try:
-        result = process_single_structure(task["input_path"], task["output_dir"], settings)
+        result = process_single_structure(
+            task["input_path"], task["output_dir"], settings,
+            _preflight_assembly_atoms=assembly_atom_counts,
+        )
         result["case_id"] = task["case_id"]
         result["status"] = "ok"
         return result
@@ -608,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
         "use_author_fields": settings.use_author_fields,
         "drop_hydrogens_for_analysis": settings.drop_hydrogens_for_analysis,
         "max_polymer_chains": settings.max_polymer_chains,
+        "max_assembly_atoms": settings.max_assembly_atoms,
         "min_polymer_chain_length": settings.min_polymer_chain_length,
         "tight_multimer_min_buried_area": settings.tight_multimer_min_buried_area,
         "tight_multimer_louvain_resolution": settings.tight_multimer_louvain_resolution,
@@ -630,9 +641,43 @@ def main(argv: list[str] | None = None) -> int:
         for case_spec in case_specs
     ]
 
-    # Sort by input file size descending so that the largest (slowest) cases
-    # start first, minimising the long tail at the end of the batch.
-    if args.jobs > 1 and len(tasks) > 1:
+    # Pre-scan: count atoms per assembly for each CIF file, then sort by
+    # the largest assembly so that the heaviest computations start first.
+    if args.jobs > 1 and len(tasks) > 1 and settings.assembly_mode == "all":
+        from cif_parse.io.cif_reader import preflight_assembly_atom_counts
+
+        def _preflight_task(task: dict[str, Any]) -> tuple[str, dict[str, int]]:
+            path = task["input_path"]
+            try:
+                return (path, preflight_assembly_atom_counts(path))
+            except Exception:
+                return (path, {})
+
+        # Scan in a thread pool — only reads CIF category tables, no coordinates.
+        preflight_workers = max(1, min(args.jobs * 2, len(tasks)))
+        preflight_results: dict[str, dict[str, int]] = {}
+        with ThreadPoolExecutor(max_workers=preflight_workers) as preflight_executor:
+            preflight_futures = [preflight_executor.submit(_preflight_task, t) for t in tasks]
+            for future in as_completed(preflight_futures):
+                path, counts = future.result()
+                preflight_results[path] = counts
+
+        for task in tasks:
+            task["_preflight_assembly_atoms"] = preflight_results.get(task["input_path"], {})
+
+        def _max_assembly_atoms(task: dict[str, Any]) -> int:
+            counts = task.get("_preflight_assembly_atoms", {})
+            return max(counts.values()) if counts else 0
+
+        tasks.sort(key=_max_assembly_atoms, reverse=True)
+        largest = tasks[0]
+        max_atoms = _max_assembly_atoms(largest)
+        LOGGER.info(
+            "Largest assembly submitted first: %s (%d atoms)",
+            Path(largest["input_path"]).name,
+            max_atoms,
+        )
+    elif args.jobs > 1 and len(tasks) > 1:
         def _task_size(task: dict[str, Any]) -> int:
             try:
                 return Path(task["input_path"]).stat().st_size

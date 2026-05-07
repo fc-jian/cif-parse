@@ -87,6 +87,7 @@ class AppSettings:
     use_author_fields: bool = False
     drop_hydrogens_for_analysis: bool = True
     max_polymer_chains: int = 100
+    max_assembly_atoms: int = 300_000
     min_polymer_chain_length: int = 20
     tight_multimer_min_buried_area: float = 500.0
     tight_multimer_louvain_resolution: float = 1.0
@@ -119,6 +120,8 @@ class AppSettings:
             raise ValueError("model must be >= 1")
         if self.max_polymer_chains < 1:
             raise ValueError("max_polymer_chains must be >= 1")
+        if self.max_assembly_atoms < 1:
+            raise ValueError("max_assembly_atoms must be >= 1")
         if self.min_polymer_chain_length < 0:
             raise ValueError("min_polymer_chain_length must be >= 0")
         if self.tight_multimer_min_buried_area < 0:
@@ -252,6 +255,7 @@ def default_cli_config() -> dict[str, Any]:
             "use_author_fields": False,
             "drop_hydrogens_for_analysis": True,
             "max_polymer_chains": 100,
+            "max_assembly_atoms": 300_000,
             "min_polymer_chain_length": 20,
             "tight_multimer_min_buried_area": 500.0,
             "tight_multimer_louvain_resolution": 1.0,
@@ -378,6 +382,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "use_author_fields",
             "drop_hydrogens_for_analysis",
             "max_polymer_chains",
+            "max_assembly_atoms",
             "min_polymer_chain_length",
             "tight_multimer_min_buried_area",
             "tight_multimer_louvain_resolution",
@@ -445,6 +450,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "use_author_fields": validated_settings.use_author_fields,
         "drop_hydrogens_for_analysis": validated_settings.drop_hydrogens_for_analysis,
         "max_polymer_chains": validated_settings.max_polymer_chains,
+        "max_assembly_atoms": validated_settings.max_assembly_atoms,
         "min_polymer_chain_length": validated_settings.min_polymer_chain_length,
         "tight_multimer_min_buried_area": validated_settings.tight_multimer_min_buried_area,
         "tight_multimer_louvain_resolution": validated_settings.tight_multimer_louvain_resolution,

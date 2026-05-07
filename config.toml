@@ -48,7 +48,11 @@ drop_hydrogens_for_analysis = true
 
 # Skip structures with more polymer chains than this threshold.
 # Allowed values: integer >= 1.
-max_polymer_chains = 100
+max_polymer_chains = 1000
+
+# Skip assemblies estimated to contain more atoms than this threshold.
+# Allowed values: integer >= 1.
+max_assembly_atoms = 300000
 
 # Skip structures unless at least one polymer chain has length greater than this
 # threshold. A value of 0 disables the practical length guard.
