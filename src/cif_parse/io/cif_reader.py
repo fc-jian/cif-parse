@@ -68,21 +68,46 @@ def read_structure_preflight(path: str | Path) -> dict[str, Any]:
 
 
 def preflight_assembly_atom_counts(path: str | Path) -> dict[str, int]:
-    """Estimate atom count per assembly by scanning ``atom_site`` + ``pdbx_struct_assembly_gen``.
+    """Estimate atom count per assembly from chain lengths (fast, no atom_site read).
 
-    Reads only the ``label_asym_id`` column (no coordinate parsing) and multiplies
-    chain atom counts by the assembly copy number.  Returns ``{assembly_id: atom_count}``.
+    Uses ``struct_asym`` + ``entity`` + ``entity_poly`` for per-chain atom estimates
+    (residue count × atoms-per-residue heuristic) and ``pdbx_struct_assembly_gen`` for
+    assembly composition.  Returns ``{assembly_id: atom_count}``.
     """
     cif_path = Path(path)
     cif_file = read_cif_file(cif_path)
-    block = cif_file[_default_block_name(cif_file)]
 
-    chain_atom_counts: dict[str, int] = defaultdict(int)
-    if "atom_site" in block and "label_asym_id" in block["atom_site"]:
-        for val in block["atom_site"]["label_asym_id"].as_array():
-            label = str(val).strip() if val is not None else ""
-            if label:
-                chain_atom_counts[label] += 1
+    # Per-chain atom estimate from entity tables (avoids reading atom_site).
+    _ATOMS_PER_RES = {"protein": 8, "rna": 20, "dna": 20, "unknown": 5}
+    chain_est: dict[str, int] = {}
+    entity_info: dict[str, tuple[str, int]] = {}
+    for row in _category_rows(cif_file, "entity"):
+        eid = row.get("id")
+        etype = (row.get("type") or "").lower()
+        if eid:
+            entity_info[eid] = (etype, 0)
+    for row in _category_rows(cif_file, "entity_poly"):
+        eid = row.get("entity_id")
+        if not eid:
+            continue
+        seq = _sanitize_sequence(row.get("pdbx_seq_one_letter_code_can"))
+        length = len(seq) if seq else 0
+        ptype = (row.get("type") or "").lower()
+        etype = entity_info.get(eid, ("polymer", 0))[0]
+        if "ribo" in ptype:
+            apx = _ATOMS_PER_RES["rna"]
+        elif "deoxyribo" in ptype:
+            apx = _ATOMS_PER_RES["dna"]
+        elif etype == "polymer":
+            apx = _ATOMS_PER_RES["protein"]
+        else:
+            apx = _ATOMS_PER_RES["unknown"]
+        entity_info[eid] = (etype, length * apx)
+    for row in _category_rows(cif_file, "struct_asym"):
+        aid = row.get("id")
+        eid = row.get("entity_id")
+        if aid and eid and eid in entity_info:
+            chain_est[aid] = entity_info[eid][1]
 
     assembly_atoms: dict[str, int] = {}
     for row in _category_rows(cif_file, "pdbx_struct_assembly_gen"):
@@ -94,7 +119,7 @@ def preflight_assembly_atom_counts(path: str | Path) -> dict[str, int]:
         copies = count_oper_expression_copies(oper_expr)
         total = 0
         for asym_id in (a.strip() for a in asym_id_list.split(",") if a.strip()):
-            total += chain_atom_counts.get(asym_id, 0) * copies
+            total += chain_est.get(asym_id, 0) * copies
         if total > 0:
             assembly_atoms[assembly_id] = total
 

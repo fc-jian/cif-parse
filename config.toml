@@ -54,6 +54,12 @@ max_polymer_chains = 1000
 # Allowed values: integer >= 1.
 max_assembly_atoms = 300000
 
+# Number of worker threads used inside one case when `assembly_mode = "all"`.
+# Keep this at 1 for large batch runs unless you intentionally want nested
+# case-process × assembly-thread parallelism.
+# Allowed values: integer >= 1.
+assembly_jobs = 1
+
 # Skip structures unless at least one polymer chain has length greater than this
 # threshold. A value of 0 disables the practical length guard.
 # Allowed values: integer >= 0.

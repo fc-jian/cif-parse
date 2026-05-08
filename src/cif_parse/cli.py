@@ -7,7 +7,8 @@ import json
 import logging
 import os
 import tomllib
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+import heapq
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +191,12 @@ def _add_runtime_args(
         help="Skip assemblies estimated to contain more than this many atoms",
     )
     parser.add_argument(
+        "--assembly-jobs",
+        type=int,
+        default=int(settings_defaults.get("assembly_jobs", 1)),
+        help="Number of per-case assembly worker threads for --assembly-mode all",
+    )
+    parser.add_argument(
         "--min-polymer-chain-length",
         type=int,
         default=int(settings_defaults.get("min_polymer_chain_length", 20)),
@@ -291,6 +298,8 @@ def _settings_from_args(args: argparse.Namespace) -> AppSettings:
         use_author_fields=args.author_fields,
         drop_hydrogens_for_analysis=args.drop_hydrogens_for_analysis,
         max_polymer_chains=args.max_polymer_chains,
+        max_assembly_atoms=args.max_assembly_atoms,
+        assembly_jobs=args.assembly_jobs,
         min_polymer_chain_length=args.min_polymer_chain_length,
         tight_multimer_min_buried_area=args.tight_multimer_min_buried_area,
         tight_multimer_louvain_resolution=args.tight_multimer_louvain_resolution,
@@ -421,11 +430,11 @@ def _process_batch_case(task: dict[str, Any]) -> dict[str, Any]:
 
     settings = AppSettings(**task["settings"])
     configure_logging(settings.log_level)
-    assembly_atom_counts = task.get("_preflight_assembly_atoms")
+    allowed_assembly_ids = task.get("_preflight_allowed_assembly_ids")
     try:
         result = process_single_structure(
             task["input_path"], task["output_dir"], settings,
-            _preflight_assembly_atoms=assembly_atom_counts,
+            _allowed_assembly_ids=allowed_assembly_ids,
         )
         result["case_id"] = task["case_id"]
         result["status"] = "ok"
@@ -452,6 +461,47 @@ def _process_batch_case(task: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+def _prepare_preflighted_batch_task(
+    task: dict[str, Any],
+    counts: dict[str, int],
+    *,
+    max_assembly_atoms: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, int]:
+    """Apply assembly preflight results to one batch task.
+
+    Returns ``(task_to_run, skipped_result, priority_atoms)``.  Empty counts mean
+    preflight was unavailable, so the worker must fall back to its own assembly
+    discovery/filtering path.
+    """
+
+    if not counts:
+        return task, None, 0
+    allowed = sorted(
+        [aid for aid, n in counts.items() if n <= max_assembly_atoms],
+        key=lambda aid: -counts.get(aid, 0),
+    )
+    if not allowed:
+        return (
+            None,
+            {
+                "case_id": task["case_id"],
+                "input_path": task["input_path"],
+                "output_dir": task["output_dir"],
+                "status": "skipped",
+                "warning_code": "all_assemblies_exceed_max_atoms",
+                "warning": f"Skipping {task['case_id']}: all assemblies exceed max_assembly_atoms",
+                "warning_details": {
+                    "assembly_atom_counts": counts,
+                    "max_assembly_atoms": max_assembly_atoms,
+                },
+            },
+            0,
+        )
+    prepared_task = dict(task)
+    prepared_task["_preflight_allowed_assembly_ids"] = allowed
+    return prepared_task, None, max(counts.get(aid, 0) for aid in allowed)
+
+
 def _print_single_result(settings: AppSettings, outdir: Path, result: dict[str, Any]) -> None:
     """Print the single-run CLI response."""
 
@@ -466,6 +516,8 @@ def _print_single_result(settings: AppSettings, outdir: Path, result: dict[str, 
                         "debug": settings.debug,
                         "log_level": settings.log_level,
                         "max_polymer_chains": settings.max_polymer_chains,
+                        "max_assembly_atoms": settings.max_assembly_atoms,
+                        "assembly_jobs": settings.assembly_jobs,
                         "min_polymer_chain_length": settings.min_polymer_chain_length,
                         "model": settings.model,
                         "use_author_fields": settings.use_author_fields,
@@ -515,6 +567,8 @@ def _print_batch_result(
                         "debug": settings.debug,
                         "log_level": settings.log_level,
                         "max_polymer_chains": settings.max_polymer_chains,
+                        "max_assembly_atoms": settings.max_assembly_atoms,
+                        "assembly_jobs": settings.assembly_jobs,
                         "min_polymer_chain_length": settings.min_polymer_chain_length,
                         "model": settings.model,
                         "use_author_fields": settings.use_author_fields,
@@ -619,6 +673,7 @@ def main(argv: list[str] | None = None) -> int:
         "drop_hydrogens_for_analysis": settings.drop_hydrogens_for_analysis,
         "max_polymer_chains": settings.max_polymer_chains,
         "max_assembly_atoms": settings.max_assembly_atoms,
+        "assembly_jobs": settings.assembly_jobs,
         "min_polymer_chain_length": settings.min_polymer_chain_length,
         "tight_multimer_min_buried_area": settings.tight_multimer_min_buried_area,
         "tight_multimer_louvain_resolution": settings.tight_multimer_louvain_resolution,
@@ -641,42 +696,104 @@ def main(argv: list[str] | None = None) -> int:
         for case_spec in case_specs
     ]
 
-    # Pre-scan: count atoms per assembly for each CIF file, then sort by
-    # the largest assembly so that the heaviest computations start first.
-    if args.jobs > 1 and len(tasks) > 1 and settings.assembly_mode == "all":
+    results: list[dict[str, Any]] = []
+
+    # ── Streaming preflight → priority heap → process pool ──────────────
+    # Pre-scan preflight results stream into a max-heap (largest assembly
+    # first).  As soon as a ProcessPoolExecutor worker slot opens, the
+    # heaviest ready task is submitted — no waiting for all files to be
+    # pre-scanned before processing begins.
+    streaming_scheduler_ran = False
+    if settings.assembly_mode == "all" and settings.max_assembly_atoms > 0 and args.jobs > 1:
         from cif_parse.io.cif_reader import preflight_assembly_atom_counts
 
-        def _preflight_task(task: dict[str, Any]) -> tuple[str, dict[str, int]]:
+        streaming_scheduler_ran = True
+        threshold = settings.max_assembly_atoms
+
+        def _preflight_task(task: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
             path = task["input_path"]
             try:
-                return (path, preflight_assembly_atom_counts(path))
+                return (task, preflight_assembly_atom_counts(path))
             except Exception:
-                return (path, {})
+                return (task, {})
 
-        # Scan in a thread pool — only reads CIF category tables, no coordinates.
-        preflight_workers = max(1, min(args.jobs * 2, len(tasks)))
-        preflight_results: dict[str, dict[str, int]] = {}
-        with ThreadPoolExecutor(max_workers=preflight_workers) as preflight_executor:
-            preflight_futures = [preflight_executor.submit(_preflight_task, t) for t in tasks]
-            for future in as_completed(preflight_futures):
-                path, counts = future.result()
-                preflight_results[path] = counts
+        preflight_workers = max(1, min((args.jobs or 1) * 2, len(tasks)))
+        preflight_window = max(preflight_workers, args.jobs * 4)
+        priority_buffer = max(args.jobs * 4, args.jobs)
+        task_heap: list[tuple[int, int, dict[str, Any]]] = []  # (-max_atoms, tie, task)
+        task_iter = iter(tasks)
+        tie = 0
+        pre_skipped = 0
 
-        for task in tasks:
-            task["_preflight_assembly_atoms"] = preflight_results.get(task["input_path"], {})
+        with (
+            ThreadPoolExecutor(max_workers=preflight_workers) as preflight_exec,
+            ProcessPoolExecutor(max_workers=args.jobs) as process_exec,
+        ):
+            preflight_futures: dict[Any, dict[str, Any]] = {}
+            process_futures: dict[Any, dict[str, Any]] = {}
 
-        def _max_assembly_atoms(task: dict[str, Any]) -> int:
-            counts = task.get("_preflight_assembly_atoms", {})
-            return max(counts.values()) if counts else 0
+            def _fill_preflight_window() -> None:
+                while len(preflight_futures) < preflight_window:
+                    try:
+                        task = next(task_iter)
+                    except StopIteration:
+                        break
+                    preflight_futures[preflight_exec.submit(_preflight_task, task)] = task
 
-        tasks.sort(key=_max_assembly_atoms, reverse=True)
-        largest = tasks[0]
-        max_atoms = _max_assembly_atoms(largest)
-        LOGGER.info(
-            "Largest assembly submitted first: %s (%d atoms)",
-            Path(largest["input_path"]).name,
-            max_atoms,
-        )
+            def _enqueue_ready(task: dict[str, Any], counts: dict[str, int]) -> None:
+                nonlocal pre_skipped, tie
+                prepared, skipped, max_atoms = _prepare_preflighted_batch_task(
+                    task,
+                    counts,
+                    max_assembly_atoms=threshold,
+                )
+                if skipped is not None:
+                    pre_skipped += 1
+                    results.append(skipped)
+                    return
+                if prepared is not None:
+                    heapq.heappush(task_heap, (-max_atoms, tie, prepared))
+                    tie += 1
+
+            _fill_preflight_window()
+
+            while preflight_futures or task_heap or process_futures:
+                can_submit = len(task_heap) >= priority_buffer or not preflight_futures
+                while can_submit and task_heap and len(process_futures) < args.jobs:
+                    _, _, task = heapq.heappop(task_heap)
+                    fut = process_exec.submit(_process_batch_case, task)
+                    process_futures[fut] = task
+
+                wait_set = set(process_futures) | set(preflight_futures)
+                if not wait_set:
+                    break
+                done, _ = wait(wait_set, return_when=FIRST_COMPLETED)
+                for future in done:
+                    if future in preflight_futures:
+                        preflight_futures.pop(future)
+                        task, counts = future.result()
+                        _enqueue_ready(task, counts)
+                        _fill_preflight_window()
+                    elif future in process_futures:
+                        task = process_futures.pop(future)
+                        result = future.result()
+                        results.append(result)
+                        if args.fail_fast and result["status"] == "error":
+                            LOGGER.error("Batch failed fast on %s", result["input_path"])
+                            for f in preflight_futures:
+                                f.cancel()
+                            for f in process_futures:
+                                f.cancel()
+                            preflight_futures.clear()
+                            process_futures.clear()
+                            task_heap.clear()
+
+        if pre_skipped:
+            LOGGER.info(
+                "Pre-skipped %d case(s) with all assemblies exceeding %d atoms",
+                pre_skipped, threshold,
+            )
+
     elif args.jobs > 1 and len(tasks) > 1:
         def _task_size(task: dict[str, Any]) -> int:
             try:
@@ -691,24 +808,44 @@ def main(argv: list[str] | None = None) -> int:
             _task_size(tasks[0]) / (1 << 20),
         )
 
-    results: list[dict[str, Any]] = []
-    if args.jobs == 1:
-        for task in tasks:
-            result = _process_batch_case(task)
-            results.append(result)
-            if args.fail_fast and result["status"] == "error":
-                break
-    else:
-        with ProcessPoolExecutor(max_workers=args.jobs) as executor:
-            futures = {executor.submit(_process_batch_case, task): task for task in tasks}
-            for future in as_completed(futures):
-                result = future.result()
+    if not streaming_scheduler_ran:
+        # No streaming path taken — process sequentially or with simple pool.
+        if args.jobs == 1:
+            for task in tasks:
+                result = _process_batch_case(task)
                 results.append(result)
                 if args.fail_fast and result["status"] == "error":
-                    LOGGER.error("Batch failed fast on %s", result["input_path"])
-                    for pending in futures:
-                        pending.cancel()
                     break
+        else:
+            with ProcessPoolExecutor(max_workers=args.jobs) as executor:
+                task_iter = iter(tasks)
+                futures: dict[Any, dict[str, Any]] = {}
+                window = max(args.jobs, args.jobs * 4)
+
+                def _fill_process_window() -> None:
+                    while len(futures) < window:
+                        try:
+                            task = next(task_iter)
+                        except StopIteration:
+                            break
+                        futures[executor.submit(_process_batch_case, task)] = task
+
+                _fill_process_window()
+                while futures:
+                    done, _ = wait(set(futures), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        futures.pop(future)
+                        result = future.result()
+                        results.append(result)
+                        if args.fail_fast and result["status"] == "error":
+                            LOGGER.error("Batch failed fast on %s", result["input_path"])
+                            for pending in futures:
+                                pending.cancel()
+                            futures.clear()
+                            break
+                    if args.fail_fast and results and results[-1]["status"] == "error":
+                        break
+                    _fill_process_window()
 
     results.sort(key=lambda item: item["case_id"])
     summary = _summarize_batch_results(results)
