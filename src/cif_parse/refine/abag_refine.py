@@ -265,6 +265,26 @@ def refine_antibody_complex(
     ab_cropped: list[Any] = []
     ab_res_ca: dict[int, np.ndarray] = {}
     chain_intervals: list[dict[str, Any]] = []
+    # Track mapping: new PDB chain id → original label_asym_id
+    _pdb_chain_ids = _PDB_CHAIN_IDS
+    _chain_idx = 0
+
+    def _residue_intervals(res_ids: np.ndarray) -> list[tuple[int, int]]:
+        """Convert sorted unique residue IDs to compact interval notation."""
+        uniq = sorted(set(int(r) for r in res_ids))
+        if not uniq:
+            return []
+        intervals: list[tuple[int, int]] = []
+        start = end = uniq[0]
+        for r in uniq[1:]:
+            if r == end + 1:
+                end = r
+            else:
+                intervals.append((start, end))
+                start = end = r
+        intervals.append((start, end))
+        return intervals
+
     for cid in antibody_chain_ids:
         aa = chain_arrays.get(cid)
         if aa is None:
@@ -276,22 +296,22 @@ def refine_antibody_complex(
         chain_type = ann.get("chain_type", "")
 
         if antibody_unit_type in ("VHH", "scFv"):
-            # Keep full chain for single-domain antibodies.
             start, end = (int(aa.res_id.min()), None)
         else:
             start, end = _find_fv_boundaries(aa, variable_domains, chain_type)
 
         cropped = _crop_atom_array(aa, start, end)
+        pdb_chain = _pdb_chain_ids[_chain_idx % len(_pdb_chain_ids)]
         ab_cropped.append(cropped)
         ab_res_ca.update(_ca_coords(cropped))
         chain_intervals.append({
             "label_asym_id": cid,
+            "pdb_chain_id": pdb_chain,
             "chain_type": chain_type,
             "role": "antibody",
-            "fv_start_res_id": start,
-            "fv_end_res_id": end,
-            "retained_residues": sorted(set(int(r) for r in cropped.res_id)),
+            "retained_residue_intervals": _residue_intervals(cropped.res_id),
         })
+        _chain_idx += 1
 
     # ---- antigen domain detection and filtering ----------------------------
     antigen_domains: list[dict[str, Any]] = []
@@ -348,14 +368,17 @@ def refine_antibody_complex(
         else:
             ag_cropped = aa.copy()
         ag_cropped_parts.append(ag_cropped)
+        pdb_chain = _pdb_chain_ids[_chain_idx % len(_pdb_chain_ids)]
         chain_intervals.append({
             "label_asym_id": cid,
+            "pdb_chain_id": pdb_chain,
             "chain_type": chain_type,
             "role": "antigen",
-            "retained_residues": sorted(retained_ids) if retained_ids else sorted(set(int(r) for r in aa.res_id)),
+            "retained_residue_intervals": _residue_intervals(ag_cropped.res_id),
             "num_contacting_domains": len(contacting),
             "num_removed_domains": len(removed),
         })
+        _chain_idx += 1
 
     # ---- assemble and write PDB --------------------------------------------
     import biotite.structure as struc
@@ -365,10 +388,12 @@ def refine_antibody_complex(
     if not all_parts:
         raise ValueError(f"No atoms left after cropping for complex {complex_id}")
 
-    # Re-number chains to sequential PDB chain IDs.
+    # Re-number chains using the tracked PDB chain IDs.
     for idx, part in enumerate(all_parts):
-        cid = _PDB_CHAIN_IDS[idx % len(_PDB_CHAIN_IDS)]
-        part.chain_id[:] = cid
+        if idx < len(chain_intervals):
+            part.chain_id[:] = chain_intervals[idx]["pdb_chain_id"]
+        else:
+            part.chain_id[:] = _PDB_CHAIN_IDS[idx % len(_PDB_CHAIN_IDS)]
 
     full_atoms = struc.concatenate(all_parts) if len(all_parts) > 1 else all_parts[0]
     stem = f"{pdb_id}_{assembly_id or 'na'}_{complex_id}"

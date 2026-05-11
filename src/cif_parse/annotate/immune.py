@@ -335,9 +335,10 @@ def _number_selected_domains(
     return domains
 
 
-# Known J-region C-terminal 4-mer motifs for extending short Fv annotations.
-# When SADIE reports a variable domain < 100 residues, we scan the sequence
-# after the current boundary for these conserved FR4-end signatures.
+# Known J-region C-terminal 4-mer motifs for extending Fv annotations.
+# When SADIE's CDR3 reaches IMGT position ≥ 115 (full CDR3) but the
+# annotation lacks the terminal FR4 region, we extend the boundary
+# to include the conserved J-region end signature.
 _HEAVY_END_MOTIFS: tuple[str, ...] = (
     "VTVS", "VTVT", "VTVW", "VTVA", "VTVM", "VTVP", "VTVL",
     "VSSP", "VSSS", "VSSA", "VSSM",
@@ -349,24 +350,42 @@ _KAPPA_END_MOTIFS: tuple[str, ...] = (
 _LAMBDA_END_MOTIFS: tuple[str, ...] = (
     "VTVL", "LTVL", "VTVF", "LTVF", "VTVS", "LTVS",
 )
-_FV_MIN_LENGTH = 100
 _FV_EXTEND_LIMIT = 40
+_CDR3_IMGT_FULL_END = 115  # CDR3 reaching this IMGT position implies FR4 should follow
+
+
+def _cdr3_numbering_end(domain: VariableDomainAnnotation) -> int:
+    """Return the highest IMGT numbering_end among CDR3 regions, or 0."""
+    for cdr in domain.cdr_regions:
+        if cdr.get("name") == "cdr3":
+            try:
+                return int(cdr["numbering_end"])
+            except (ValueError, KeyError):
+                pass
+    return 0
 
 
 def _extend_fv_by_end_motif(
     domains: list[VariableDomainAnnotation],
     sequence: str,
-) -> list[VariableDomainAnnotation]:
-    """Extend short Fv domains to include a conserved J-region end motif.
+) -> tuple[list[VariableDomainAnnotation], list[dict[str, Any]]]:
+    """Extend Fv domains where CDR3 is complete but FR4 is missing.
 
-    Returns the modified list (in-place mutation is avoided; new objects
-    are created for domains that were extended).
+    Returns ``(extended_domains, warnings)``.  A warning is emitted for each
+    domain that was extended.
     """
     extended_domains: list[VariableDomainAnnotation] = []
+    warnings: list[dict[str, Any]] = []
     for domain in domains:
-        if domain.length >= _FV_MIN_LENGTH:
+        cdr3_end = _cdr3_numbering_end(domain)
+        missing_fr4 = (
+            cdr3_end >= _CDR3_IMGT_FULL_END
+            and domain.seq_end + 5 < len(sequence)
+        )
+        if not missing_fr4:
             extended_domains.append(domain)
             continue
+
         if domain.chain_code == "H":
             motifs = _HEAVY_END_MOTIFS
         elif domain.chain_code == "K":
@@ -377,16 +396,18 @@ def _extend_fv_by_end_motif(
             extended_domains.append(domain)
             continue
 
-        current_end = domain.seq_end  # 1-based inclusive
-        search_start = max(current_end - 5, 0)  # look a bit before current end too
+        current_end = domain.seq_end
+        search_start = max(current_end - 5, 0)
         search_end = min(current_end + _FV_EXTEND_LIMIT, len(sequence) - 3)
 
         best_offset: int | None = None
+        best_motif: str | None = None
         for i in range(search_start, search_end):
             candidate = sequence[i:i + 4]
             if candidate in motifs:
-                best_offset = i + 4 - current_end  # new end = i+4
-                break  # take the first (closest) match
+                best_offset = i + 4 - current_end
+                best_motif = candidate
+                break
 
         if best_offset is None or best_offset <= 0:
             extended_domains.append(domain)
@@ -395,7 +416,6 @@ def _extend_fv_by_end_motif(
         new_end = current_end + best_offset
         new_length = domain.length + best_offset
 
-        # Extend CDR regions if they end near the old boundary.
         new_cdrs: list[dict[str, Any]] = []
         for cdr in domain.cdr_regions:
             cdr_copy = dict(cdr)
@@ -419,7 +439,17 @@ def _extend_fv_by_end_motif(
                 cdr_regions=new_cdrs,
             )
         )
-    return extended_domains
+        warnings.append({
+            "warning_code": "fv_extended_by_end_motif",
+            "chain_code": domain.chain_code,
+            "chain_type": domain.chain_type,
+            "original_seq_end": current_end,
+            "extended_seq_end": new_end,
+            "extension": best_offset,
+            "end_motif": best_motif,
+            "cdr3_imgt_end": cdr3_end,
+        })
+    return extended_domains, warnings
 
 
 def _cdr_regions_from_numbering(item: dict[str, Any], domain_seq_start: int) -> list[dict[str, Any]]:
@@ -511,9 +541,15 @@ def analyze_immune_sequence(
             for hit in selected_hits
         ]
     )
-    annotation.variable_domains = _extend_fv_by_end_motif(
-        _number_selected_domains(sequence_clean, selected_hits), sequence_clean,
+    numbered_domains = _number_selected_domains(sequence_clean, selected_hits)
+    annotation.variable_domains, fv_warnings = _extend_fv_by_end_motif(
+        numbered_domains, sequence_clean,
     )
+    if fv_warnings:
+        annotation.sequence_hits.extend(
+            f"fv_extended:{w['chain_code']}:{w['original_seq_end']}->{w['extended_seq_end']}:{w['end_motif']}"
+            for w in fv_warnings
+        )
     if not annotation.variable_domains:
         return annotation
 
