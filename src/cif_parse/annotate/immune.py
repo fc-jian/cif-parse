@@ -335,6 +335,93 @@ def _number_selected_domains(
     return domains
 
 
+# Known J-region C-terminal 4-mer motifs for extending short Fv annotations.
+# When SADIE reports a variable domain < 100 residues, we scan the sequence
+# after the current boundary for these conserved FR4-end signatures.
+_HEAVY_END_MOTIFS: tuple[str, ...] = (
+    "VTVS", "VTVT", "VTVW", "VTVA", "VTVM", "VTVP", "VTVL",
+    "VSSP", "VSSS", "VSSA", "VSSM",
+    "MVTW", "MVTV",
+)
+_KAPPA_END_MOTIFS: tuple[str, ...] = (
+    "VEIK", "LEIK", "VDIK", "LDIK", "TEIK", "VEIN", "LEIN",
+)
+_LAMBDA_END_MOTIFS: tuple[str, ...] = (
+    "VTVL", "LTVL", "VTVF", "LTVF", "VTVS", "LTVS",
+)
+_FV_MIN_LENGTH = 100
+_FV_EXTEND_LIMIT = 40
+
+
+def _extend_fv_by_end_motif(
+    domains: list[VariableDomainAnnotation],
+    sequence: str,
+) -> list[VariableDomainAnnotation]:
+    """Extend short Fv domains to include a conserved J-region end motif.
+
+    Returns the modified list (in-place mutation is avoided; new objects
+    are created for domains that were extended).
+    """
+    extended_domains: list[VariableDomainAnnotation] = []
+    for domain in domains:
+        if domain.length >= _FV_MIN_LENGTH:
+            extended_domains.append(domain)
+            continue
+        if domain.chain_code == "H":
+            motifs = _HEAVY_END_MOTIFS
+        elif domain.chain_code == "K":
+            motifs = _KAPPA_END_MOTIFS
+        elif domain.chain_code == "L":
+            motifs = _LAMBDA_END_MOTIFS
+        else:
+            extended_domains.append(domain)
+            continue
+
+        current_end = domain.seq_end  # 1-based inclusive
+        search_start = max(current_end - 5, 0)  # look a bit before current end too
+        search_end = min(current_end + _FV_EXTEND_LIMIT, len(sequence) - 3)
+
+        best_offset: int | None = None
+        for i in range(search_start, search_end):
+            candidate = sequence[i:i + 4]
+            if candidate in motifs:
+                best_offset = i + 4 - current_end  # new end = i+4
+                break  # take the first (closest) match
+
+        if best_offset is None or best_offset <= 0:
+            extended_domains.append(domain)
+            continue
+
+        new_end = current_end + best_offset
+        new_length = domain.length + best_offset
+
+        # Extend CDR regions if they end near the old boundary.
+        new_cdrs: list[dict[str, Any]] = []
+        for cdr in domain.cdr_regions:
+            cdr_copy = dict(cdr)
+            if cdr_copy.get("seq_end", 0) >= current_end - 5:
+                cdr_copy["seq_end"] = min(cdr_copy["seq_end"] + best_offset, new_end)
+                cdr_copy["length"] = cdr_copy["seq_end"] - cdr_copy["seq_start"] + 1
+            new_cdrs.append(cdr_copy)
+
+        extended_domains.append(
+            VariableDomainAnnotation(
+                domain_no=domain.domain_no,
+                chain_code=domain.chain_code,
+                chain_type=domain.chain_type,
+                subtype=domain.subtype,
+                seq_start=domain.seq_start,
+                seq_end=new_end,
+                length=new_length,
+                bitscore=domain.bitscore,
+                evalue=domain.evalue,
+                species=domain.species,
+                cdr_regions=new_cdrs,
+            )
+        )
+    return extended_domains
+
+
 def _cdr_regions_from_numbering(item: dict[str, Any], domain_seq_start: int) -> list[dict[str, Any]]:
     numbering = item.get("Numbering")
     numbered_sequence = item.get("Numbered_Sequence")
@@ -385,6 +472,9 @@ def _cdr_regions_from_numbering(item: dict[str, Any], domain_seq_start: int) -> 
 def analyze_immune_sequence(
     description: str | None,
     sequence: str | None,
+    *,
+    domain_bitscore_threshold: float = 80.0,
+    domain_limit: int = 4,
 ) -> ImmuneSequenceAnnotation:
     annotation = ImmuneSequenceAnnotation()
     sequence_clean = _protein_letters(sequence)
@@ -402,19 +492,28 @@ def analyze_immune_sequence(
         annotation.description_hits.append("scfv")
 
     try:
-        candidate_hits = _collect_candidate_hits(sequence_clean)
+        candidate_hits = _collect_candidate_hits(
+            sequence_clean,
+            domain_bitscore_threshold=domain_bitscore_threshold,
+        )
     except Exception as exc:  # noqa: BLE001
         annotation.sequence_hits.append(f"sadie_error:{exc.__class__.__name__}")
         return annotation
 
-    selected_hits = _select_variable_domains(candidate_hits, description_lower, domain_limit=4)
+    selected_hits = _select_variable_domains(
+        candidate_hits,
+        description_lower,
+        domain_limit=domain_limit,
+    )
     annotation.sequence_hits.extend(
         [
             f"sadie_domain:{hit['chain_type']}:{int(hit['query_start']) + 1}-{int(hit['query_end'])}"
             for hit in selected_hits
         ]
     )
-    annotation.variable_domains = _number_selected_domains(sequence_clean, selected_hits)
+    annotation.variable_domains = _extend_fv_by_end_motif(
+        _number_selected_domains(sequence_clean, selected_hits), sequence_clean,
+    )
     if not annotation.variable_domains:
         return annotation
 
@@ -489,7 +588,10 @@ def analyze_immune_sequence(
             annotation.subtype = first_domain.subtype
 
     if annotation.chain_type:
-        annotation.annotation_confidence = _annotation_confidence(annotation.top_bitscore)
+        annotation.annotation_confidence = _annotation_confidence(
+            annotation.top_bitscore,
+            domain_bitscore_threshold=domain_bitscore_threshold,
+        )
     annotation.heavy_only_evidence = {
         "paired_light_found": False,
         "unit_type": annotation.unit_type or "",

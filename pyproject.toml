@@ -45,6 +45,7 @@ all = [
 cif-parse = "cif_parse.cli:main"
 cif-parse-cluster = "cif_parse.clustering.cli:main"
 cif-parse-cluster-monomers = "cif_parse.clustering.cli:main"
+cif-parse-refine = "cif_parse.refine.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

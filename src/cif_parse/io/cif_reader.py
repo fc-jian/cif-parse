@@ -32,11 +32,11 @@ def _append_warning_detail(record: ChainRecord, warning_code: str, detail: dict[
     warning_details[warning_code] = detail
 
 
-def read_structure_preflight(path: str | Path) -> dict[str, Any]:
+def read_structure_preflight(path: str | Path, *, cif_file: CIFFile | None = None) -> dict[str, Any]:
     """Read lightweight per-structure chain counts without building atom arrays."""
 
     cif_path = Path(path)
-    cif_file = read_cif_file(cif_path)
+    cif_file = cif_file or read_cif_file(cif_path)
     pdb_id = _infer_pdb_id(cif_path, cif_file)
     entity_map = _build_entity_map(cif_file)
 
@@ -67,7 +67,7 @@ def read_structure_preflight(path: str | Path) -> dict[str, Any]:
     }
 
 
-def preflight_assembly_atom_counts(path: str | Path) -> dict[str, int]:
+def preflight_assembly_atom_counts(path: str | Path, *, cif_file: CIFFile | None = None) -> dict[str, int]:
     """Estimate atom count per assembly from chain lengths (fast, no atom_site read).
 
     Uses ``struct_asym`` + ``entity`` + ``entity_poly`` for per-chain atom estimates
@@ -75,7 +75,7 @@ def preflight_assembly_atom_counts(path: str | Path) -> dict[str, int]:
     assembly composition.  Returns ``{assembly_id: atom_count}``.
     """
     cif_path = Path(path)
-    cif_file = read_cif_file(cif_path)
+    cif_file = cif_file or read_cif_file(cif_path)
 
     # Per-chain atom estimate from entity tables (avoids reading atom_site).
     _ATOMS_PER_RES = {"protein": 8, "rna": 20, "dna": 20, "unknown": 5}
@@ -256,9 +256,9 @@ def _assembly_sort_key(assembly_id: str) -> tuple[int, int | str]:
     return (1, assembly_id)
 
 
-def read_available_assembly_ids(path: str | Path) -> list[str]:
+def read_available_assembly_ids(path: str | Path, *, cif_file: CIFFile | None = None) -> list[str]:
     cif_path = Path(path)
-    cif_file = read_cif_file(cif_path)
+    cif_file = cif_file or read_cif_file(cif_path)
     return sorted(
         [str(assembly_id) for assembly_id in list_assemblies(cif_file)],
         key=_assembly_sort_key,
@@ -311,9 +311,11 @@ def select_largest_polymer_assembly_id(cif_file: CIFFile) -> str | None:
 def read_assembly_chain_operations(
     path: str | Path,
     assembly_id: str | None = None,
+    *,
+    cif_file: CIFFile | None = None,
 ) -> tuple[str | None, dict[str, list[str]]]:
     cif_path = Path(path)
-    cif_file = read_cif_file(cif_path)
+    cif_file = cif_file or read_cif_file(cif_path)
     block = cif_file[_default_block_name(cif_file)]
     if "pdbx_struct_assembly_gen" not in block:
         return assembly_id, {}
@@ -344,8 +346,17 @@ def read_assembly_chain_operations(
     return selected_assembly_id, chain_operations
 
 
-def read_assembly_copy_numbers(path: str | Path, assembly_id: str | None = None) -> tuple[str | None, dict[str, int]]:
-    selected_assembly_id, chain_operations = read_assembly_chain_operations(path, assembly_id=assembly_id)
+def read_assembly_copy_numbers(
+    path: str | Path,
+    assembly_id: str | None = None,
+    *,
+    cif_file: CIFFile | None = None,
+) -> tuple[str | None, dict[str, int]]:
+    selected_assembly_id, chain_operations = read_assembly_chain_operations(
+        path,
+        assembly_id=assembly_id,
+        cif_file=cif_file,
+    )
     copy_numbers = {
         asym_id: len(operation_ids)
         for asym_id, operation_ids in chain_operations.items()
@@ -646,40 +657,6 @@ def _description_based_chain_type(
     if not description_lower:
         return None, None, sources, features
 
-    if (
-        ("single-chain fv" in description_lower or "scfv" in description_lower)
-        and "heavy chain" not in description_lower
-        and "light chain" not in description_lower
-        and "kappa" not in description_lower
-        and "lambda" not in description_lower
-    ):
-        sources.append("description_heuristic")
-        features["antibody_unit_type"] = "scFv"
-        features["contains_fused_heavy_fv"] = True
-        features["contains_fused_light_fv"] = True
-        return "antibody heavy chain", "scFv", sources, features
-
-    if "nanobody" in description_lower or "vhh" in description_lower:
-        sources.append("description_heuristic")
-        features["antibody_unit_type"] = "VHH"
-        return "antibody heavy chain", "VHH", sources, features
-
-    heavy_markers = ("immunoglobulin", "antibody", "fab")
-    if any(marker in description_lower for marker in heavy_markers) and "heavy chain" in description_lower:
-        sources.append("description_heuristic")
-        return "antibody heavy chain", "heavy", sources, features
-
-    if any(marker in description_lower for marker in heavy_markers) and (
-        "light chain" in description_lower or "kappa" in description_lower or "lambda" in description_lower
-    ):
-        sources.append("description_heuristic")
-        subtype = "light"
-        if "kappa" in description_lower:
-            subtype = "light:kappa"
-        if "lambda" in description_lower:
-            subtype = "light:lambda"
-        return "antibody light chain", subtype, sources, features
-
     if "beta-2-microglobulin" in description_lower or "beta 2 microglobulin" in description_lower:
         sources.append("description_heuristic")
         return "beta2m or auxiliary immune chain", "beta2m", sources, features
@@ -906,6 +883,8 @@ def _classify_chain(
     chem_comp_map: dict[str, dict[str, str | None]],
     *,
     length: int,
+    sadie_domain_bitscore_threshold: float = 80.0,
+    sadie_domain_limit: int = 4,
 ) -> tuple[str, str | None, list[str], float, dict[str, Any], list[str]]:
     entity_type_lower = (entity.get("entity_type") or "").lower()
     polymer_type_lower = (entity.get("polymer_type") or "").lower()
@@ -933,11 +912,10 @@ def _classify_chain(
             immune_annotation = analyze_immune_sequence(
                 entity.get("entity_description"),
                 sequence,
+                domain_bitscore_threshold=sadie_domain_bitscore_threshold,
+                domain_limit=sadie_domain_limit,
             )
-            antibody_annotation = analyze_antibody_sequence(
-                entity.get("entity_description"),
-                sequence,
-            )
+            antibody_annotation = None
             heuristic_type, heuristic_subtype, heuristic_sources, heuristic_features = (
                 _description_based_chain_type(entity.get("entity_description"), length)
             )
@@ -953,6 +931,13 @@ def _classify_chain(
                     domain.to_dict() for domain in immune_annotation.variable_domains
                 ]
                 if immune_annotation.chain_type.startswith("antibody"):
+                    antibody_annotation = analyze_antibody_sequence(
+                        entity.get("entity_description"),
+                        sequence,
+                        immune_annotation=immune_annotation,
+                        domain_bitscore_threshold=sadie_domain_bitscore_threshold,
+                        domain_limit=sadie_domain_limit,
+                    )
                     features["antibody_analysis"] = antibody_annotation.to_feature_dict()
                     if antibody_annotation.unit_type:
                         features["antibody_unit_type"] = antibody_annotation.unit_type
@@ -976,29 +961,12 @@ def _classify_chain(
                 if heuristic_subtype and chain_type == "antibody light chain" and subtype == "light":
                     subtype = heuristic_subtype
                 for key, value in heuristic_features.items():
-                    if key == "antibody_unit_type" and value == "scFv" and subtype != "scFv":
-                        continue
                     features.setdefault(key, value)
             elif heuristic_type and immune_annotation.chain_type and (
                 "antibody" in heuristic_type or heuristic_type == "TCR chain"
             ):
                 warnings.append("description_and_sequence_immune_annotation_disagree")
 
-            if antibody_annotation.chain_type:
-                features["antibody_analysis"] = antibody_annotation.to_feature_dict()
-                if antibody_annotation.chain_type == chain_type and "sadie_sequence_analysis" not in annotation_sources:
-                    annotation_sources.append("antibody_sequence_analysis")
-                    annotation_confidence = max(
-                        annotation_confidence,
-                        float(antibody_annotation.annotation_confidence),
-                    )
-                elif _has_antibody_annotation_conflict(
-                    heuristic_type,
-                    heuristic_subtype,
-                    heuristic_features,
-                    antibody_annotation,
-                ):
-                    warnings.append("description_and_sequence_antibody_annotation_disagree")
             return chain_type, subtype, annotation_sources, annotation_confidence, features, warnings
 
         if (
@@ -1042,41 +1010,6 @@ def _append_unique(items: list[str], value: str | None) -> None:
         items.append(value)
 
 
-def _has_antibody_annotation_conflict(
-    heuristic_type: str | None,
-    heuristic_subtype: str | None,
-    heuristic_features: dict[str, Any],
-    antibody_annotation: Any,
-) -> bool:
-    annotation_type = getattr(antibody_annotation, "chain_type", None)
-    if not heuristic_type or "antibody" not in heuristic_type or not annotation_type:
-        return False
-    if heuristic_type != annotation_type:
-        return True
-
-    heuristic_unit_type = str(heuristic_features.get("antibody_unit_type") or "")
-    annotation_unit_type = str(getattr(antibody_annotation, "unit_type", None) or "")
-    if heuristic_unit_type or annotation_unit_type:
-        return heuristic_unit_type != annotation_unit_type
-
-    heuristic_subtype_normalized = str(heuristic_subtype or "")
-    annotation_subtype_normalized = str(getattr(antibody_annotation, "subtype", None) or "")
-    if heuristic_type == "antibody light chain":
-        light_subtypes = {"light", "light:kappa", "light:lambda"}
-        if (
-            heuristic_subtype_normalized in light_subtypes
-            and annotation_subtype_normalized in light_subtypes
-        ):
-            return False
-    if (
-        heuristic_subtype_normalized in {"VHH", "scFv", "light:kappa", "light:lambda"}
-        or annotation_subtype_normalized in {"VHH", "scFv", "light:kappa", "light:lambda"}
-    ):
-        return heuristic_subtype_normalized != annotation_subtype_normalized
-
-    return False
-
-
 def _is_hoh_water_chain(
     entity: dict[str, Any],
     monomer_ids: list[str],
@@ -1109,6 +1042,18 @@ def _apply_single_chain_coverage(
     distance_threshold: float = 4.5,
 ) -> None:
     if coverage_mode != "nearest":
+        for record in chain_records:
+            record.features["coverage_mode"] = coverage_mode
+            record.features["coverage_status"] = "unsupported_mode"
+            record.warnings.append(f"coverage mode {coverage_mode!r} is not implemented; coverage skipped")
+            _append_warning_detail(
+                record,
+                "coverage mode not implemented",
+                {
+                    "coverage_mode": coverage_mode,
+                    "supported_coverage_modes": ["nearest"],
+                },
+            )
         return
 
     subordinate_chain_types = {
@@ -1271,11 +1216,14 @@ def read_chain_inventory(
     model: int = 1,
     coverage_mode: str = "nearest",
     drop_hydrogens_for_analysis: bool = True,
+    sadie_domain_bitscore_threshold: float = 80.0,
+    sadie_domain_limit: int = 4,
+    cif_file: CIFFile | None = None,
 ) -> list[ChainRecord]:
     """Build the annotated chain inventory for one mmCIF structure."""
 
     cif_path = Path(path)
-    cif_file = read_cif_file(cif_path)
+    cif_file = cif_file or read_cif_file(cif_path)
     pdb_id = _infer_pdb_id(cif_path, cif_file)
     LOGGER.debug("Reading chain inventory for %s from %s", pdb_id, cif_path)
     entity_map = _build_entity_map(cif_file)
@@ -1337,6 +1285,8 @@ def read_chain_inventory(
             monomer_ids,
             chem_comp_map,
             length=length,
+            sadie_domain_bitscore_threshold=sadie_domain_bitscore_threshold,
+            sadie_domain_limit=sadie_domain_limit,
         )
         warnings.extend(rule_warnings)
         features["chain_id_mapping"] = {
@@ -1430,22 +1380,30 @@ def read_structure_summary(
     use_author_fields: bool = False,
     coverage_mode: str = "nearest",
     drop_hydrogens_for_analysis: bool = True,
+    chain_inventory: list[ChainRecord] | None = None,
+    sadie_domain_bitscore_threshold: float = 80.0,
+    sadie_domain_limit: int = 4,
+    cif_file: CIFFile | None = None,
 ) -> StructureSummary:
     """Read a structure-level summary and filtered visible chain ids."""
 
     cif_path = Path(path)
-    cif_file = read_cif_file(cif_path)
+    cif_file = cif_file or read_cif_file(cif_path)
     LOGGER.debug("Reading structure summary from %s", cif_path)
     assembly_map = {
         str(assembly_id): str(description)
         for assembly_id, description in list_assemblies(cif_file).items()
     }
-    chain_inventory = read_chain_inventory(
-        cif_path,
-        model=model,
-        coverage_mode=coverage_mode,
-        drop_hydrogens_for_analysis=drop_hydrogens_for_analysis,
-    )
+    if chain_inventory is None:
+        chain_inventory = read_chain_inventory(
+            cif_path,
+            model=model,
+            coverage_mode=coverage_mode,
+            drop_hydrogens_for_analysis=drop_hydrogens_for_analysis,
+            sadie_domain_bitscore_threshold=sadie_domain_bitscore_threshold,
+            sadie_domain_limit=sadie_domain_limit,
+            cif_file=cif_file,
+        )
     try:
         atom_array = get_structure(
             cif_file,

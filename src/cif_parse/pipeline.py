@@ -10,6 +10,8 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from biotite.structure.io.pdbx import CIFFile
+
 from cif_parse.annotate import apply_antibody_pairing
 from cif_parse.assemble import (
     identify_antibody_antigen_complexes,
@@ -219,13 +221,17 @@ def process_single_structure(
     input_path = Path(input_path)
     outdir = Path(outdir)
     LOGGER.info("Processing mmCIF %s", input_path)
-    preflight = read_structure_preflight(input_path)
+    cif_file = read_cif_file(input_path)
+    preflight = read_structure_preflight(input_path, cif_file=cif_file)
     validate_preflight_inputs(input_path, preflight, settings)
     chain_inventory = read_chain_inventory(
         input_path,
         model=settings.model,
         coverage_mode=settings.coverage_mode,
         drop_hydrogens_for_analysis=settings.drop_hydrogens_for_analysis,
+        sadie_domain_bitscore_threshold=settings.sadie_domain_bitscore_threshold,
+        sadie_domain_limit=settings.sadie_domain_limit,
+        cif_file=cif_file,
     )
     validate_processing_inputs(input_path, chain_inventory, settings)
     summary = read_structure_summary(
@@ -234,6 +240,10 @@ def process_single_structure(
         use_author_fields=settings.use_author_fields,
         coverage_mode=settings.coverage_mode,
         drop_hydrogens_for_analysis=settings.drop_hydrogens_for_analysis,
+        chain_inventory=chain_inventory,
+        sadie_domain_bitscore_threshold=settings.sadie_domain_bitscore_threshold,
+        sadie_domain_limit=settings.sadie_domain_limit,
+        cif_file=cif_file,
     )
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
@@ -241,6 +251,7 @@ def process_single_structure(
         _dump_atom_cache(
             outdir=outdir,
             input_path=input_path,
+            cif_file=cif_file,
             assembly_mode=settings.assembly_mode,
             selected_assembly_id=None,
             model=settings.model,
@@ -251,6 +262,7 @@ def process_single_structure(
             settings=settings,
             summary=summary,
             chain_inventory=chain_inventory,
+            cif_file=cif_file,
             analysis_assembly_mode=settings.assembly_mode,
             selected_assembly_id=None,
             bundle_name="result.json.gz",
@@ -276,7 +288,7 @@ def process_single_structure(
                 details={"max_assembly_atoms": getattr(settings, "max_assembly_atoms", None)},
             )
     else:
-        available_assembly_ids = read_available_assembly_ids(input_path)
+        available_assembly_ids = read_available_assembly_ids(input_path, cif_file=cif_file)
         if not available_assembly_ids:
             raise StructureSkipWarning(
                 "no_available_assemblies_for_all_mode",
@@ -285,7 +297,7 @@ def process_single_structure(
             )
         atom_counts: dict[str, int] = {}
         try:
-            atom_counts = preflight_assembly_atom_counts(input_path)
+            atom_counts = preflight_assembly_atom_counts(input_path, cif_file=cif_file)
         except Exception:
             LOGGER.debug("Failed to estimate assembly atom counts for %s", input_path, exc_info=True)
         max_assembly_atoms = getattr(settings, "max_assembly_atoms", None)
@@ -337,6 +349,7 @@ def process_single_structure(
     _dump_atom_cache_au(
         outdir=outdir,
         input_path=input_path,
+        cif_file=cif_file,
         model=settings.model,
     )
 
@@ -356,6 +369,7 @@ def process_single_structure(
                     settings=settings,
                     summary=summary,
                     chain_inventory=chain_inventory,
+                    cif_file=cif_file,
                     selected_assembly_id=assembly_id,
                     bundle_name=bundle_name,
                 )
@@ -379,6 +393,7 @@ def process_single_structure(
                 settings=settings,
                 summary=summary,
                 chain_inventory=chain_inventory,
+                cif_file=cif_file,
                 selected_assembly_id=assembly_id,
                 bundle_name=bundle_name,
             )
@@ -420,6 +435,7 @@ def _dump_atom_cache_au(
     *,
     outdir: Path,
     input_path: Path,
+    cif_file: CIFFile | None = None,
     model: int,
 ) -> None:
     """Write the asymmetric unit atom cache (``atoms/_none.pkl``) once.
@@ -434,7 +450,7 @@ def _dump_atom_cache_au(
         return
     try:
         from biotite.structure.io.pdbx import get_structure
-        cif_file = read_cif_file(input_path)
+        cif_file = cif_file or read_cif_file(input_path)
         atom_array = get_structure(cif_file, model=model, use_author_fields=False)
         if atom_array is not None and len(atom_array) > 0:
             au_cache_path.write_bytes(
@@ -451,6 +467,7 @@ def _process_single_assembly_parallel(
     settings: Any,
     summary: Any,
     chain_inventory: list[Any],
+    cif_file: CIFFile | None = None,
     selected_assembly_id: str,
     bundle_name: str,
 ) -> dict[str, Any]:
@@ -461,6 +478,7 @@ def _process_single_assembly_parallel(
     _dump_atom_cache(
         outdir=outdir,
         input_path=input_path,
+        cif_file=cif_file,
         assembly_mode="all",
         selected_assembly_id=selected_assembly_id,
         model=settings.model,
@@ -471,6 +489,7 @@ def _process_single_assembly_parallel(
         settings=settings,
         summary=summary,
         chain_inventory=chain_inventory,
+        cif_file=cif_file,
         analysis_assembly_mode="all",
         selected_assembly_id=selected_assembly_id,
         bundle_name=bundle_name,
@@ -491,6 +510,7 @@ def _dump_atom_cache(
     *,
     outdir: Path,
     input_path: Path,
+    cif_file: CIFFile | None = None,
     assembly_mode: str,
     selected_assembly_id: str | None,
     model: int,
@@ -508,7 +528,7 @@ def _dump_atom_cache(
     try:
         from biotite.structure.io.pdbx import get_assembly, get_structure
 
-        cif_file = read_cif_file(input_path)
+        cif_file = cif_file or read_cif_file(input_path)
 
         # Always cache asymmetric unit (needed by monomer extraction)
         au_cache_path = atoms_dir / "_none.pkl"
@@ -523,10 +543,14 @@ def _dump_atom_cache(
                 LOGGER.debug("Failed to cache asymmetric unit for %s", input_path)
 
         # Cache assembly-expanded coordinates when applicable
-        if assembly_mode in ("largest_assembly", "all"):
+        if assembly_mode in ("largest_assembly", "first_assembly", "all"):
             effective_assembly_id = selected_assembly_id
             if effective_assembly_id is None and assembly_mode == "largest_assembly":
                 effective_assembly_id = select_largest_polymer_assembly_id(cif_file)
+            elif effective_assembly_id is None and assembly_mode == "first_assembly":
+                from cif_parse.io.cif_reader import read_available_assembly_ids
+                available = read_available_assembly_ids(input_path, cif_file=cif_file)
+                effective_assembly_id = available[0] if available else None
 
             if effective_assembly_id:
                 asm_cache_path = atoms_dir / f"{effective_assembly_id}.pkl"
@@ -564,6 +588,7 @@ def _process_single_structure_for_mode(
     settings: AppSettings,
     summary: Any,
     chain_inventory: list[Any],
+    cif_file: CIFFile | None = None,
     analysis_assembly_mode: str,
     selected_assembly_id: str | None,
     bundle_name: str,
@@ -580,6 +605,7 @@ def _process_single_structure_for_mode(
         atom_contact_cutoff=settings.atom_contact_cutoff,
         min_residue_contacts=settings.min_residue_contacts,
         min_atom_contacts=settings.min_atom_contacts,
+        cif_file=cif_file,
     )
     apply_antibody_pairing(working_chain_inventory, dimer_interfaces)
     LOGGER.debug(
@@ -588,15 +614,23 @@ def _process_single_structure_for_mode(
         summary.pdb_id,
         f" assembly {selected_assembly_id}" if selected_assembly_id is not None else "",
     )
-    _, assembly_copy_numbers = read_assembly_copy_numbers(input_path, assembly_id=selected_assembly_id)
-    _, assembly_chain_operations = read_assembly_chain_operations(input_path, assembly_id=selected_assembly_id)
+    _, assembly_copy_numbers = read_assembly_copy_numbers(
+        input_path,
+        assembly_id=selected_assembly_id,
+        cif_file=cif_file,
+    )
+    _, assembly_chain_operations = read_assembly_chain_operations(
+        input_path,
+        assembly_id=selected_assembly_id,
+        cif_file=cif_file,
+    )
     tight_multimers = identify_tight_multimers(
         working_chain_inventory,
         dimer_interfaces,
         assembly_mode=analysis_assembly_mode,
-        assembly_copy_numbers=assembly_copy_numbers if analysis_assembly_mode in {"largest_assembly", "all"} else {},
+        assembly_copy_numbers=assembly_copy_numbers if analysis_assembly_mode in {"largest_assembly", "first_assembly", "all"} else {},
         assembly_chain_operations=(
-            assembly_chain_operations if analysis_assembly_mode in {"largest_assembly", "all"} else {}
+            assembly_chain_operations if analysis_assembly_mode in {"largest_assembly", "first_assembly", "all"} else {}
         ),
         min_buried_area=settings.tight_multimer_min_buried_area,
         louvain_resolution=settings.tight_multimer_louvain_resolution,

@@ -141,32 +141,6 @@ CHAIN_CODE_DESCRIPTION_HINTS = {
     "D": ("delta",),
 }
 
-# Antibody sequence heuristic motifs
-HEAVY_PREFIX_MOTIFS = (
-    "QVQL",
-    "EVQL",
-    "DVQL",
-    "DIQV",
-    "QVQLV",
-    "EVQLV",
-    "GLVQ",
-    "QVQ",
-    "EVQ",
-)
-LIGHT_PREFIX_MOTIFS = (
-    "DIQ",
-    "DIV",
-    "DVV",
-    "EIV",
-    "QSV",
-    "QIV",
-    "ELV",
-    "AIQ",
-    "TVL",
-)
-HEAVY_J_MOTIFS = ("WGQG", "WGPG", "WGRG", "WGGG", "WSQG", "WGKG")
-LIGHT_J_MOTIFS = ("FGQG", "FGSG", "LGQG", "SGSG", "QGTK", "FGGG")
-
 # ---------------------------------------------------------------------------
 # Reporting / review defaults
 # ---------------------------------------------------------------------------

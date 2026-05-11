@@ -3,16 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from cif_parse.constants import (
-    ANTIBODY_DESCRIPTION_MARKERS,
-    HEAVY_J_MOTIFS,
-    HEAVY_PREFIX_MOTIFS,
-    LIGHT_J_MOTIFS,
-    LIGHT_PREFIX_MOTIFS,
-    SCFV_LINKER_MOTIFS,
-)
-
-from .immune import analyze_immune_sequence
+from .immune import ImmuneSequenceAnnotation, analyze_immune_sequence
 
 
 @dataclass(slots=True)
@@ -57,180 +48,55 @@ class AntibodyAnnotation:
         return payload
 
 
-def _protein_letters(sequence: str | None) -> str:
-    if not sequence:
-        return ""
-    return "".join(char for char in sequence.upper() if "A" <= char <= "Z")
-
-
-def _find_first(sequence: str, motifs: tuple[str, ...]) -> str | None:
-    for motif in motifs:
-        if motif in sequence:
-            return motif
-    return None
-
-
 def analyze_antibody_sequence(
     description: str | None,
     sequence: str | None,
+    *,
+    immune_annotation: ImmuneSequenceAnnotation | None = None,
+    domain_bitscore_threshold: float = 80.0,
+    domain_limit: int = 4,
 ) -> AntibodyAnnotation:
-    immune_annotation = analyze_immune_sequence(description, sequence)
-    if immune_annotation.chain_type in {"antibody heavy chain", "antibody light chain"}:
-        annotation = AntibodyAnnotation(
-            chain_type=immune_annotation.chain_type,
-            subtype=immune_annotation.subtype,
-            annotation_confidence=immune_annotation.annotation_confidence,
-            description_hits=list(immune_annotation.description_hits),
-            sequence_hits=list(immune_annotation.sequence_hits),
-            heavy_score=round(
-                immune_annotation.top_bitscore
-                if immune_annotation.chain_type == "antibody heavy chain"
-                or immune_annotation.contains_fused_heavy_fv
-                else 0.0,
-                3,
-            ),
-            light_score=round(
-                immune_annotation.top_bitscore
-                if immune_annotation.chain_type == "antibody light chain"
-                or immune_annotation.contains_fused_light_fv
-                else 0.0,
-                3,
-            ),
-            unit_type=immune_annotation.unit_type,
-            contains_fused_heavy_fv=immune_annotation.contains_fused_heavy_fv,
-            contains_fused_light_fv=immune_annotation.contains_fused_light_fv,
-            linker_motif=immune_annotation.linker_motif,
-            variable_domains=[domain.to_dict() for domain in immune_annotation.variable_domains],
-            vhh_evidence=dict(immune_annotation.vhh_evidence),
-            heavy_only_evidence=dict(immune_annotation.heavy_only_evidence),
-            tool=immune_annotation.tool,
-            numbering_scheme=immune_annotation.numbering_scheme,
-            region_definition=immune_annotation.region_definition,
+    if immune_annotation is None:
+        immune_annotation = analyze_immune_sequence(
+            description,
+            sequence,
+            domain_bitscore_threshold=domain_bitscore_threshold,
+            domain_limit=domain_limit,
         )
-        return annotation
+    if immune_annotation.chain_type not in {"antibody heavy chain", "antibody light chain"}:
+        return AntibodyAnnotation()
 
-    description_lower = (description or "").lower()
-    sequence_clean = _protein_letters(sequence)
-    annotation = AntibodyAnnotation()
-
-    if not description_lower and not sequence_clean:
-        return annotation
-
-    heavy_score = 0.0
-    light_score = 0.0
-
-    if any(marker in description_lower for marker in ANTIBODY_DESCRIPTION_MARKERS):
-        annotation.description_hits.append("antibody_context")
-        heavy_score += 0.5
-        light_score += 0.5
-
-    if "heavy chain" in description_lower:
-        annotation.description_hits.append("heavy_chain")
-        heavy_score += 2.0
-    if "light chain" in description_lower:
-        annotation.description_hits.append("light_chain")
-        light_score += 2.0
-    if "kappa" in description_lower:
-        annotation.description_hits.append("kappa")
-        light_score += 1.5
-    if "lambda" in description_lower:
-        annotation.description_hits.append("lambda")
-        light_score += 1.5
-    if "nanobody" in description_lower or "vhh" in description_lower:
-        annotation.description_hits.append("vhh")
-        heavy_score += 2.5
-        annotation.unit_type = "VHH"
-    if "single-chain fv" in description_lower or "scfv" in description_lower:
-        annotation.description_hits.append("scfv")
-        heavy_score += 2.5
-        light_score += 2.5
-        annotation.unit_type = "scFv"
-        annotation.contains_fused_heavy_fv = True
-        annotation.contains_fused_light_fv = True
-
-    if sequence_clean:
-        prefix4 = sequence_clean[:4]
-        prefix3 = sequence_clean[:3]
-        if any(sequence_clean.startswith(motif) for motif in HEAVY_PREFIX_MOTIFS):
-            annotation.sequence_hits.append(f"heavy_prefix:{prefix4 or prefix3}")
-            heavy_score += 2.0
-        if any(sequence_clean.startswith(motif) for motif in LIGHT_PREFIX_MOTIFS):
-            annotation.sequence_hits.append(f"light_prefix:{prefix4 or prefix3}")
-            light_score += 2.0
-
-        yyc_position = sequence_clean.find("YYC")
-        if 70 <= yyc_position <= 120:
-            annotation.sequence_hits.append("cdr3_anchor:YYC")
-            heavy_score += 1.0
-            light_score += 0.5
-
-        heavy_j_motif = _find_first(sequence_clean[90:150], HEAVY_J_MOTIFS)
-        if heavy_j_motif:
-            annotation.sequence_hits.append(f"heavy_j:{heavy_j_motif}")
-            annotation.variable_domain_end_motif = heavy_j_motif
-            heavy_score += 1.5
-
-        light_j_motif = _find_first(sequence_clean[80:140], LIGHT_J_MOTIFS)
-        if light_j_motif:
-            annotation.sequence_hits.append(f"light_j:{light_j_motif}")
-            annotation.variable_domain_end_motif = light_j_motif
-            light_score += 1.5
-
-        if 105 <= len(sequence_clean) <= 145:
-            annotation.sequence_hits.append("single_domain_length")
-            heavy_score += 0.5
-            light_score += 0.5
-        if len(sequence_clean) >= 210:
-            annotation.sequence_hits.append("long_chain_length")
-            heavy_score += 0.5
-
-        linker_motif = _find_first(sequence_clean, SCFV_LINKER_MOTIFS)
-        if linker_motif:
-            annotation.sequence_hits.append(f"scfv_linker:{linker_motif}")
-            annotation.linker_motif = linker_motif
-            annotation.unit_type = "scFv"
-            annotation.contains_fused_heavy_fv = True
-            annotation.contains_fused_light_fv = True
-            heavy_score += 2.0
-            light_score += 2.0
-
-    annotation.heavy_score = round(heavy_score, 3)
-    annotation.light_score = round(light_score, 3)
-
-    score_gap = abs(heavy_score - light_score)
-    dominant_score = max(heavy_score, light_score)
-    if annotation.unit_type == "scFv":
-        annotation.chain_type = "antibody heavy chain"
-        annotation.subtype = "scFv"
-        annotation.annotation_confidence = 0.9 if dominant_score >= 4.0 else 0.75
-        return annotation
-
-    if annotation.unit_type == "VHH":
-        annotation.chain_type = "antibody heavy chain"
-        annotation.subtype = "VHH"
-        annotation.annotation_confidence = 0.9 if heavy_score >= 3.0 else 0.75
-        return annotation
-
-    if dominant_score < 2.5:
-        return annotation
-
-    if heavy_score > light_score and (score_gap >= 0.75 or heavy_score >= 4.0):
-        annotation.chain_type = "antibody heavy chain"
-        annotation.subtype = "heavy"
-        annotation.annotation_confidence = 0.85 if heavy_score >= 4.0 else 0.7
-        return annotation
-
-    if light_score > heavy_score and (score_gap >= 0.75 or light_score >= 4.0):
-        annotation.chain_type = "antibody light chain"
-        annotation.subtype = "light"
-        if "kappa" in annotation.description_hits:
-            annotation.subtype = "light:kappa"
-        elif "lambda" in annotation.description_hits:
-            annotation.subtype = "light:lambda"
-        annotation.annotation_confidence = 0.85 if light_score >= 4.0 else 0.7
-        return annotation
-
-    return annotation
+    return AntibodyAnnotation(
+        chain_type=immune_annotation.chain_type,
+        subtype=immune_annotation.subtype,
+        annotation_confidence=immune_annotation.annotation_confidence,
+        description_hits=list(immune_annotation.description_hits),
+        sequence_hits=list(immune_annotation.sequence_hits),
+        heavy_score=round(
+            immune_annotation.top_bitscore
+            if immune_annotation.chain_type == "antibody heavy chain"
+            or immune_annotation.contains_fused_heavy_fv
+            else 0.0,
+            3,
+        ),
+        light_score=round(
+            immune_annotation.top_bitscore
+            if immune_annotation.chain_type == "antibody light chain"
+            or immune_annotation.contains_fused_light_fv
+            else 0.0,
+            3,
+        ),
+        unit_type=immune_annotation.unit_type,
+        contains_fused_heavy_fv=immune_annotation.contains_fused_heavy_fv,
+        contains_fused_light_fv=immune_annotation.contains_fused_light_fv,
+        linker_motif=immune_annotation.linker_motif,
+        variable_domains=[domain.to_dict() for domain in immune_annotation.variable_domains],
+        vhh_evidence=dict(immune_annotation.vhh_evidence),
+        heavy_only_evidence=dict(immune_annotation.heavy_only_evidence),
+        tool=immune_annotation.tool,
+        numbering_scheme=immune_annotation.numbering_scheme,
+        region_definition=immune_annotation.region_definition,
+    )
 
 
 def apply_antibody_pairing(chain_records: list[Any], dimer_interfaces: list[Any]) -> None:

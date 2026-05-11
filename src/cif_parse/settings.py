@@ -10,7 +10,8 @@ from typing import Any
 
 
 SUPPORTED_FORMATS = frozenset({"json", "csv"})
-SUPPORTED_ASSEMBLY_MODES = frozenset({"largest_assembly", "asymmetric_unit", "all"})
+SUPPORTED_ASSEMBLY_MODES = frozenset({"largest_assembly", "first_assembly", "asymmetric_unit", "all"})
+ASSEMBLY_MODES_REQUIRING_ASSEMBLY_ID = frozenset({"largest_assembly", "first_assembly", "all"})
 SUPPORTED_COVERAGE_MODES = frozenset({"nearest", "contact", "covalent"})
 SUPPORTED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR"})
 SUPPORTED_CLUSTERING_SEQUENCE_MODES = frozenset({"skip", "exact", "mmseqs2"})
