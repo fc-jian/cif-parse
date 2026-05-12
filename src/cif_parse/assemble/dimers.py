@@ -61,6 +61,16 @@ def _dimer_rank_key(dimer: DimerInterfaceRecord) -> tuple[float, int, int, float
     )
 
 
+def _bbox_distance_from_geometries(geometry_1: object, geometry_2: object) -> float:
+    import numpy as np
+
+    delta = np.maximum(
+        0.0,
+        np.maximum(geometry_1.bbox_min - geometry_2.bbox_max, geometry_2.bbox_min - geometry_1.bbox_max),
+    )
+    return float(np.sqrt(np.sum(delta * delta)))
+
+
 def _deduplicate_dimer_interfaces(dimers: list[DimerInterfaceRecord]) -> list[DimerInterfaceRecord]:
     grouped: dict[tuple[str, str, str | None, str, str, str, str, bool], list[DimerInterfaceRecord]] = {}
     for dimer in dimers:
@@ -192,6 +202,8 @@ def identify_dimer_interfaces(
             continue
         for instance_id_2 in ordered_instance_ids[index + 1 :]:
             geometry_2 = geometries[instance_id_2]
+            if _bbox_distance_from_geometries(geometry_1, geometry_2) > residue_contact_cutoff:
+                continue
             label_asym_id_2 = geometry_2.label_asym_id
             if label_asym_id_2 not in chain_map:
                 continue

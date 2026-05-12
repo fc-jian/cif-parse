@@ -66,7 +66,7 @@ cif-parse-refine abag \
 
 ## 算法
 
-1. **抗体 Fv 裁剪**: 使用 SADIE IMGT 注释的 `variable_domains`，对 paired Fab 裁剪到 Fv 区域（VHH/scFv 完整保留）
+1. **抗体 Fv 裁剪**: 使用 `variable_domains[*].fv_seq_start/fv_seq_end` 作为结构 Fv 边界；`seq_start/seq_end` 和 `cdr_regions` 保持严格 SADIE/IMGT 编号。若 Fv 末端来自 FR4 motif 修复，refine JSON 会输出 `fv_boundary_repaired_by_motif_requires_review` warning，提醒人工检查。
 2. **抗原 domain 鉴定**: 计算 Cα-Cα 距离（≤ 8.0 Å）建立残基邻接图 → Louvain community detection 识别 domain
 3. **Domain 筛选**: 保留与抗体 Fv 有 ≥ 3 个残基接触的 domain，删除其他
 

@@ -190,6 +190,84 @@ def _count_category_rows(cif_file: CIFFile, category_name: str, column_name: str
     return len(category[column_name].as_array())
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text in {"", ".", "?", "None", "none", "nan", "NaN"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _category_column_values(cif_file: CIFFile, category_name: str, column_name: str) -> list[str]:
+    block = cif_file[_default_block_name(cif_file)]
+    if category_name not in block:
+        return []
+    category = block[category_name]
+    if column_name not in category:
+        return []
+    return [str(value) for value in category[column_name].as_array().tolist()]
+
+
+def _pick_first_metadata_value(values: list[str]) -> str:
+    for value in values:
+        text = str(value).strip()
+        if text and text not in {".", "?"}:
+            return text
+    return ""
+
+
+def read_case_metadata(path: str | Path, *, cif_file: CIFFile | None = None) -> dict[str, Any]:
+    """Read cheap per-entry metadata from an already parsed CIF when available."""
+
+    cif_path = Path(path)
+    cif_file = cif_file or read_cif_file(cif_path)
+    entity_map = _build_entity_map(cif_file)
+
+    asym_ids: list[str] = []
+    polymer_count = 0
+    for row in _category_rows(cif_file, "struct_asym"):
+        asym_id = row.get("id")
+        if asym_id:
+            asym_ids.append(asym_id)
+        entity_id = row.get("entity_id")
+        if entity_id:
+            entity = entity_map.get(entity_id, {})
+            if str(entity.get("entity_type", "")).lower() == "polymer":
+                polymer_count += 1
+
+    num_assemblies = len(_category_rows(cif_file, "pdbx_struct_assembly_gen"))
+    method = _pick_first_metadata_value(
+        [
+            *_category_column_values(cif_file, "exptl", "method"),
+            *_category_column_values(cif_file, "exptl_crystal", "method"),
+        ]
+    )
+    resolution_values = [
+        *_category_column_values(cif_file, "refine", "ls_d_res_high"),
+        *_category_column_values(cif_file, "reflns", "d_resolution_high"),
+        *_category_column_values(cif_file, "em_3d_reconstruction", "resolution"),
+    ]
+    resolutions = sorted(value for value in (_safe_float(item) for item in resolution_values) if value is not None)
+    release_dates = [
+        date
+        for date in _category_column_values(cif_file, "pdbx_audit_revision_history", "revision_date")
+        if str(date).strip() not in {"", ".", "?"}
+    ]
+
+    return {
+        "experimental_method": method,
+        "resolution": round(resolutions[0], 2) if resolutions else "",
+        "release_date": min(release_dates) if release_dates else "",
+        "num_polymer_chains": polymer_count,
+        "num_asym_ids": len(asym_ids),
+        "num_assemblies": num_assemblies,
+    }
+
+
 def _category_rows(cif_file: CIFFile, category_name: str) -> list[dict[str, str | None]]:
     block = cif_file[_default_block_name(cif_file)]
     if category_name not in block:
@@ -930,6 +1008,13 @@ def _classify_chain(
                 features["variable_domains"] = [
                     domain.to_dict() for domain in immune_annotation.variable_domains
                 ]
+                warnings.extend(
+                    warning for warning in immune_annotation.warnings if warning not in warnings
+                )
+                if immune_annotation.warning_details:
+                    features["immune_annotation_warning_details"] = dict(
+                        immune_annotation.warning_details
+                    )
                 if immune_annotation.chain_type.startswith("antibody"):
                     antibody_annotation = analyze_antibody_sequence(
                         entity.get("entity_description"),
@@ -1117,6 +1202,26 @@ def _apply_single_chain_coverage(
         for record in chain_records
         if record.chain_type in primary_chain_types and record.label_asym_id in chain_coords
     }
+    primary_labels = sorted(primary_records)
+    primary_tree = None
+    primary_tree_labels: list[str] = []
+    if primary_labels:
+        try:
+            from scipy.spatial import cKDTree
+
+            coords: list[np.ndarray] = []
+            labels: list[str] = []
+            for owner_label in primary_labels:
+                owner_coords = chain_coords[owner_label]
+                if owner_coords.size == 0:
+                    continue
+                coords.append(owner_coords)
+                labels.extend([owner_label] * owner_coords.shape[0])
+            if coords:
+                primary_tree = cKDTree(np.vstack(coords))
+                primary_tree_labels = labels
+        except Exception:
+            LOGGER.debug("Falling back to brute-force coverage assignment", exc_info=True)
 
     for record in chain_records:
         if record.chain_type not in subordinate_chain_types:
@@ -1139,22 +1244,28 @@ def _apply_single_chain_coverage(
             continue
 
         owner_labels: list[str] = []
-        for atom_coord in sub_coords:
-            best_owner_label: str | None = None
-            best_distance_sq: float | None = None
-            for owner_label, owner_record in primary_records.items():
-                owner_coords = chain_coords[owner_label]
-                if owner_coords.size == 0:
-                    continue
-                deltas = owner_coords - atom_coord
-                distance_sq = float(np.sum(deltas * deltas, axis=1).min())
-                if best_distance_sq is None or distance_sq < best_distance_sq:
-                    best_distance_sq = distance_sq
-                    best_owner_label = owner_label
+        if primary_tree is not None and primary_tree_labels:
+            distances, indices = primary_tree.query(sub_coords, k=1, distance_upper_bound=distance_threshold)
+            for distance, index in zip(np.atleast_1d(distances), np.atleast_1d(indices), strict=False):
+                if np.isfinite(distance) and int(index) < len(primary_tree_labels):
+                    owner_labels.append(primary_tree_labels[int(index)])
+        else:
+            for atom_coord in sub_coords:
+                best_owner_label: str | None = None
+                best_distance_sq: float | None = None
+                for owner_label in primary_records:
+                    owner_coords = chain_coords[owner_label]
+                    if owner_coords.size == 0:
+                        continue
+                    deltas = owner_coords - atom_coord
+                    distance_sq = float(np.sum(deltas * deltas, axis=1).min())
+                    if best_distance_sq is None or distance_sq < best_distance_sq:
+                        best_distance_sq = distance_sq
+                        best_owner_label = owner_label
 
-            if best_owner_label and best_distance_sq is not None:
-                if best_distance_sq ** 0.5 <= distance_threshold:
-                    owner_labels.append(best_owner_label)
+                if best_owner_label and best_distance_sq is not None:
+                    if best_distance_sq ** 0.5 <= distance_threshold:
+                        owner_labels.append(best_owner_label)
 
         unique_owner_labels = sorted(set(owner_labels))
         owner_auth_ids = [

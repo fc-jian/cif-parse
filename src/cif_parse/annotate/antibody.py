@@ -26,6 +26,8 @@ class AntibodyAnnotation:
     tool: str = ""
     numbering_scheme: str = ""
     region_definition: str = ""
+    warnings: list[str] = field(default_factory=list)
+    warning_details: dict[str, Any] = field(default_factory=dict)
 
     def to_feature_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -96,6 +98,8 @@ def analyze_antibody_sequence(
         tool=immune_annotation.tool,
         numbering_scheme=immune_annotation.numbering_scheme,
         region_definition=immune_annotation.region_definition,
+        warnings=list(immune_annotation.warnings),
+        warning_details=dict(immune_annotation.warning_details),
     )
 
 

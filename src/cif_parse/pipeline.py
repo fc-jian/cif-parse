@@ -24,6 +24,7 @@ from cif_parse.io import (
     read_assembly_chain_operations,
     read_assembly_copy_numbers,
     read_available_assembly_ids,
+    read_case_metadata,
     read_chain_inventory,
     read_structure_summary,
     read_structure_preflight,
@@ -222,6 +223,11 @@ def process_single_structure(
     outdir = Path(outdir)
     LOGGER.info("Processing mmCIF %s", input_path)
     cif_file = read_cif_file(input_path)
+    try:
+        metadata = read_case_metadata(input_path, cif_file=cif_file)
+    except Exception:
+        LOGGER.debug("Failed to read metadata for %s", input_path, exc_info=True)
+        metadata = {}
     preflight = read_structure_preflight(input_path, cif_file=cif_file)
     validate_preflight_inputs(input_path, preflight, settings)
     chain_inventory = read_chain_inventory(
@@ -248,12 +254,18 @@ def process_single_structure(
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
     if settings.assembly_mode != "all":
+        selected_assembly_id = _resolve_single_mode_assembly_id(
+            input_path=input_path,
+            cif_file=cif_file,
+            settings=settings,
+            pdb_id=summary.pdb_id,
+        )
         _dump_atom_cache(
             outdir=outdir,
             input_path=input_path,
             cif_file=cif_file,
             assembly_mode=settings.assembly_mode,
-            selected_assembly_id=None,
+            selected_assembly_id=selected_assembly_id,
             model=settings.model,
         )
         result = _process_single_structure_for_mode(
@@ -264,9 +276,10 @@ def process_single_structure(
             chain_inventory=chain_inventory,
             cif_file=cif_file,
             analysis_assembly_mode=settings.assembly_mode,
-            selected_assembly_id=None,
-            bundle_name="result.json.gz",
+            selected_assembly_id=selected_assembly_id,
+            bundle_name=_resolve_single_mode_bundle_name(settings, selected_assembly_id),
         )
+        result["_meta"] = metadata
         LOGGER.info(
             "Finished %s: %d chains, %d dimers, %d multimers, %d antibody complexes, %d TCR complexes",
             summary.pdb_id,
@@ -369,7 +382,7 @@ def process_single_structure(
                     settings=settings,
                     summary=summary,
                     chain_inventory=chain_inventory,
-                    cif_file=cif_file,
+                    cif_file=None,
                     selected_assembly_id=assembly_id,
                     bundle_name=bundle_name,
                 )
@@ -428,7 +441,86 @@ def process_single_structure(
         "num_assemblies_processed": len(assembly_results),
         "processed_assembly_ids": assembly_ids,
         "assembly_results": assembly_results,
+        "_meta": metadata,
     }
+
+
+def _resolve_single_mode_assembly_id(
+    *,
+    input_path: Path,
+    cif_file: CIFFile,
+    settings: AppSettings,
+    pdb_id: str,
+) -> str | None:
+    if settings.assembly_mode == "largest_assembly":
+        return select_largest_polymer_assembly_id(cif_file)
+    if settings.assembly_mode != "first_assembly":
+        return None
+
+    available_assembly_ids = read_available_assembly_ids(input_path, cif_file=cif_file)
+    if not available_assembly_ids:
+        LOGGER.warning("No biological assembly ids found for %s in first_assembly mode; using asymmetric unit", pdb_id)
+        return None
+
+    atom_counts: dict[str, int] = {}
+    try:
+        atom_counts = preflight_assembly_atom_counts(input_path, cif_file=cif_file)
+    except Exception:
+        LOGGER.debug("Failed to estimate assembly atom counts for %s", input_path, exc_info=True)
+
+    max_assembly_atoms = getattr(settings, "max_assembly_atoms", None)
+    if max_assembly_atoms is None or max_assembly_atoms <= 0 or not atom_counts:
+        return available_assembly_ids[0]
+
+    skipped_large = [
+        aid
+        for aid in available_assembly_ids
+        if atom_counts.get(aid, 0) > max_assembly_atoms
+    ]
+    selected_assembly_id = next(
+        (aid for aid in available_assembly_ids if aid not in skipped_large),
+        None,
+    )
+    if selected_assembly_id is None:
+        raise StructureSkipWarning(
+            "first_assembly_candidates_exceed_max_atoms",
+            (
+                f"Skipping {pdb_id}: all {len(available_assembly_ids)} assemblies "
+                f"exceed {max_assembly_atoms} estimated atoms in first_assembly mode"
+            ),
+            details={
+                "assembly_ids": available_assembly_ids,
+                "assembly_atom_counts": atom_counts,
+                "max_assembly_atoms": max_assembly_atoms,
+            },
+        )
+
+    skipped_before_selected = [
+        aid
+        for aid in available_assembly_ids[: available_assembly_ids.index(selected_assembly_id)]
+        if aid in skipped_large
+    ]
+    if skipped_before_selected:
+        LOGGER.warning(
+            "first_assembly mode for %s selected assembly %s after skipping earlier assembly id(s) "
+            "exceeding %d estimated atoms: %s",
+            pdb_id,
+            selected_assembly_id,
+            max_assembly_atoms,
+            ", ".join(skipped_before_selected),
+        )
+    return selected_assembly_id
+
+
+def _resolve_single_mode_bundle_name(settings: AppSettings, selected_assembly_id: str | None) -> str:
+    if (
+        settings.assembly_mode == "first_assembly"
+        and settings.output_format == "json"
+        and not settings.debug
+        and selected_assembly_id
+    ):
+        return f"result_assembly_{selected_assembly_id}.json.gz"
+    return "result.json.gz"
 
 
 def _dump_atom_cache_au(
@@ -475,6 +567,8 @@ def _process_single_assembly_parallel(
 
     Handles the per-assembly atom cache write before delegating.
     """
+    if cif_file is None:
+        cif_file = read_cif_file(input_path)
     _dump_atom_cache(
         outdir=outdir,
         input_path=input_path,

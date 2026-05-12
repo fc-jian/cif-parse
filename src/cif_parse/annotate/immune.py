@@ -38,6 +38,14 @@ class VariableDomainAnnotation:
     bitscore: float
     evalue: float
     species: str | None = None
+    sadie_seq_start: int | None = None
+    sadie_seq_end: int | None = None
+    fv_seq_start: int | None = None
+    fv_seq_end: int | None = None
+    boundary_source: str = "sadie"
+    boundary_confidence: str = "high"
+    boundary_warnings: list[str] = field(default_factory=list)
+    boundary_evidence: dict[str, Any] = field(default_factory=dict)
     cdr_regions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -46,6 +54,14 @@ class VariableDomainAnnotation:
             payload["subtype"] = ""
         if self.species is None:
             payload["species"] = ""
+        if self.sadie_seq_start is None:
+            payload["sadie_seq_start"] = self.seq_start
+        if self.sadie_seq_end is None:
+            payload["sadie_seq_end"] = self.seq_end
+        if self.fv_seq_start is None:
+            payload["fv_seq_start"] = self.seq_start
+        if self.fv_seq_end is None:
+            payload["fv_seq_end"] = self.seq_end
         return payload
 
 
@@ -68,6 +84,8 @@ class ImmuneSequenceAnnotation:
     variable_domains: list[VariableDomainAnnotation] = field(default_factory=list)
     vhh_evidence: dict[str, Any] = field(default_factory=dict)
     heavy_only_evidence: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    warning_details: dict[str, Any] = field(default_factory=dict)
 
     def to_feature_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -329,6 +347,10 @@ def _number_selected_domains(
                 bitscore=float(matched_hit["bitscore"]) if matched_hit is not None else 0.0,
                 evalue=float(matched_hit["evalue"]) if matched_hit is not None else 0.0,
                 species=str(item["hmm_species"]) if item.get("hmm_species") else None,
+                sadie_seq_start=int(item["seqstart_index"]) + 1,
+                sadie_seq_end=int(item["seqend_index"]) + 1,
+                fv_seq_start=int(item["seqstart_index"]) + 1,
+                fv_seq_end=int(item["seqend_index"]) + 1,
                 cdr_regions=_cdr_regions_from_numbering(item, int(item["seqstart_index"])),
             )
         )
@@ -369,10 +391,11 @@ def _extend_fv_by_end_motif(
     domains: list[VariableDomainAnnotation],
     sequence: str,
 ) -> tuple[list[VariableDomainAnnotation], list[dict[str, Any]]]:
-    """Extend Fv domains where CDR3 is complete but FR4 is missing.
+    """Infer Fv boundaries where CDR3 is complete but FR4 is missing.
 
-    Returns ``(extended_domains, warnings)``.  A warning is emitted for each
-    domain that was extended.
+    The SADIE/IMGT numbering and CDR intervals remain unchanged.  A motif hit
+    only updates ``fv_seq_end`` for structural cropping and records explicit
+    low-confidence boundary evidence.
     """
     extended_domains: list[VariableDomainAnnotation] = []
     warnings: list[dict[str, Any]] = []
@@ -414,15 +437,15 @@ def _extend_fv_by_end_motif(
             continue
 
         new_end = current_end + best_offset
-        new_length = domain.length + best_offset
-
-        new_cdrs: list[dict[str, Any]] = []
-        for cdr in domain.cdr_regions:
-            cdr_copy = dict(cdr)
-            if cdr_copy.get("seq_end", 0) >= current_end - 5:
-                cdr_copy["seq_end"] = min(cdr_copy["seq_end"] + best_offset, new_end)
-                cdr_copy["length"] = cdr_copy["seq_end"] - cdr_copy["seq_start"] + 1
-            new_cdrs.append(cdr_copy)
+        boundary_warnings = sorted(set([*domain.boundary_warnings, "sadie_missing_fr4_region", "fv_boundary_extended_by_fr4_motif"]))
+        boundary_evidence = {
+            **domain.boundary_evidence,
+            "original_sadie_seq_end": current_end,
+            "extended_seq_end": new_end,
+            "extension": best_offset,
+            "end_motif": best_motif,
+            "cdr3_imgt_end": cdr3_end,
+        }
 
         extended_domains.append(
             VariableDomainAnnotation(
@@ -431,12 +454,20 @@ def _extend_fv_by_end_motif(
                 chain_type=domain.chain_type,
                 subtype=domain.subtype,
                 seq_start=domain.seq_start,
-                seq_end=new_end,
-                length=new_length,
+                seq_end=domain.seq_end,
+                length=domain.length,
                 bitscore=domain.bitscore,
                 evalue=domain.evalue,
                 species=domain.species,
-                cdr_regions=new_cdrs,
+                sadie_seq_start=domain.sadie_seq_start or domain.seq_start,
+                sadie_seq_end=domain.sadie_seq_end or domain.seq_end,
+                fv_seq_start=domain.fv_seq_start or domain.seq_start,
+                fv_seq_end=new_end,
+                boundary_source="sadie_with_fr4_motif_extension",
+                boundary_confidence="low",
+                boundary_warnings=boundary_warnings,
+                boundary_evidence=boundary_evidence,
+                cdr_regions=[dict(cdr) for cdr in domain.cdr_regions],
             )
         )
         warnings.append({
@@ -546,6 +577,12 @@ def analyze_immune_sequence(
         numbered_domains, sequence_clean,
     )
     if fv_warnings:
+        annotation.warnings.extend(
+            warning
+            for warning in ("sadie_missing_fr4_region", "fv_boundary_extended_by_fr4_motif")
+            if warning not in annotation.warnings
+        )
+        annotation.warning_details["fv_boundary_extension"] = fv_warnings
         annotation.sequence_hits.extend(
             f"fv_extended:{w['chain_code']}:{w['original_seq_end']}->{w['extended_seq_end']}:{w['end_motif']}"
             for w in fv_warnings

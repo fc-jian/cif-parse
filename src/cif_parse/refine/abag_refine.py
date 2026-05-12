@@ -55,13 +55,15 @@ def _find_fv_boundaries(
 ) -> tuple[int, int | None]:
     """Return ``(fv_start_res_id, fv_end_res_id)`` for an antibody chain.
 
-    Uses IMGT variable-domain annotation when available; otherwise falls back
-    to a heuristic: keep residues up to the conserved Fv C-terminal motif
-    (e.g. ``...VTVSS`` for heavy chains, ``...VEIK`` for kappa).
+    Uses the structural Fv boundary from immune annotation when available.
+    ``cdr_regions`` remain strict SADIE/IMGT intervals; motif-repaired FR4
+    ends are exposed separately as ``fv_seq_end``.
     """
     if variable_domains:
         vd = variable_domains[0]
-        return (int(vd.get("seq_start", 1)), int(vd.get("seq_end", 0)) or None)
+        start = int(vd.get("fv_seq_start") or vd.get("seq_start") or 1)
+        end = int(vd.get("fv_seq_end") or vd.get("seq_end") or 0) or None
+        return (start, end)
 
     # Fallback: take the first ~120 residues based on residue ordering.
     res_ids = sorted(set(int(r) for r in atom_array.res_id))
@@ -69,6 +71,18 @@ def _find_fv_boundaries(
         return (0, 0)
     fv_end_idx = min(120, len(res_ids))
     return (res_ids[0], res_ids[fv_end_idx - 1])
+
+
+def _fv_boundary_warnings(variable_domains: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    for domain in variable_domains:
+        domain_warnings = domain.get("boundary_warnings")
+        if isinstance(domain_warnings, list):
+            warnings.extend(str(warning) for warning in domain_warnings if warning)
+        source = str(domain.get("boundary_source") or "")
+        if source == "sadie_with_fr4_motif_extension":
+            warnings.append("fv_boundary_repaired_by_motif_requires_review")
+    return sorted(set(warnings))
 
 
 def _crop_atom_array(
@@ -299,6 +313,10 @@ def refine_antibody_complex(
             start, end = (int(aa.res_id.min()), None)
         else:
             start, end = _find_fv_boundaries(aa, variable_domains, chain_type)
+            for warning in _fv_boundary_warnings(variable_domains):
+                warning_text = f"chain {cid}: {warning}"
+                if warning_text not in warnings:
+                    warnings.append(warning_text)
 
         cropped = _crop_atom_array(aa, start, end)
         pdb_chain = _pdb_chain_ids[_chain_idx % len(_pdb_chain_ids)]
@@ -309,6 +327,16 @@ def refine_antibody_complex(
             "pdb_chain_id": pdb_chain,
             "chain_type": chain_type,
             "role": "antibody",
+            "fv_boundary_source": (
+                str(variable_domains[0].get("boundary_source") or "sadie")
+                if variable_domains
+                else "fallback_first_120_residues"
+            ),
+            "fv_boundary_confidence": (
+                str(variable_domains[0].get("boundary_confidence") or "high")
+                if variable_domains
+                else "low"
+            ),
             "retained_residue_intervals": _residue_intervals(cropped.res_id),
         })
         _chain_idx += 1

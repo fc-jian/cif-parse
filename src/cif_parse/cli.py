@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from cif_parse.export import dump_json
-from cif_parse.io import read_structure_summary
+from cif_parse.io import read_case_metadata, read_structure_summary
 from cif_parse.pipeline import StructureSkipWarning, infer_case_id, process_single_structure
 from cif_parse.reporting import (
     build_batch_html_report,
@@ -419,9 +419,35 @@ def _build_metadata_csv(results: list[dict[str, Any]], output_path: Path) -> Non
 
     if not rows:
         return
-    fieldnames = list(rows[0])
+    preferred = [
+        "case_id",
+        "pdb_id",
+        "input_path",
+        "status",
+        "experimental_method",
+        "resolution",
+        "release_date",
+        "num_chains",
+        "num_polymer_chains",
+        "num_asym_ids",
+        "num_dimers",
+        "num_multimers",
+        "num_antibody_antigen_complexes",
+        "num_tcr_pmhc_complexes",
+        "num_assemblies",
+        "num_assemblies_processed",
+        "warning_code",
+    ]
+    all_fields: list[str] = []
+    for field in preferred:
+        if any(field in row for row in rows):
+            all_fields.append(field)
+    for row in rows:
+        for field in row:
+            if field not in all_fields:
+                all_fields.append(field)
     with output_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(fh, fieldnames=all_fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     LOGGER.info("Wrote metadata CSV: %s (%d rows)", output_path, len(rows))
@@ -430,81 +456,7 @@ def _build_metadata_csv(results: list[dict[str, Any]], output_path: Path) -> Non
 def _scan_case_metadata(input_path: str | Path) -> dict[str, Any]:
     """Read cheap CIF metadata without building atom arrays."""
     try:
-        from biotite.structure.io.pdbx import CIFFile
-        from cif_parse.io.cif_reader import (
-            _category_rows, _build_entity_map, read_cif_file, count_oper_expression_copies,
-        )
-        cif = read_cif_file(input_path)
-        entity_map = _build_entity_map(cif)
-
-        # Polymer chain count and total asym count from struct_asym
-        asym_ids: list[str] = []
-        polymer_count = 0
-        for row in _category_rows(cif, "struct_asym"):
-            aid = row.get("id")
-            if aid:
-                asym_ids.append(aid)
-            eid = row.get("entity_id")
-            if eid:
-                e = entity_map.get(eid, {})
-                if str(e.get("entity_type", "")).lower() == "polymer":
-                    polymer_count += 1
-
-        num_assemblies = 0
-        assembly_atom_est = 0
-        for row in _category_rows(cif, "pdbx_struct_assembly_gen"):
-            num_assemblies += 1
-            copies = count_oper_expression_copies(row.get("oper_expression"))
-            asym_id_list = row.get("asym_id_list", "")
-            for aid in (a.strip() for a in asym_id_list.split(",") if a.strip()):
-                # Rough atom estimate: average ~80 atoms per residue for proteins
-                # We don't have exact chain lengths here, but use a minimal estimate
-                assembly_atom_est += copies
-
-        # Experimental method and resolution
-        block = cif.block if isinstance(cif, CIFFile) else cif
-        method = ""
-        resolution = None
-        if hasattr(block, "get"):
-            raw_method = block.get("_exptl.method") or block.get("_exptl_crystal.method") or ""
-            if hasattr(raw_method, "as_item"):
-                method = str(raw_method.as_item()) if raw_method.as_item() else ""
-            elif isinstance(raw_method, (list, tuple)):
-                method = str(raw_method[0]) if raw_method else ""
-            else:
-                method = str(raw_method) if raw_method else ""
-            raw_res = block.get("_refine.ls_d_res_high") or block.get("_reflns.d_resolution_high") or ""
-            if hasattr(raw_res, "as_item"):
-                raw_res = raw_res.as_item()
-            elif isinstance(raw_res, (list, tuple)):
-                raw_res = raw_res[0] if raw_res else None
-            try:
-                resolution = round(float(raw_res), 2) if raw_res else None
-            except (ValueError, TypeError):
-                resolution = None
-            # Also try EM resolution
-            if resolution is None:
-                raw_em = block.get("_em_3d_reconstruction.resolution") or ""
-                if hasattr(raw_em, "as_item"):
-                    raw_em = raw_em.as_item()
-                try:
-                    resolution = round(float(raw_em), 2) if raw_em else None
-                except (ValueError, TypeError):
-                    pass
-
-        # Release date
-        release_date = ""
-        for row in _category_rows(cif, "pdbx_audit_revision_history"):
-            release_date = row.get("revision_date", "") or release_date
-
-        return {
-            "experimental_method": method,
-            "resolution": resolution if resolution else "",
-            "release_date": release_date,
-            "num_polymer_chains": polymer_count,
-            "num_asym_ids": len(asym_ids),
-            "num_assemblies": num_assemblies,
-        }
+        return read_case_metadata(input_path)
     except Exception:
         return {}
 
@@ -548,7 +500,6 @@ def _process_batch_case(task: dict[str, Any]) -> dict[str, Any]:
     settings = AppSettings(**task["settings"])
     configure_logging(settings.log_level)
     allowed_assembly_ids = task.get("_preflight_allowed_assembly_ids")
-    metadata = _scan_case_metadata(task["input_path"])
     try:
         result = process_single_structure(
             task["input_path"], task["output_dir"], settings,
@@ -556,10 +507,11 @@ def _process_batch_case(task: dict[str, Any]) -> dict[str, Any]:
         )
         result["case_id"] = task["case_id"]
         result["status"] = "ok"
-        result["_meta"] = metadata
+        result["_meta"] = result.get("_meta", {})
         return result
     except StructureSkipWarning as exc:
         LOGGER.warning("%s", exc)
+        metadata = _scan_case_metadata(task["input_path"])
         return {
             "case_id": task["case_id"],
             "input_path": task["input_path"],
@@ -572,6 +524,7 @@ def _process_batch_case(task: dict[str, Any]) -> dict[str, Any]:
         }
     except Exception as exc:  # pragma: no cover - exercised through CLI behavior
         LOGGER.exception("Failed to process %s", task["input_path"])
+        metadata = _scan_case_metadata(task["input_path"])
         return {
             "case_id": task["case_id"],
             "input_path": task["input_path"],
