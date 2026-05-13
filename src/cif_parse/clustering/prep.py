@@ -415,7 +415,7 @@ def _ingest_cases_to_parquet(
 
 
 def _cache_sources_to_temp(
-    args: tuple[list[tuple[str, list[str | None], str]], Path, int, dict[str, str] | None],
+    args: tuple[list[tuple[str, list[str | None], str]], Path, int, dict[str, str] | None, set[str]],
 ) -> dict[str, Any]:
     """Process a batch of mmCIF files and write cached atom arrays to one chunk.
 
@@ -425,7 +425,7 @@ def _cache_sources_to_temp(
 
     Returns metadata only — no blob data through IPC.
     """
-    chunk_tasks, tmp_dir, worker_id, atom_cache_map = args
+    chunk_tasks, tmp_dir, worker_id, atom_cache_map, input_assembly_sources = args
     tmp_dir = Path(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -495,7 +495,7 @@ def _cache_sources_to_temp(
                 for assembly_id in assembly_ids:
                     cache_key = f"{source_path}__{assembly_id or ''}"
                     try:
-                        if assembly_id:
+                        if assembly_id and source_path not in input_assembly_sources:
                             atom_array = get_assembly(cif_file, assembly_id=assembly_id, model=1, use_author_fields=False)
                         else:
                             atom_array = get_structure(cif_file, model=1, use_author_fields=False)
@@ -793,6 +793,7 @@ def build_prep_database(
 
         # Collect (source_path, assembly_id) pairs from all tables
         cache_pairs: dict[str, set[str | None]] = {}
+        input_assembly_sources: set[str] = set()
         source_paths_ordered = sorted(all_source_paths)
         for sp in source_paths_ordered:
             cache_pairs.setdefault(sp, set()).add(None)
@@ -812,12 +813,21 @@ def build_prep_database(
                     cols = ["source_path"]
                     if "assembly_id" in schema_names:
                         cols.append("assembly_id")
+                    if "assembly_mode" in schema_names:
+                        cols.append("assembly_mode")
                     tbl = pf.read_row_group(rg_idx, columns=cols)
                     sp_list = tbl.column("source_path").to_pylist()
                     aid_list = tbl.column("assembly_id").to_pylist() if "assembly_id" in schema_names else [None] * len(sp_list)
-                    for sp, aid in zip(sp_list, aid_list):
+                    mode_list = (
+                        tbl.column("assembly_mode").to_pylist()
+                        if "assembly_mode" in schema_names
+                        else [""] * len(sp_list)
+                    )
+                    for sp, aid, mode in zip(sp_list, aid_list, mode_list):
                         if sp and sp in cache_pairs:
                             cache_pairs[sp].add(aid if aid else None)
+                            if str(mode or "") == "input_assembly":
+                                input_assembly_sources.add(sp)
         except ImportError:
             pass
 
@@ -831,13 +841,13 @@ def build_prep_database(
         try:
             if len(tasks) <= 1:
                 chunk_tasks = [(sp, aids, cfd) for sp, aids, cfd in tasks]
-                result = _cache_sources_to_temp((chunk_tasks, tmp_phase2, 0, atom_cache_map))
+                result = _cache_sources_to_temp((chunk_tasks, tmp_phase2, 0, atom_cache_map, input_assembly_sources))
                 _count_cif_entries(result, cif_stats)
             else:
                 # Split source files into more chunks than workers so that large
                 # CIF files do not leave a single slow worker at the end.
                 grouped = _group_source_tasks(tasks, num_workers)
-                task_args = [(chunk_tasks, tmp_phase2, wid, atom_cache_map)
+                task_args = [(chunk_tasks, tmp_phase2, wid, atom_cache_map, input_assembly_sources)
                              for wid, chunk_tasks in enumerate(grouped)]
                 with ProcessPoolExecutor(max_workers=num_workers) as executor:
                     futures = [executor.submit(_cache_sources_to_temp, arg) for arg in task_args]

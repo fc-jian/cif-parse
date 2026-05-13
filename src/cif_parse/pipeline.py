@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 import logging
 import pickle
+import re
 import zlib
 from pathlib import Path
 from typing import Any
@@ -103,14 +104,20 @@ def validate_processing_inputs(
         chain for chain in chain_inventory if str(getattr(chain, "entity_type", "")).lower() == "polymer"
     ]
     polymer_chain_count = len(polymer_chains)
+    pdb_id = (
+        str(getattr(chain_inventory[0], "pdb_id", "") or "")
+        if chain_inventory
+        else infer_case_id(input_path)
+    )
     if polymer_chain_count > settings.max_polymer_chains:
         raise StructureSkipWarning(
             "too_many_polymer_chains",
             (
-                f"Skipping {infer_case_id(input_path)}: polymer chain count {polymer_chain_count} "
+                f"Skipping {pdb_id or infer_case_id(input_path)}: polymer chain count {polymer_chain_count} "
                 f"exceeds max_polymer_chains={settings.max_polymer_chains}"
             ),
             details={
+                "pdb_id": pdb_id or infer_case_id(input_path),
                 "polymer_chain_count": polymer_chain_count,
                 "max_polymer_chains": settings.max_polymer_chains,
             },
@@ -122,10 +129,11 @@ def validate_processing_inputs(
         raise StructureSkipWarning(
             "no_polymer_chain_above_min_length",
             (
-                f"Skipping {infer_case_id(input_path)}: no polymer chain has length > "
+                f"Skipping {pdb_id or infer_case_id(input_path)}: no polymer chain has length > "
                 f"{min_required_length}"
             ),
             details={
+                "pdb_id": pdb_id or infer_case_id(input_path),
                 "polymer_chain_count": polymer_chain_count,
                 "min_polymer_chain_length": min_required_length,
             },
@@ -189,6 +197,7 @@ def validate_preflight_inputs(
                 f"{polymer_chain_count} exceeds max_polymer_chains={settings.max_polymer_chains}"
             ),
             details={
+                "pdb_id": preflight.get("pdb_id") or infer_case_id(input_path),
                 "polymer_chain_count": polymer_chain_count,
                 "max_polymer_chains": settings.max_polymer_chains,
             },
@@ -203,6 +212,7 @@ def validate_preflight_inputs(
                 f"{settings.min_polymer_chain_length}"
             ),
             details={
+                "pdb_id": preflight.get("pdb_id") or infer_case_id(input_path),
                 "polymer_chain_count": polymer_chain_count,
                 "max_polymer_chain_length": max_polymer_chain_length,
                 "min_polymer_chain_length": settings.min_polymer_chain_length,
@@ -253,6 +263,26 @@ def process_single_structure(
     )
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
+
+    # Validate pre-split assembly files: chain IDs must be unique.
+    if settings.input_assembly:
+        from collections import Counter as _Counter
+        chain_ids = [c.label_asym_id for c in chain_inventory]
+        dupes = [cid for cid, n in _Counter(chain_ids).items() if n > 1]
+        if dupes:
+            raise StructureSkipWarning(
+                "duplicate_chain_ids_in_input_assembly",
+                f"Skipping {summary.pdb_id}: input_assembly mode requires unique chain IDs. "
+                f"Duplicates: {', '.join(sorted(dupes))}",
+                details={"duplicate_chain_ids": sorted(dupes)},
+            )
+        input_assembly_id = _infer_input_assembly_id(input_path)
+        if input_assembly_id:
+            summary.assembly_ids = [input_assembly_id]
+            summary.assembly_descriptions = {
+                input_assembly_id: "input pre-split biological assembly",
+            }
+
     if settings.assembly_mode != "all":
         selected_assembly_id = _resolve_single_mode_assembly_id(
             input_path=input_path,
@@ -275,7 +305,7 @@ def process_single_structure(
             summary=summary,
             chain_inventory=chain_inventory,
             cif_file=cif_file,
-            analysis_assembly_mode=settings.assembly_mode,
+            analysis_assembly_mode="input_assembly" if settings.input_assembly else settings.assembly_mode,
             selected_assembly_id=selected_assembly_id,
             bundle_name=_resolve_single_mode_bundle_name(settings, selected_assembly_id),
         )
@@ -452,6 +482,8 @@ def _resolve_single_mode_assembly_id(
     settings: AppSettings,
     pdb_id: str,
 ) -> str | None:
+    if settings.input_assembly:
+        return _infer_input_assembly_id(input_path)
     if settings.assembly_mode == "largest_assembly":
         return select_largest_polymer_assembly_id(cif_file)
     if settings.assembly_mode != "first_assembly":
@@ -514,13 +546,25 @@ def _resolve_single_mode_assembly_id(
 
 def _resolve_single_mode_bundle_name(settings: AppSettings, selected_assembly_id: str | None) -> str:
     if (
-        settings.assembly_mode == "first_assembly"
+        (settings.assembly_mode == "first_assembly" or settings.input_assembly)
         and settings.output_format == "json"
         and not settings.debug
         and selected_assembly_id
     ):
         return f"result_assembly_{selected_assembly_id}.json.gz"
     return "result.json.gz"
+
+
+def _infer_input_assembly_id(input_path: Path) -> str | None:
+    name = input_path.name.lower()
+    for suffix in (".cif.gz", ".bcif.gz", ".cif", ".bcif"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    match = re.search(r"(?:^|[-_])assembly[-_]?([a-z0-9]+)(?:$|[-_])", name)
+    if match:
+        return match.group(1)
+    return None
 
 
 def _dump_atom_cache_au(
@@ -636,6 +680,11 @@ def _dump_atom_cache(
             except Exception:
                 LOGGER.debug("Failed to cache asymmetric unit for %s", input_path)
 
+        if assembly_mode == "asymmetric_unit" and selected_assembly_id:
+            asm_cache_path = atoms_dir / f"{selected_assembly_id}.pkl"
+            if not asm_cache_path.exists() and au_cache_path.exists():
+                asm_cache_path.write_bytes(au_cache_path.read_bytes())
+
         # Cache assembly-expanded coordinates when applicable
         if assembly_mode in ("largest_assembly", "first_assembly", "all"):
             effective_assembly_id = selected_assembly_id
@@ -708,16 +757,20 @@ def _process_single_structure_for_mode(
         summary.pdb_id,
         f" assembly {selected_assembly_id}" if selected_assembly_id is not None else "",
     )
-    _, assembly_copy_numbers = read_assembly_copy_numbers(
-        input_path,
-        assembly_id=selected_assembly_id,
-        cif_file=cif_file,
-    )
-    _, assembly_chain_operations = read_assembly_chain_operations(
-        input_path,
-        assembly_id=selected_assembly_id,
-        cif_file=cif_file,
-    )
+    if analysis_assembly_mode == "input_assembly":
+        assembly_copy_numbers = {}
+        assembly_chain_operations = {}
+    else:
+        _, assembly_copy_numbers = read_assembly_copy_numbers(
+            input_path,
+            assembly_id=selected_assembly_id,
+            cif_file=cif_file,
+        )
+        _, assembly_chain_operations = read_assembly_chain_operations(
+            input_path,
+            assembly_id=selected_assembly_id,
+            cif_file=cif_file,
+        )
     tight_multimers = identify_tight_multimers(
         working_chain_inventory,
         dimer_interfaces,

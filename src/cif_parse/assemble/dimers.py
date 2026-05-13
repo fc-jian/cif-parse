@@ -126,7 +126,10 @@ def identify_dimer_interfaces(
 ) -> list[DimerInterfaceRecord]:
     cif_path = Path(path)
     cif_file = cif_file or read_cif_file(cif_path)
-    assembly_ids = sorted(str(assembly_id) for assembly_id in list_assemblies(cif_file))
+    try:
+        assembly_ids = sorted(str(assembly_id) for assembly_id in list_assemblies(cif_file))
+    except Exception:
+        assembly_ids = []
     polymer_chains = [
         chain for chain in chain_inventory if chain.chain_type in POLYMER_CHAIN_TYPES
     ]
@@ -193,6 +196,11 @@ def identify_dimer_interfaces(
             polymer_chains,
             drop_hydrogens_for_analysis=drop_hydrogens_for_analysis,
         )
+        if assembly_mode == "input_assembly" and assembly_id is not None:
+            geometries = {
+                instance_id: replace(geometry, assembly_id=assembly_id)
+                for instance_id, geometry in geometries.items()
+            }
 
     ordered_instance_ids = sorted(geometries)
     for index, instance_id_1 in enumerate(ordered_instance_ids):
@@ -247,9 +255,13 @@ def identify_dimer_interfaces(
                 "interface_area_method": str(
                     metrics.get("area_evidence", {}).get("interface_area_method", "ProtOr")
                 ),
-                "instance_granularity": "chain_id_plus_sym_id"
-                if assembly_mode in {"largest_assembly", "first_assembly", "all"}
-                else "label_asym_id",
+                "instance_granularity": (
+                    "chain_id_plus_sym_id"
+                    if assembly_mode in {"largest_assembly", "first_assembly", "all"}
+                    else "pre_split_assembly_label_asym_id"
+                    if assembly_mode == "input_assembly"
+                    else "label_asym_id"
+                ),
                 "bbox_distance": round(float(metrics["bbox_distance"]), 4),
             }
             area_evidence = metrics.get("area_evidence", {})
@@ -261,7 +273,9 @@ def identify_dimer_interfaces(
                 DimerInterfaceRecord(
                     pdb_id=chain_1.pdb_id,
                     assembly_mode=assembly_mode,
-                    assembly_id=geometry_1.assembly_id if assembly_mode in {"largest_assembly", "first_assembly", "all"} else None,
+                    assembly_id=geometry_1.assembly_id
+                    if assembly_mode in {"largest_assembly", "first_assembly", "all", "input_assembly"}
+                    else None,
                     num_supporting_instance_pairs=1,
                     instance_id_1=output_instance_id_1,
                     sym_id_1=geometry_1.sym_id,

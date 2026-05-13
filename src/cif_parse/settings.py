@@ -80,6 +80,7 @@ class AppSettings:
 
     output_format: str = "json"
     assembly_mode: str = "asymmetric_unit"
+    input_assembly: bool = False
     coverage_mode: str = "nearest"
     debug: bool = False
     log_level: str = "INFO"
@@ -251,6 +252,7 @@ def default_cli_config() -> dict[str, Any]:
         "settings": {
             "output_format": "json",
             "assembly_mode": "asymmetric_unit",
+            "input_assembly": False,
             "coverage_mode": "nearest",
             "debug": False,
             "log_level": "INFO",
@@ -379,6 +381,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         {
             "output_format",
             "assembly_mode",
+            "input_assembly",
             "coverage_mode",
             "debug",
             "log_level",
@@ -448,6 +451,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
     config["settings"] = {
         "output_format": validated_settings.output_format,
         "assembly_mode": validated_settings.assembly_mode,
+        "input_assembly": validated_settings.input_assembly,
         "coverage_mode": validated_settings.coverage_mode,
         "debug": validated_settings.debug,
         "log_level": validated_settings.log_level,

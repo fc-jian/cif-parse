@@ -170,6 +170,11 @@ def _get_first_value(cif_file: CIFFile, category_name: str, column_name: str) ->
 
 def _infer_pdb_id(path: Path, cif_file: CIFFile) -> str:
     entry_id = _get_first_value(cif_file, "entry", "id")
+    filename_pdb_id = _infer_pdb_id_from_filename(path)
+    if entry_id and entry_id.lower() not in {"xxxx", "unknown", "none"}:
+        return entry_id.lower()
+    if filename_pdb_id is not None:
+        return filename_pdb_id
     if entry_id:
         return entry_id.lower()
 
@@ -178,6 +183,18 @@ def _infer_pdb_id(path: Path, cif_file: CIFFile) -> str:
         if name.endswith(suffix):
             return name[: -len(suffix)].lower()
     return path.stem.lower()
+
+
+def _infer_pdb_id_from_filename(path: Path) -> str | None:
+    name = path.name.lower()
+    for suffix in (".cif.gz", ".bcif.gz", ".cif", ".bcif"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    match = re.match(r"^([0-9][a-z0-9]{3})(?:[-_].*)?$", name)
+    if match:
+        return match.group(1)
+    return None
 
 
 def _count_category_rows(cif_file: CIFFile, category_name: str, column_name: str) -> int:
@@ -337,10 +354,16 @@ def _assembly_sort_key(assembly_id: str) -> tuple[int, int | str]:
 def read_available_assembly_ids(path: str | Path, *, cif_file: CIFFile | None = None) -> list[str]:
     cif_path = Path(path)
     cif_file = cif_file or read_cif_file(cif_path)
-    return sorted(
-        [str(assembly_id) for assembly_id in list_assemblies(cif_file)],
-        key=_assembly_sort_key,
-    )
+    block = cif_file[_default_block_name(cif_file)]
+    if "pdbx_struct_assembly" not in block:
+        return []
+    try:
+        return sorted(
+            [str(assembly_id) for assembly_id in list_assemblies(cif_file)],
+            key=_assembly_sort_key,
+        )
+    except Exception:
+        return []
 
 
 def select_largest_polymer_assembly_id(cif_file: CIFFile) -> str | None:
@@ -1501,10 +1524,13 @@ def read_structure_summary(
     cif_path = Path(path)
     cif_file = cif_file or read_cif_file(cif_path)
     LOGGER.debug("Reading structure summary from %s", cif_path)
-    assembly_map = {
-        str(assembly_id): str(description)
-        for assembly_id, description in list_assemblies(cif_file).items()
-    }
+    try:
+        assembly_map = {
+            str(assembly_id): str(description)
+            for assembly_id, description in list_assemblies(cif_file).items()
+        }
+    except Exception:
+        assembly_map = {}
     if chain_inventory is None:
         chain_inventory = read_chain_inventory(
             cif_path,

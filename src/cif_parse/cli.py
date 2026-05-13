@@ -161,6 +161,12 @@ def _add_runtime_args(
         help="Assembly mode recorded in settings metadata",
     )
     parser.add_argument(
+        "--input-assembly",
+        action=argparse.BooleanOptionalAction,
+        default=bool(settings_defaults.get("input_assembly", False)),
+        help="CIF files are already split per-assembly; skip assembly expansion and validate chain uniqueness",
+    )
+    parser.add_argument(
         "--coverage-mode",
         choices=sorted(SUPPORTED_COVERAGE_MODES),
         default=str(settings_defaults.get("coverage_mode", "nearest")),
@@ -289,7 +295,8 @@ def _settings_from_args(args: argparse.Namespace) -> AppSettings:
 
     return AppSettings(
         output_format=args.format,
-        assembly_mode=args.assembly_mode,
+        assembly_mode="asymmetric_unit" if args.input_assembly else args.assembly_mode,
+        input_assembly=args.input_assembly,
         coverage_mode=args.coverage_mode,
         debug=args.debug,
         log_level=args.log_level,
@@ -514,6 +521,7 @@ def _process_batch_case(task: dict[str, Any]) -> dict[str, Any]:
         metadata = _scan_case_metadata(task["input_path"])
         return {
             "case_id": task["case_id"],
+            "pdb_id": exc.details.get("pdb_id") or metadata.get("pdb_id") or "",
             "input_path": task["input_path"],
             "output_dir": task["output_dir"],
             "status": "skipped",
@@ -586,6 +594,7 @@ def _print_single_result(settings: AppSettings, outdir: Path, result: dict[str, 
                     "settings": {
                         "output_format": settings.output_format,
                         "assembly_mode": settings.assembly_mode,
+                        "input_assembly": settings.input_assembly,
                         "coverage_mode": settings.coverage_mode,
                         "debug": settings.debug,
                         "log_level": settings.log_level,
@@ -637,6 +646,7 @@ def _print_batch_result(
                     "settings": {
                         "output_format": settings.output_format,
                         "assembly_mode": settings.assembly_mode,
+                        "input_assembly": settings.input_assembly,
                         "coverage_mode": settings.coverage_mode,
                         "debug": settings.debug,
                         "log_level": settings.log_level,
@@ -714,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
         except StructureSkipWarning as exc:
             LOGGER.warning("%s", exc)
             result = {
-                "pdb_id": infer_case_id(args.input),
+                "pdb_id": exc.details.get("pdb_id") or infer_case_id(args.input),
                 "input_path": str(args.input),
                 "output_dir": str(args.outdir),
                 "status": "skipped",
@@ -738,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
     settings_payload = {
         "output_format": settings.output_format,
         "assembly_mode": settings.assembly_mode,
+        "input_assembly": settings.input_assembly,
         "coverage_mode": settings.coverage_mode,
         "debug": settings.debug,
         "log_level": settings.log_level,
