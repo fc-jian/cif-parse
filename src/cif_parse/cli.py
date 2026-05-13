@@ -167,6 +167,18 @@ def _add_runtime_args(
         help="CIF files are already split per-assembly; skip assembly expansion and validate chain uniqueness",
     )
     parser.add_argument(
+        "--metadata-cif-dir",
+        type=str,
+        default=str(settings_defaults.get("metadata_cif_dir", "")),
+        help="Directory of original full mmCIF files for entry metadata when input CIF lacks it",
+    )
+    parser.add_argument(
+        "--metadata-table",
+        type=str,
+        default=str(settings_defaults.get("metadata_table", "")),
+        help="Pre-generated parquet/csv with entry metadata (pdb_id, method, resolution, release_date)",
+    )
+    parser.add_argument(
         "--coverage-mode",
         choices=sorted(SUPPORTED_COVERAGE_MODES),
         default=str(settings_defaults.get("coverage_mode", "nearest")),
@@ -297,6 +309,8 @@ def _settings_from_args(args: argparse.Namespace) -> AppSettings:
         output_format=args.format,
         assembly_mode="asymmetric_unit" if args.input_assembly else args.assembly_mode,
         input_assembly=args.input_assembly,
+        metadata_cif_dir=args.metadata_cif_dir or "",
+        metadata_table=args.metadata_table or "",
         coverage_mode=args.coverage_mode,
         debug=args.debug,
         log_level=args.log_level,
@@ -460,8 +474,22 @@ def _build_metadata_csv(results: list[dict[str, Any]], output_path: Path) -> Non
     LOGGER.info("Wrote metadata CSV: %s (%d rows)", output_path, len(rows))
 
 
-def _scan_case_metadata(input_path: str | Path) -> dict[str, Any]:
-    """Read cheap CIF metadata without building atom arrays."""
+def _scan_case_metadata(input_path: str | Path, output_dir: str | Path | None = None) -> dict[str, Any]:
+    """Read entry metadata, preferring the enriched bundle over raw CIF."""
+    # Prefer the enriched metadata from the case output bundle.
+    if output_dir:
+        try:
+            import gzip as _gz, json as _json
+            outdir = Path(output_dir)
+            for bundle_path in sorted(outdir.glob("*.json.gz")):
+                with _gz.open(bundle_path) as fh:
+                    bundle = _json.load(fh)
+                meta = (bundle.get("structure_summary", {}) or {}).get("entry_metadata", {})
+                if isinstance(meta, dict) and meta:
+                    return meta
+        except Exception:
+            pass
+    # Fallback: re-read from the raw CIF.
     try:
         return read_case_metadata(input_path)
     except Exception:
@@ -595,6 +623,8 @@ def _print_single_result(settings: AppSettings, outdir: Path, result: dict[str, 
                         "output_format": settings.output_format,
                         "assembly_mode": settings.assembly_mode,
                         "input_assembly": settings.input_assembly,
+                        "metadata_cif_dir": settings.metadata_cif_dir,
+                        "metadata_table": settings.metadata_table,
                         "coverage_mode": settings.coverage_mode,
                         "debug": settings.debug,
                         "log_level": settings.log_level,
@@ -647,6 +677,8 @@ def _print_batch_result(
                         "output_format": settings.output_format,
                         "assembly_mode": settings.assembly_mode,
                         "input_assembly": settings.input_assembly,
+                        "metadata_cif_dir": settings.metadata_cif_dir,
+                        "metadata_table": settings.metadata_table,
                         "coverage_mode": settings.coverage_mode,
                         "debug": settings.debug,
                         "log_level": settings.log_level,
@@ -749,6 +781,8 @@ def main(argv: list[str] | None = None) -> int:
         "output_format": settings.output_format,
         "assembly_mode": settings.assembly_mode,
         "input_assembly": settings.input_assembly,
+        "metadata_cif_dir": settings.metadata_cif_dir,
+        "metadata_table": settings.metadata_table,
         "coverage_mode": settings.coverage_mode,
         "debug": settings.debug,
         "log_level": settings.log_level,

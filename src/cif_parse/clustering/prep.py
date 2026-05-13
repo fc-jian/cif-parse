@@ -185,6 +185,7 @@ def _entry_quality_row(summary: dict[str, Any], case_id: str) -> dict[str, Any]:
         "resolution": resolution,
         "release_date": str(metadata.get("release_date", "") or ""),
         "metadata_source": str(metadata.get("metadata_source", "") or ""),
+        "metadata_warning": str(metadata.get("metadata_warning", "") or ""),
     }
 
 

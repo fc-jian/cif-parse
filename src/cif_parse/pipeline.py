@@ -201,7 +201,121 @@ def _coerce_entry_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
         "resolution": resolution_value,
         "release_date": release_date,
         "metadata_source": metadata.get("metadata_source") or "input_cif",
+        "metadata_warning": metadata.get("metadata_warning") or "",
     }
+
+
+def _enrich_entry_metadata(
+    input_path: Path,
+    existing: dict[str, Any],
+    settings: AppSettings,
+) -> dict[str, Any]:
+    """Enrich empty entry metadata from external sources for input-assembly mode."""
+    import csv
+
+    pdb_id = _infer_pdb_id_from_assembly_path(input_path)
+
+    # 1) --metadata-table: pre-generated parquet or CSV.
+    table_path = (settings.metadata_table or "").strip()
+    if table_path and pdb_id:
+        tp = Path(table_path)
+        enriched = _query_metadata_table(tp, pdb_id)
+        if enriched:
+            return enriched
+
+    # 2) --metadata-cif-dir: original full mmCIF files.
+    cif_dir = (settings.metadata_cif_dir or "").strip()
+    if cif_dir and pdb_id:
+        enriched = _query_metadata_cif_dir(Path(cif_dir), pdb_id)
+        if enriched:
+            return enriched
+
+    # 3) No external metadata found — keep existing empty values.
+    if existing:
+        existing["metadata_warning"] = "no_entry_metadata_found_for_input_assembly"
+    return existing
+
+
+def _infer_pdb_id_from_assembly_path(path: Path) -> str:
+    """Extract a 4-character PDB ID from an assembly filename like ``5YWO-assembly1.cif.gz``."""
+    name = path.name.lower()
+    for suffix in (".cif.gz", ".bcif.gz", ".cif", ".bcif"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    # Strip assembly suffix: 5ywo-assembly1 → 5ywo
+    for sep in ("-assembly", "_assembly"):
+        if sep in name:
+            name = name[: name.index(sep)]
+            break
+    return name.upper()[:4]
+
+
+def _query_metadata_table(table_path: Path, pdb_id: str) -> dict[str, Any] | None:
+    """Query a parquet or CSV metadata table for *pdb_id*."""
+    try:
+        if table_path.suffix in (".parquet", ".pq"):
+            import pyarrow.parquet as pq
+            table = pq.read_table(str(table_path))
+            df = table.to_pandas()
+            mask = df["pdb_id"].str.upper() == pdb_id.upper()
+            match = df[mask]
+            if not match.empty:
+                row = match.iloc[0]
+                return {
+                    "experimental_method": str(row.get("experimental_method", "") or ""),
+                    "resolution": _safe_float(row.get("resolution")),
+                    "release_date": str(row.get("release_date", "") or ""),
+                    "metadata_source": "metadata_table",
+                }
+        elif table_path.suffix == ".csv":
+            with table_path.open("r", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    if str(row.get("pdb_id", "")).upper() == pdb_id.upper():
+                        return {
+                            "experimental_method": str(row.get("experimental_method", "") or ""),
+                            "resolution": _safe_float(row.get("resolution")),
+                            "release_date": str(row.get("release_date", "") or ""),
+                            "metadata_source": "metadata_table",
+                        }
+    except Exception:
+        LOGGER.debug("Failed to query metadata table %s", table_path, exc_info=True)
+    return None
+
+
+def _query_metadata_cif_dir(cif_dir: Path, pdb_id: str) -> dict[str, Any] | None:
+    """Find the original full mmCIF for *pdb_id* in *cif_dir* and read metadata."""
+    from cif_parse.io.cif_reader import read_case_metadata as _read_meta
+
+    pdb_lower = pdb_id.lower()
+    candidates = [
+        cif_dir / f"{pdb_lower}.cif.gz",
+        cif_dir / f"{pdb_lower}.cif",
+        cif_dir / f"{pdb_id.upper()}.cif.gz",
+        cif_dir / f"{pdb_id.upper()}.cif",
+        # PDB two-char shard layout: yw/5ywo.cif.gz
+        cif_dir / pdb_lower[1:3] / f"{pdb_lower}.cif.gz",
+        cif_dir / pdb_lower[1:3] / f"{pdb_lower}.cif",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            try:
+                meta = _read_meta(str(cand))
+                if meta.get("experimental_method") or meta.get("resolution"):
+                    meta["metadata_source"] = "full_mmcif"
+                    return meta
+            except Exception:
+                continue
+    return None
+
+
+def _safe_float(value: Any) -> float | str:
+    if value in (None, "", ".", "?"):
+        return ""
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return ""
 
 
 def validate_preflight_inputs(
@@ -262,6 +376,17 @@ def process_single_structure(
         LOGGER.debug("Failed to read metadata for %s", input_path, exc_info=True)
         metadata = {}
     metadata = _coerce_entry_metadata(metadata)
+    # For input-assembly mode the assembly CIF may have incomplete metadata
+    # (e.g. wrong chain counts from expanded sym copies).  Always prefer the
+    # original full CIF when --metadata-cif-dir or --metadata-table is set.
+    if settings.input_assembly and (settings.metadata_cif_dir or settings.metadata_table):
+        enriched = _enrich_entry_metadata(input_path, metadata, settings)
+        if enriched is not metadata:
+            metadata = enriched
+    elif not metadata.get("experimental_method") and not metadata.get("resolution"):
+        enriched = _enrich_entry_metadata(input_path, metadata, settings)
+        if enriched is not metadata:
+            metadata = enriched
     preflight = read_structure_preflight(input_path, cif_file=cif_file)
     validate_preflight_inputs(input_path, preflight, settings)
     chain_inventory = read_chain_inventory(
