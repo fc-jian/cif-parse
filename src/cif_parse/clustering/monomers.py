@@ -267,8 +267,16 @@ def collect_canonical_monomers(
         canonical.values(),
         key=lambda item: (item.polymer_class, item.pdb_id, item.label_asym_id),
     )
+    prep_total_cases: int | None = None
+    if prep_dir:
+        manifest_path = Path(prep_dir) / "manifest.json"
+        try:
+            prep_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            prep_total_cases = int(prep_manifest.get("total_cases", 0) or 0)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            prep_total_cases = None
     manifest = {
-        "num_input_case_dirs": len(case_paths),
+        "num_input_case_dirs": prep_total_cases if prep_total_cases is not None else len(case_paths),
         "num_case_bundles": num_case_bundles,
         "num_polymer_observations": polymer_observations,
         "num_eligible_observations": eligible_observations,

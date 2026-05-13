@@ -44,8 +44,8 @@ from .protein_structures import (
     USalignAlignmentResult,
     extract_protein_monomer_structures,
     greedy_cluster_protein_structures,
+    load_entry_quality_metadata_from_prep,
     parse_usalign_output,
-    read_entry_quality_metadata,
     run_usalign_alignment,
 )
 from .tcr_complexes import (
@@ -91,10 +91,10 @@ __all__ = [
     "extract_multimer_structures",
     "extract_tcr_complex_structures",
     "greedy_cluster_protein_structures",
+    "load_entry_quality_metadata_from_prep",
     "load_monomer_cluster_assignments",
     "parse_usalign_output",
     "parse_mmseqs_cluster_tsv",
-    "read_entry_quality_metadata",
     "refine_antibody_complex_signature_clusters",
     "refine_dimer_signature_clusters",
     "refine_multimer_signature_clusters",

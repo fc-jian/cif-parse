@@ -16,12 +16,10 @@ from tqdm import tqdm
 
 from biotite.structure import AtomArray, get_residues
 from biotite.structure.io.pdb import PDBFile
-from biotite.structure.io.pdbx import CIFBlock, CIFCategory, get_structure
 
 from cif_parse.clustering.monomers import MonomerSample
 from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
-from cif_parse.io import read_cif_file
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
 
 
@@ -58,15 +56,6 @@ def _safe_int(value: Any) -> int | None:
     if parsed is None:
         return None
     return int(parsed)
-
-
-def _category_column_values(block: CIFBlock, category_name: str, column_name: str) -> list[str]:
-    if category_name not in block:
-        return []
-    category = block[category_name]
-    if not isinstance(category, CIFCategory) or column_name not in category:
-        return []
-    return [str(value) for value in category[column_name].as_array().tolist()]
 
 
 def _pick_primary_method(methods: list[str]) -> str | None:
@@ -118,6 +107,56 @@ class EntryQualityMetadata:
         return asdict(self)
 
 
+def _default_entry_quality(*, source_path: str, pdb_id: str) -> EntryQualityMetadata:
+    return EntryQualityMetadata(
+        pdb_id=str(pdb_id),
+        source_path=str(source_path),
+        experimental_methods=[],
+        primary_method=None,
+        method_priority=99,
+        resolution=None,
+    )
+
+
+def _entry_quality_from_row(row: dict[str, Any]) -> EntryQualityMetadata:
+    raw_methods = row.get("experimental_methods", "[]")
+    if isinstance(raw_methods, str):
+        try:
+            methods = [str(item) for item in json.loads(raw_methods) if str(item)]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            methods = [raw_methods] if raw_methods else []
+    elif isinstance(raw_methods, list):
+        methods = [str(item) for item in raw_methods if str(item)]
+    else:
+        methods = []
+    primary_method = row.get("primary_method")
+    primary_method = str(primary_method) if primary_method not in (None, "", ".", "?") else _pick_primary_method(methods)
+    resolution = _safe_float(row.get("resolution"))
+    return EntryQualityMetadata(
+        pdb_id=str(row.get("pdb_id", "") or ""),
+        source_path=str(row.get("source_path", "") or ""),
+        experimental_methods=sorted(set(methods)),
+        primary_method=primary_method,
+        method_priority=int(row.get("method_priority", _method_priority(primary_method)) or 99),
+        resolution=resolution,
+    )
+
+
+def load_entry_quality_metadata_from_prep(prep_dir: str | Path) -> dict[str, EntryQualityMetadata]:
+    """Load entry quality metadata captured during parse/prep."""
+
+    from cif_parse.clustering.prep import iter_parquet_rows
+
+    quality_by_source: dict[str, EntryQualityMetadata] = {}
+    for row in iter_parquet_rows(prep_dir, "entry_quality", required=False) or []:
+        if "__empty__" in row:
+            continue
+        quality = _entry_quality_from_row(row)
+        if quality.source_path and quality.source_path not in quality_by_source:
+            quality_by_source[quality.source_path] = quality
+    return quality_by_source
+
+
 @dataclass(slots=True)
 class ExtractedMonomerStructure:
     monomer_id: str
@@ -167,29 +206,6 @@ class USalignAlignmentResult:
         return asdict(self)
 
 
-def read_entry_quality_metadata(source_path: str | Path, *, pdb_id: str | None = None) -> EntryQualityMetadata:
-    """Extract a minimal, clustering-local quality summary from mmCIF metadata."""
-
-    cif_file = read_cif_file(source_path)
-    block = cif_file.block
-    methods = _category_column_values(block, "exptl", "method")
-    primary_method = _pick_primary_method(methods)
-    resolution_candidates = [
-        *(_safe_float(value) for value in _category_column_values(block, "refine", "ls_d_res_high")),
-        *(_safe_float(value) for value in _category_column_values(block, "em_3d_reconstruction", "resolution")),
-        *(_safe_float(value) for value in _category_column_values(block, "reflns", "d_resolution_high")),
-    ]
-    resolutions = sorted(value for value in resolution_candidates if value is not None)
-    return EntryQualityMetadata(
-        pdb_id=str(pdb_id or Path(source_path).stem),
-        source_path=str(source_path),
-        experimental_methods=sorted({method for method in methods if method not in {"", ".", "?"}}),
-        primary_method=primary_method,
-        method_priority=_method_priority(primary_method),
-        resolution=resolutions[0] if resolutions else None,
-    )
-
-
 def extract_protein_monomer_structure(
     monomer: MonomerSample,
     *,
@@ -199,16 +215,11 @@ def extract_protein_monomer_structure(
     quality_metadata: EntryQualityMetadata | object | None = None,
     atom_array: AtomArray | None = None,
 ) -> ExtractedMonomerStructure:
-    """Extract one canonical monomer chain from source mmCIF and write a single-chain PDB."""
+    """Extract one canonical monomer chain from cached atoms and write a PDB."""
 
     full_atom_array = atom_array
     if full_atom_array is None:
-        cif_file = read_cif_file(monomer.source_path)
-        full_atom_array = get_structure(
-            cif_file,
-            model=model,
-            use_author_fields=False,
-        )
+        raise ValueError(f"Cached coordinates are required for monomer {monomer.monomer_id}")
     chain_mask = full_atom_array.chain_id == monomer.label_asym_id
     if hasattr(full_atom_array, "hetero"):
         chain_mask &= ~full_atom_array.hetero
@@ -243,7 +254,7 @@ def extract_protein_monomer_structure(
     quality = (
         None
         if quality_metadata is SKIP_QUALITY_METADATA
-        else quality_metadata or read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+        else quality_metadata or _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id)
     )
     resolved_from_segments = _resolved_residue_count_from_segments(monomer.parsed_coordinate_segments)
     denominator = sequence_length if sequence_length > 0 else max(1, resolved_residue_count)
@@ -398,9 +409,11 @@ def extract_protein_monomer_structures(
     outdir.mkdir(parents=True, exist_ok=True)
     # Load cif_cache index when prep_dir is available
     cif_idx: dict | None = None
+    quality_by_source: dict[str, EntryQualityMetadata] = {}
     if prep_dir:
         from cif_parse.clustering.prep import load_cif_coords_index, load_cif_from_prep
         cif_idx = load_cif_coords_index(prep_dir)
+        quality_by_source = load_entry_quality_metadata_from_prep(prep_dir)
 
     structures: dict[str, ExtractedMonomerStructure] = {}
     failures: list[dict[str, str]] = []
@@ -450,23 +463,12 @@ def extract_protein_monomer_structures(
                 if _prep_atoms is not None:
                     atom_array_cache[_atom_key] = _prep_atoms
             if monomer.source_path not in quality_cache:
-                quality_cache[monomer.source_path] = (
-                    SKIP_QUALITY_METADATA
-                    if prep_dir
-                    else read_entry_quality_metadata(
-                        monomer.source_path,
-                        pdb_id=monomer.pdb_id,
-                    )
+                quality_cache[monomer.source_path] = quality_by_source.get(
+                    monomer.source_path,
+                    _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
                 )
             if _atom_key not in atom_array_cache and monomer.source_path not in atom_array_cache:
-                if prep_dir:
-                    raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
-                cif_file = read_cif_file(monomer.source_path)
-                atom_array_cache[monomer.source_path] = get_structure(
-                    cif_file,
-                    model=model,
-                    use_author_fields=False,
-                )
+                raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
             _atoms = atom_array_cache.get(_atom_key) or atom_array_cache.get(monomer.source_path)
             try:
                 structures[monomer.monomer_id] = extract_protein_monomer_structure(
@@ -504,26 +506,19 @@ def extract_protein_monomer_structures(
                     with cache_lock:
                         atom_array_cache[_atom_key_local] = _prep
             if _need_quality:
-                _q = (
-                    SKIP_QUALITY_METADATA
-                    if prep_dir
-                    else read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
+                _q = quality_by_source.get(
+                    monomer.source_path,
+                    _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
                 )
                 with cache_lock:
                     if monomer.source_path not in quality_cache:
                         quality_cache[monomer.source_path] = _q
 
-            # Phase 3: check again under lock, fallback to mmCIF if still missing
+            # Phase 3: check again under lock; clustering does not read mmCIF.
             with cache_lock:
                 _need_atoms = (_atom_key_local not in atom_array_cache and monomer.source_path not in atom_array_cache)
             if _need_atoms:
-                if prep_dir:
-                    raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
-                cf = read_cif_file(monomer.source_path)
-                _atoms_fb = get_structure(cf, model=model, use_author_fields=False)
-                with cache_lock:
-                    if _atom_key_local not in atom_array_cache:
-                        atom_array_cache[monomer.source_path] = _atoms_fb
+                raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
 
             with cache_lock:
                 _atoms = atom_array_cache.get(_atom_key_local) or atom_array_cache.get(monomer.source_path)

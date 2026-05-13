@@ -1,9 +1,9 @@
 """Pre-processing for clustering at any scale.
 
 Produces a self-contained directory that replaces thousands of individual
-``result.json.gz`` reads with columnar Parquet scans and replaces re-parsing
-the same mmCIF files with a single binary index.  The output directory always
-contains exactly 8 files regardless of case count.
+``result.json.gz`` reads with columnar Parquet scans and converts parse-stage
+atom pickle caches into a compact binary coordinate index.  Clustering
+consumers do not read original mmCIF files.
 
 Layout
 ------
@@ -75,6 +75,7 @@ def _decompress_blob(data: bytes) -> bytes:
 
 # Parquet output file names
 PARQUET_TABLES = [
+    "entry_quality",
     "monomers",
     "dimers",
     "multimers",
@@ -96,7 +97,7 @@ def _hash_source_mtime(source_path: str) -> str:
 def _blob_index_key(source_path: str, assembly_id: str | None) -> str:
     """Return a stable 64-char hex key that uniquely identifies a cached blob.
 
-    Different assemblies from the same mmCIF file get different keys, so the
+    Different assemblies from the same parsed source get different keys, so the
     index can store them independently.
     """
     cache_key = f"{source_path}__{assembly_id or ''}"
@@ -147,6 +148,46 @@ def _classify_polymer_class(chain_payload: dict[str, Any]) -> str | None:
     return None
 
 
+_METHOD_PRIORITY = {
+    "x-ray diffraction": 0,
+    "electron microscopy": 1,
+    "solution nmr": 2,
+    "solid-state nmr": 2,
+}
+
+
+def _safe_float(value: Any) -> float | None:
+    if value in (None, "", ".", "?"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _entry_quality_row(summary: dict[str, Any], case_id: str) -> dict[str, Any]:
+    metadata = summary.get("entry_metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    source_path = str(summary.get("source_path", "") or "")
+    pdb_id = str(summary.get("pdb_id", "") or "")
+    method = str(metadata.get("experimental_method", "") or "").strip()
+    methods = [method] if method else []
+    primary_method = method or None
+    resolution = _safe_float(metadata.get("resolution"))
+    return {
+        "pdb_id": pdb_id,
+        "source_path": source_path,
+        "source_case_dir": case_id,
+        "experimental_methods": json.dumps(sorted(set(methods)), ensure_ascii=False),
+        "primary_method": primary_method,
+        "method_priority": _METHOD_PRIORITY.get(method.lower(), 99) if method else 99,
+        "resolution": resolution,
+        "release_date": str(metadata.get("release_date", "") or ""),
+        "metadata_source": str(metadata.get("metadata_source", "") or ""),
+    }
+
+
 def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list[dict[str, Any]]]:
     """Parse one case bundle dict and return rows for each Parquet table.
 
@@ -162,6 +203,7 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
     assembly_mode = str(summary.get("assembly_mode", "") or "")
 
     rows: dict[str, list[dict[str, Any]]] = {t: [] for t in PARQUET_TABLES}
+    rows["entry_quality"].append(_entry_quality_row(summary, case_id))
 
     # ── monomers ─────────────────────────────────────────────────────────
     chain_inventory = bundle.get("chain_inventory", [])
@@ -370,11 +412,6 @@ def _ingest_cases_to_parquet(
                 stats["skipped_no_bundles"] += 1
                 continue
             for bundle in bundles:
-                if cif_files_directory:
-                    summary = bundle.get("structure_summary", {})
-                    sp = str(summary.get("source_path", "") or "")
-                    if sp:
-                        summary["source_path"] = str(Path(cif_files_directory) / Path(sp).name)
                 rows = _extract_bundle_rows(bundle, case_id)
                 for table_name in PARQUET_TABLES:
                     all_rows[table_name].extend(rows[table_name])
@@ -417,7 +454,7 @@ def _ingest_cases_to_parquet(
 def _cache_sources_to_temp(
     args: tuple[list[tuple[str, list[str | None], str]], Path, int, dict[str, str] | None, set[str]],
 ) -> dict[str, Any]:
-    """Process a batch of mmCIF files and write cached atom arrays to one chunk.
+    """Process a batch of parse-stage atom caches into one coord chunk.
 
     All source_paths in the batch write to a single ``temp_{worker_id}.bin`` +
     ``temp_{worker_id}.idx`` pair — no inter-process coordination needed because
@@ -425,7 +462,7 @@ def _cache_sources_to_temp(
 
     Returns metadata only — no blob data through IPC.
     """
-    chunk_tasks, tmp_dir, worker_id, atom_cache_map, input_assembly_sources = args
+    chunk_tasks, tmp_dir, worker_id, atom_cache_map, _input_assembly_sources = args
     tmp_dir = Path(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -434,95 +471,51 @@ def _cache_sources_to_temp(
     all_entries: list[dict[str, Any]] = []
 
     with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
-        for source_path, assembly_ids, cif_files_directory in chunk_tasks:
-            resolved_path = source_path
-            if cif_files_directory:
-                resolved_path = str(Path(cif_files_directory) / Path(source_path).name)
-
-            # Fast path: use atom cache from parsing stage
+        for source_path, assembly_ids, _cif_files_directory in chunk_tasks:
             atoms_dir = atom_cache_map.get(source_path) if atom_cache_map else None
-            if atoms_dir:
-                atoms_dir = Path(atoms_dir)
-                try:
-                    for assembly_id in assembly_ids:
-                        cache_key = f"{source_path}__{assembly_id or ''}"
-                        pkl_name = f"{assembly_id or '_none'}.pkl"
-                        pkl_path = atoms_dir / pkl_name
-                        if not pkl_path.exists():
-                            if assembly_id is None:
-                                all_entries.append({"cache_key": cache_key, "status": "empty"})
-                                continue
-                            pkl_none = atoms_dir / "_none.pkl"
-                            if pkl_none.exists():
-                                pkl_path = pkl_none
-                            else:
-                                all_entries.append({"cache_key": cache_key, "status": "empty"})
-                                continue
-                        raw = pickle.loads(zlib.decompress(pkl_path.read_bytes()))
-                        if isinstance(raw, dict):
-                            aa = raw.get("atom_array", raw)
-                        else:
-                            aa = raw
-                        if aa is not None and len(aa) > 0:
-                            for cid in sorted(set(aa.chain_id)):
-                                chain_atoms = aa[aa.chain_id == cid]
-                                if chain_atoms is None or len(chain_atoms) == 0:
-                                    continue
-                                wrapped = _compress_blob(pickle.dumps(
-                                    {"atom_array": chain_atoms, "quality": None, "chain_ops": None},
-                                    protocol=pickle.HIGHEST_PROTOCOL,
-                                ))
-                                offset = bin_fh.tell()
-                                bin_fh.write(wrapped)
-                                blob_key = _chain_blob_key(source_path, assembly_id, str(cid))
-                                idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                                    blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                                    offset, len(wrapped),
-                                ))
-                                all_entries.append({"cache_key": cache_key, "status": "cached"})
-                    continue  # skip slow path for this source_path
-                except Exception as exc:
-                    LOGGER.debug("Atom cache read failed for %s, falling back to mmCIF: %s", source_path, exc)
-
-            # Slow path: read and parse original mmCIF
-            try:
-                from biotite.structure.io.pdbx import get_assembly, get_structure
-                from cif_parse.io import read_cif_file
-
-                cif_file = read_cif_file(resolved_path)
-                quality = _read_quality(resolved_path, cif_file)
-
+            if not atoms_dir:
                 for assembly_id in assembly_ids:
                     cache_key = f"{source_path}__{assembly_id or ''}"
-                    try:
-                        if assembly_id and source_path not in input_assembly_sources:
-                            atom_array = get_assembly(cif_file, assembly_id=assembly_id, model=1, use_author_fields=False)
-                        else:
-                            atom_array = get_structure(cif_file, model=1, use_author_fields=False)
-                        if atom_array is not None and len(atom_array) > 0:
-                            for cid in sorted(set(atom_array.chain_id)):
-                                chain_atoms = atom_array[atom_array.chain_id == cid]
-                                if chain_atoms is None or len(chain_atoms) == 0:
-                                    continue
-                                blob = _compress_blob(pickle.dumps(
-                                    {"atom_array": chain_atoms, "quality": quality, "chain_ops": None},
-                                    protocol=pickle.HIGHEST_PROTOCOL,
-                                ))
-                                offset = bin_fh.tell()
-                                bin_fh.write(blob)
-                                blob_key = _chain_blob_key(source_path, assembly_id, str(cid))
-                                idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                                    blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                                    offset, len(blob),
-                                ))
-                                all_entries.append({"cache_key": cache_key, "status": "cached"})
-                        else:
-                            all_entries.append({"cache_key": cache_key, "status": "empty"})
-                    except Exception as exc:
-                        LOGGER.warning("Failed to cache assembly %s for %s: %s", assembly_id, source_path, exc)
-                        all_entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
+                    all_entries.append({"cache_key": cache_key, "status": "error", "error": "missing parse atom cache"})
+                continue
+
+            atoms_dir = Path(atoms_dir)
+            try:
+                for assembly_id in assembly_ids:
+                    cache_key = f"{source_path}__{assembly_id or ''}"
+                    pkl_name = f"{assembly_id or '_none'}.pkl"
+                    pkl_path = atoms_dir / pkl_name
+                    if not pkl_path.exists():
+                        all_entries.append({"cache_key": cache_key, "status": "empty"})
+                        continue
+                    raw = pickle.loads(zlib.decompress(pkl_path.read_bytes()))
+                    if isinstance(raw, dict):
+                        aa = raw.get("atom_array", raw)
+                    else:
+                        aa = raw
+                    if aa is None or len(aa) == 0:
+                        all_entries.append({"cache_key": cache_key, "status": "empty"})
+                        continue
+                    cached_any = False
+                    for cid in sorted(set(aa.chain_id)):
+                        chain_atoms = aa[aa.chain_id == cid]
+                        if chain_atoms is None or len(chain_atoms) == 0:
+                            continue
+                        wrapped = _compress_blob(pickle.dumps(
+                            {"atom_array": chain_atoms, "quality": None, "chain_ops": None},
+                            protocol=pickle.HIGHEST_PROTOCOL,
+                        ))
+                        offset = bin_fh.tell()
+                        bin_fh.write(wrapped)
+                        blob_key = _chain_blob_key(source_path, assembly_id, str(cid))
+                        idx_fh.write(_IDX_ENTRY_STRUCT.pack(
+                            blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                            offset, len(wrapped),
+                        ))
+                        cached_any = True
+                    all_entries.append({"cache_key": cache_key, "status": "cached" if cached_any else "empty"})
             except Exception as exc:
-                LOGGER.warning("Failed to read mmCIF %s: %s", source_path, exc)
+                LOGGER.warning("Failed to cache parse atom pkl for %s: %s", source_path, exc)
                 for assembly_id in assembly_ids:
                     cache_key = f"{source_path}__{assembly_id or ''}"
                     all_entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
@@ -530,49 +523,6 @@ def _cache_sources_to_temp(
     return {"entries": all_entries,
             "bin_path": str(bin_path) if bin_path.exists() else None,
             "idx_path": str(idx_path) if idx_path.exists() else None}
-
-
-# ── quality / chain-ops helpers ──────────────────────────────────────────────
-
-
-def _read_quality(source_path: str, cif_file=None) -> dict[str, Any] | None:
-    try:
-        from cif_parse.io import read_cif_file as _read
-        from biotite.structure.io.pdbx import CIFBlock
-        cf = cif_file or _read(source_path)
-        block = cf.block if isinstance(cf, CIFBlock) else cf
-        if hasattr(block, "get"):
-            exptl = block.get("_exptl.method") or block.get("_exptl_crystal.method") or ""
-            if hasattr(exptl, "as_item"):
-                exptl = str(exptl.as_item()) if exptl.as_item() else ""
-            elif isinstance(exptl, (list, tuple)):
-                exptl = str(exptl[0]) if exptl else ""
-            else:
-                exptl = str(exptl) if exptl else ""
-            resolution = block.get("_refine.ls_d_res_high") or block.get("_reflns.d_resolution_high") or ""
-            if hasattr(resolution, "as_item"):
-                resolution = resolution.as_item()
-            elif isinstance(resolution, (list, tuple)):
-                resolution = resolution[0] if resolution else None
-            try:
-                resolution = float(resolution) if resolution else None
-            except (ValueError, TypeError):
-                resolution = None
-            return {"method": exptl, "resolution": resolution}
-    except Exception:
-        pass
-    return None
-
-
-def _read_chain_ops_json(source_path: str, assembly_id: str | None) -> str | None:
-    try:
-        from cif_parse.io import read_assembly_chain_operations
-        _, chain_ops = read_assembly_chain_operations(source_path, assembly_id=assembly_id)
-        if chain_ops:
-            return json.dumps(chain_ops, ensure_ascii=False)
-    except Exception:
-        pass
-    return None
 
 
 # ── Parquet merging helpers ──────────────────────────────────────────────────
@@ -684,9 +634,11 @@ def build_prep_database(
     ----------
     inputs: case-output directories or parent directories.
     prep_dir: output directory for the prep files.
-    cif_files_directory: optional override for mmCIF file locations.
+    cif_files_directory: deprecated; ignored because prep consumes parse JSON
+        and parse-stage atom pkl files only.
     prep_jobs: number of parallel workers.
-    load_cif_cache: if True, also pre-load mmCIF atom arrays.
+    load_cif_cache: if True, build the coordinate index from parse-stage atom
+        pkl files.
 
     Returns a manifest dict.
     """
@@ -721,7 +673,9 @@ def build_prep_database(
     LOGGER.info("Dispatching %d batches (batch_size=%d) to %d workers",
                 len(batches), cases_per_batch, actual_jobs)
 
-    if len(batches) <= 1:
+    if not batches:
+        pass
+    elif len(batches) <= 1:
         result = _ingest_cases_to_parquet(task_args[0])
         _merge_batch_stats(result, stats)
     else:
@@ -785,11 +739,11 @@ def build_prep_database(
     LOGGER.info("Phase 1 complete (%.1fs): %d ingested, %d source paths",
                 time.monotonic() - t1, stats["ingested"], len(all_source_paths))
 
-    # ── Phase 2: mmCIF → AtomArray binary cache ──────────────────────────
+    # ── Phase 2: parse atom pkl → AtomArray binary cache ─────────────────
     cif_stats = {"cached": 0, "skipped": 0}
     if load_cif_cache and all_source_paths:
         t2 = time.monotonic()
-        LOGGER.info("Phase 2: caching atom arrays for %d source files", len(all_source_paths))
+        LOGGER.info("Phase 2: caching atom arrays for %d parsed source files", len(all_source_paths))
 
         # Collect (source_path, assembly_id) pairs from all tables
         cache_pairs: dict[str, set[str | None]] = {}
@@ -801,7 +755,7 @@ def build_prep_database(
         # Add assembly_ids from parquet tables (if we have the files)
         try:
             import pyarrow.parquet as pq
-            for table_name in ["dimers", "multimers"]:
+            for table_name in ["dimers", "multimers", "antibody_complexes", "tcr_complexes"]:
                 p = prep_dir / f"{table_name}.parquet"
                 if not p.exists():
                     continue
@@ -852,7 +806,7 @@ def build_prep_database(
                 with ProcessPoolExecutor(max_workers=num_workers) as executor:
                     futures = [executor.submit(_cache_sources_to_temp, arg) for arg in task_args]
                     for future in tqdm(as_completed(futures), total=len(futures),
-                                       desc="Caching mmCIF structures", unit="source"):
+                                       desc="Caching parsed structures", unit="source"):
                         try:
                             _count_cif_entries(future.result(), cif_stats)
                         except Exception as exc:
@@ -880,7 +834,7 @@ def build_prep_database(
     LOGGER.info("Prep built (%.1fs): %d source paths, %d errors",
                 elapsed, len(all_source_paths), stats["errors"])
 
-    return {
+    manifest = {
         "prep_dir": str(prep_dir.resolve()),
         "total_cases": stats["total_cases"],
         "ingested": stats["ingested"],
@@ -891,6 +845,9 @@ def build_prep_database(
         "cif_skipped": cif_stats["skipped"],
         "elapsed_seconds": round(elapsed, 1),
     }
+    dump_path = prep_dir / "manifest.json"
+    dump_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
 
 
 # ── consumer API (used by collect_* and extract_* functions) ─────────────────

@@ -14,7 +14,6 @@ from tqdm import tqdm
 import biotite.structure as struc
 from biotite.structure import AtomArray, get_residues
 from biotite.structure.io.pdb import PDBFile
-from biotite.structure.io.pdbx import get_assembly, get_structure
 
 from cif_parse.clustering.common import (
     canonical_monomer_id,
@@ -28,7 +27,6 @@ from cif_parse.clustering.protein_structures import (
 )
 from cif_parse.clustering.parallel import normalize_worker_count
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
-from cif_parse.io import read_assembly_chain_operations, read_cif_file
 from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
 
@@ -380,20 +378,7 @@ def extract_multimer_structure(
         raise ValueError(f"Missing source_path for multimer {observation.multimer_observation_id}")
 
     if atom_array is None:
-        cif_file = read_cif_file(observation.source_path)
-        if observation.assembly_id:
-            atom_array = get_assembly(
-                cif_file,
-                assembly_id=observation.assembly_id,
-                model=model,
-                use_author_fields=False,
-            )
-        else:
-            atom_array = get_structure(
-                cif_file,
-                model=model,
-                use_author_fields=False,
-            )
+        raise ValueError(f"Cached coordinates are required for multimer {observation.multimer_observation_id}")
 
     chain_operations = assembly_chain_operations or {}
     instance_atom_arrays: list[AtomArray] = []
@@ -485,8 +470,6 @@ def extract_multimer_structures(
     sorted_observations = sorted(observations, key=lambda item: item.multimer_observation_id)
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
-    import threading as _threading
-
     _prep_m_idx: dict | None = None
     if prep_dir:
         from cif_parse.clustering.prep import load_cif_coords_index, assemble_atom_array_from_chains
@@ -508,59 +491,17 @@ def extract_multimer_structures(
             assembly_id=obs.assembly_id, index=_prep_m_idx,
         )
 
-    atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
-    chain_ops_cache: dict[tuple[str, str | None], dict[str, list[str]]] = {}
-    _lock = _threading.Lock()
-
     def _load_chain_ops_only(observation: MultimerObservation) -> dict[str, list[str]]:
-        if prep_dir:
-            return {}
-        cache_key = (observation.source_path, observation.assembly_id)
-        with _lock:
-            if cache_key not in chain_ops_cache:
-                _, chain_ops = read_assembly_chain_operations(
-                    observation.source_path,
-                    assembly_id=observation.assembly_id,
-                )
-                chain_ops_cache[cache_key] = chain_ops
-        return chain_ops_cache[cache_key]
-
-    def _load_caches(observation: MultimerObservation) -> tuple[AtomArray, dict[str, list[str]]]:
-        cache_key = (observation.source_path, observation.assembly_id)
-        with _lock:
-            if cache_key not in atom_array_cache:
-                cif_file = read_cif_file(observation.source_path)
-                if observation.assembly_id:
-                    atom_array_cache[cache_key] = get_assembly(
-                        cif_file,
-                        assembly_id=observation.assembly_id,
-                        model=model,
-                        use_author_fields=False,
-                    )
-                else:
-                    atom_array_cache[cache_key] = get_structure(
-                        cif_file,
-                        model=model,
-                        use_author_fields=False,
-                    )
-            if cache_key not in chain_ops_cache:
-                _, chain_ops = read_assembly_chain_operations(
-                    observation.source_path,
-                    assembly_id=observation.assembly_id,
-                )
-                chain_ops_cache[cache_key] = chain_ops
-        return atom_array_cache[cache_key], chain_ops_cache[cache_key]
+        return {}
 
     def _process_one(observation: MultimerObservation) -> ExtractedMultimerStructure | None:
         atom_array = _try_assemble_multimer(observation)
         if atom_array is not None:
             chain_ops = _load_chain_ops_only(observation)
         else:
-            if prep_dir:
-                raise ValueError(
-                    f"Prep coordinates missing for multimer {observation.multimer_observation_id}"
-                )
-            atom_array, chain_ops = _load_caches(observation)
+            raise ValueError(
+                f"Prep coordinates missing for multimer {observation.multimer_observation_id}"
+            )
         return extract_multimer_structure(
             observation,
             outdir=outdir,

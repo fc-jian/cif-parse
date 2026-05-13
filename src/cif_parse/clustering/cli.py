@@ -147,6 +147,45 @@ def _close_prep_handles(prep_dir: str | None) -> None:
         close_blob_handles()
 
 
+def _full_command_needs_coordinates(args: argparse.Namespace) -> bool:
+    if args.protein_structure_mode == "greedy":
+        return True
+    return any(
+        (
+            args.dimer_mode == "signature" and args.dimer_structure_mode == "greedy",
+            args.multimer_mode == "signature" and args.multimer_structure_mode == "greedy",
+            args.antibody_complex_mode == "signature" and args.antibody_complex_structure_mode == "greedy",
+            args.tcr_complex_mode == "signature" and args.tcr_complex_structure_mode == "greedy",
+        )
+    )
+
+
+def _ensure_prep_for_full_command(args: argparse.Namespace) -> str | None:
+    prep_dir = _prep_dir(args)
+    if prep_dir is not None or args.inputs is None or not _full_command_needs_coordinates(args):
+        return prep_dir
+    if not all(Path(item).exists() for item in args.inputs):
+        return prep_dir
+
+    from cif_parse.clustering.prep import build_prep_database
+    from cif_parse.settings import get_fast_temp_dir
+
+    temp_prep_dir = get_fast_temp_dir("cluster_auto_prep")
+    LOGGER.warning(
+        "Full clustering with structure/high-order stages now consumes prep only; "
+        "building temporary prep directory %s from --inputs.",
+        temp_prep_dir,
+    )
+    build_prep_database(
+        inputs=args.inputs,
+        prep_dir=temp_prep_dir,
+        prep_jobs=args.jobs,
+        load_cif_cache=True,
+    )
+    args.prep_dir = temp_prep_dir
+    return str(temp_prep_dir)
+
+
 def build_parser(
     config_defaults: dict[str, Any] | None = None,
     config_path: Path | None = None,
@@ -191,7 +230,7 @@ def build_parser(
         "--cif-files-directory",
         type=Path,
         default=None,
-        help="Optional override directory for original mmCIF files",
+        help="Deprecated and ignored; prep reads parse JSON plus parse-stage atom pkl files only",
     )
     prep_parser.add_argument(
         "--prep-jobs",
@@ -203,7 +242,7 @@ def build_parser(
         "--no-cif-cache",
         action="store_true",
         default=False,
-        help="Skip pre-loading mmCIF atom arrays into the cif_cache table",
+        help="Skip building the coordinate index from parse-stage atom pkl files",
     )
     prep_parser.add_argument(
         "--config",
@@ -242,8 +281,7 @@ def build_parser(
         "--cif-files-directory",
         type=Path,
         default=None,
-        help="Optional override directory for original mmCIF files; when set, the basename "
-        "of each source_path recorded in case bundles is resolved inside this directory",
+        help="Deprecated and ignored; clustering never reads original mmCIF files",
     )
     parser.add_argument(
         "--outdir",
@@ -374,7 +412,7 @@ def build_parser(
         "--model",
         type=int,
         default=int(clustering_defaults.get("model", 1)),
-        help="Model index used when extracting canonical monomer coordinates from source mmCIF",
+        help="Model index recorded in extraction outputs; coordinates are read from prep atom caches",
     )
     parser.add_argument(
         "--keep-hydrogens",
@@ -437,16 +475,14 @@ def _prep_dir(args: argparse.Namespace) -> str | None:
 
 
 def _cif_files_directory(args: argparse.Namespace) -> str | None:
-    return str(args.cif_files_directory) if args.cif_files_directory is not None else None
+    return None
 
 
 def _warn_cif_override(args: argparse.Namespace) -> None:
     if args.cif_files_directory is not None:
         LOGGER.warning(
-            "Using --cif-files-directory=%s to override source mmCIF paths. "
-            "Mismatched CIF files between clustering and the original cif-parse "
-            "pipeline may produce incorrect results. If in doubt, re-run cif-parse "
-            "with the same CIF file set.",
+            "--cif-files-directory=%s is deprecated and ignored. Clustering reads "
+            "only parse JSON, prep Parquet, and parse-stage atom pkl coordinate caches.",
             args.cif_files_directory,
         )
 
@@ -458,7 +494,7 @@ def _run_prep(args: argparse.Namespace) -> int:
     result = build_prep_database(
         inputs=args.inputs,
         prep_dir=args.prep_dir,
-        cif_files_directory=str(args.cif_files_directory) if args.cif_files_directory else None,
+        cif_files_directory=None,
         prep_jobs=args.prep_jobs,
         load_cif_cache=not args.no_cif_cache,
     )
@@ -541,9 +577,6 @@ def _run_structure(
 
         cif_idx_for_pipeline = load_cif_coords_index(prep_dir)
 
-    from biotite.structure.io.pdbx import get_structure
-    from cif_parse.io import read_cif_file
-
     quality_cache: dict[str, Any] = {}
     atom_array_cache: dict[str, Any] = {}
     import threading
@@ -553,9 +586,8 @@ def _run_structure(
     def _pipeline_extract(monomer) -> Any | None:
         nonlocal cif_idx_for_pipeline
         from cif_parse.clustering.protein_structures import (
-            SKIP_QUALITY_METADATA,
             extract_protein_monomer_structure,
-            read_entry_quality_metadata,
+            load_entry_quality_metadata_from_prep,
         )
 
         atom_key = f"{monomer.source_path}__{monomer.label_asym_id}"
@@ -594,23 +626,16 @@ def _run_structure(
                     atom_array_cache[atom_key] = found
 
         if need_quality:
-            quality = (
-                SKIP_QUALITY_METADATA
-                if prep_dir
-                else read_entry_quality_metadata(monomer.source_path, pdb_id=monomer.pdb_id)
-            )
+            if "_entry_quality" not in quality_cache:
+                quality_cache["_entry_quality"] = load_entry_quality_metadata_from_prep(prep_dir)
+            quality = quality_cache["_entry_quality"].get(monomer.source_path)
             with extract_lock:
                 quality_cache.setdefault(monomer.source_path, quality)
 
         with extract_lock:
             need_atoms = atom_key not in atom_array_cache
         if need_atoms:
-            if prep_dir:
-                raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
-            cif_file = read_cif_file(monomer.source_path)
-            atoms = get_structure(cif_file, model=args.model, use_author_fields=False)
-            with extract_lock:
-                atom_array_cache.setdefault(atom_key, atoms)
+            raise ValueError(f"Prep coordinates missing for monomer {monomer.monomer_id}")
 
         with extract_lock:
             atom_array = atom_array_cache.get(atom_key)
@@ -786,9 +811,11 @@ def main(argv: list[str] | None = None) -> int:
     prep_dir = _prep_dir(args)
     if args.inputs is None and prep_dir is None:
         parser.error("--inputs is required unless --prep-dir is provided")
-    if stage_subcommand is not None and prep_dir is None:
-        parser.error(f"`{stage_subcommand}` subcommand requires --prep-dir")
-
+    if stage_subcommand not in (None, "seq") and prep_dir is None:
+        parser.error(
+            f"`{stage_subcommand}` subcommand requires --prep-dir built by `cif-parse-cluster prep`; "
+            "clustering stages do not read original mmCIF files"
+        )
     _resolve_worker_counts(args, config_defaults)
 
     for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
@@ -799,6 +826,8 @@ def main(argv: list[str] | None = None) -> int:
 
     set_global_usalign_limit(args.usalign_jobs)
     _warn_cif_override(args)
+    if stage_subcommand is None:
+        prep_dir = _ensure_prep_for_full_command(args)
     _set_shared_prep_index(prep_dir)
     try:
         if stage_subcommand == "seq":

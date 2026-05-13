@@ -94,9 +94,9 @@ cif-parse-cluster \
   --outdir cluster_outputs
 ```
 
-When `--prep-dir` is not provided, `--inputs` is required and clustering falls back to reading individual `result.json.gz` files and original mmCIF files directly.
+Full clustering and every structure/high-order subcommand consume prep data for coordinates; clustering reads parse JSON, prep Parquet, and parse-stage atom pickle caches only. The `seq` stage can still run directly from `--inputs` because it only needs case JSON. If the legacy full command is run with `--inputs` but no `--prep-dir`, it builds a temporary prep directory first and then runs clustering from that prep data.
 
-Use `--no-cif-cache` to skip Phase 2 (atom caching) when only the Parquet files are needed.
+Use `--no-cif-cache` to skip Phase 2 coordinate indexing when only the Parquet files are needed. Structure and high-order clustering require the coordinate index.
 
 ### Running Clustering
 
@@ -118,10 +118,10 @@ cif-parse-cluster abag      --prep-dir clustering_prep --outdir cluster_outputs
 
 Pass `--ignore-structure` to a high-order stage only when you intentionally want signatures based on sequence cluster ids alone.
 
-Run monomer-only clustering:
+Run sequence-only clustering directly from case JSON:
 
 ```bash
-cif-parse-cluster \
+cif-parse-cluster seq \
   --inputs batch_outputs/cases \
   --outdir cluster_outputs
 ```
@@ -130,7 +130,7 @@ Run the current full clustering stack:
 
 ```bash
 cif-parse-cluster \
-  --inputs batch_outputs/cases \
+  --prep-dir clustering_prep \
   --outdir cluster_outputs \
   --protein-sequence-mode mmseqs2 \
   --protein-structure-mode greedy \
@@ -156,8 +156,8 @@ Key clustering defaults:
 6. The legacy full command now calls the split stages as `seq -> structure -> parallel(tcr, abag, multimer, dimer)`. For maximum throughput on a scheduler, run `seq` and `structure` first, then submit high-order stage subcommands in parallel.
 7. Higher-order structure refinement skips singleton signature groups: singletons are emitted directly as clusters without writing complex PDBs or running USalign.
 8. `--jobs N` automatically propagates to all subtask workers (`--mmseqs-threads`, `--sequence-cluster-jobs`, `--usalign-jobs`). Individual subtask counts can still be overridden explicitly.
-9. Use `--cif-files-directory` to override the location of original mmCIF files during structure extraction.
-10. Use `--prep-dir` as the full clustering input source for Parquet rows and per-chain cached AtomArrays. Without it, `--inputs` is required and the pipeline falls back to reading individual case bundles and mmCIF files.
+9. `--cif-files-directory` is deprecated and ignored by clustering.
+10. Use `--prep-dir` as the full clustering input source for Parquet rows and per-chain cached AtomArrays. Without it, `seq` can run from case JSON; the legacy full command auto-builds temporary prep before any coordinate-consuming stage.
 
 ## Configuration
 

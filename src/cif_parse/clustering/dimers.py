@@ -14,7 +14,6 @@ from tqdm import tqdm
 import biotite.structure as struc
 from biotite.structure import AtomArray, get_residues
 from biotite.structure.io.pdb import PDBFile
-from biotite.structure.io.pdbx import get_assembly, get_structure
 
 from cif_parse.clustering.common import (
     canonical_monomer_id,
@@ -28,7 +27,6 @@ from cif_parse.clustering.protein_structures import (
 )
 from cif_parse.clustering.parallel import normalize_worker_count
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
-from cif_parse.io import read_cif_file
 from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
 
@@ -352,20 +350,7 @@ def extract_dimer_structure(
         raise ValueError(f"Missing source_path for dimer {observation.dimer_observation_id}")
 
     if atom_array is None:
-        cif_file = read_cif_file(observation.source_path)
-        if observation.assembly_id:
-            atom_array = get_assembly(
-                cif_file,
-                assembly_id=observation.assembly_id,
-                model=model,
-                use_author_fields=False,
-            )
-        else:
-            atom_array = get_structure(
-                cif_file,
-                model=model,
-                use_author_fields=False,
-            )
+        raise ValueError(f"Cached coordinates are required for dimer {observation.dimer_observation_id}")
 
     chain_arrays: list[AtomArray] = []
     for chain_index, (label_asym_id, sym_id) in enumerate(
@@ -439,26 +424,6 @@ def extract_dimer_structures(
     sorted_observations = sorted(observations, key=lambda item: item.dimer_observation_id)
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
-    def _load_atom_array(observation: DimerObservation, cache: dict, lock) -> AtomArray:
-        cache_key = (observation.source_path, observation.assembly_id)
-        with lock:
-            if cache_key not in cache:
-                cif_file = read_cif_file(observation.source_path)
-                if observation.assembly_id:
-                    cache[cache_key] = get_assembly(
-                        cif_file,
-                        assembly_id=observation.assembly_id,
-                        model=model,
-                        use_author_fields=False,
-                    )
-                else:
-                    cache[cache_key] = get_structure(
-                        cif_file,
-                        model=model,
-                        use_author_fields=False,
-                    )
-        return cache[cache_key]
-
     # Fast path: assemble dimer from per-chain blobs
     _prep_cif_idx: dict | None = None
     if prep_dir:
@@ -475,9 +440,6 @@ def extract_dimer_structures(
         )
 
     if extraction_jobs <= 1 or len(sorted_observations) <= 1:
-        atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
-        import threading as _threading
-        _lock = _threading.Lock()
         observation_iter = (
             tqdm(sorted_observations, desc="Extracting dimer structures", unit="dimer")
             if show_progress
@@ -487,11 +449,9 @@ def extract_dimer_structures(
             try:
                 atom_array = _try_assemble_from_chains(observation)
                 if atom_array is None:
-                    if prep_dir:
-                        raise ValueError(
-                            f"Prep coordinates missing for dimer {observation.dimer_observation_id}"
-                        )
-                    atom_array = _load_atom_array(observation, atom_array_cache, _lock)
+                    raise ValueError(
+                        f"Prep coordinates missing for dimer {observation.dimer_observation_id}"
+                    )
                 structures[observation.dimer_observation_id] = extract_dimer_structure(
                     observation,
                     outdir=outdir,
@@ -505,19 +465,12 @@ def extract_dimer_structures(
                     {"dimer_observation_id": observation.dimer_observation_id, "error": str(exc)}
                 )
     else:
-        import threading as _threading
-
-        atom_array_cache: dict[tuple[str, str | None], AtomArray] = {}
-        cache_lock = _threading.Lock()
-
         def _extract_one(observation: DimerObservation) -> ExtractedDimerStructure | None:
             atom_array = _try_assemble_from_chains(observation)
             if atom_array is None:
-                if prep_dir:
-                    raise ValueError(
-                        f"Prep coordinates missing for dimer {observation.dimer_observation_id}"
-                    )
-                atom_array = _load_atom_array(observation, atom_array_cache, cache_lock)
+                raise ValueError(
+                    f"Prep coordinates missing for dimer {observation.dimer_observation_id}"
+                )
             return extract_dimer_structure(
                 observation,
                 outdir=outdir,

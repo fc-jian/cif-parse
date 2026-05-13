@@ -181,6 +181,29 @@ def write_single_outputs(
         )
 
 
+def _coerce_entry_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize entry-level metadata for JSON/prep consumers."""
+
+    metadata = dict(metadata or {})
+    method = str(metadata.get("experimental_method", "") or "").strip()
+    resolution = metadata.get("resolution", "")
+    if resolution in (None, "", ".", "?"):
+        resolution_value: float | str = ""
+    else:
+        try:
+            resolution_value = round(float(resolution), 2)
+        except (TypeError, ValueError):
+            resolution_value = ""
+    release_date = str(metadata.get("release_date", "") or "").strip()
+    return {
+        **metadata,
+        "experimental_method": method,
+        "resolution": resolution_value,
+        "release_date": release_date,
+        "metadata_source": metadata.get("metadata_source") or "input_cif",
+    }
+
+
 def validate_preflight_inputs(
     input_path: str | Path,
     preflight: dict[str, Any],
@@ -238,6 +261,7 @@ def process_single_structure(
     except Exception:
         LOGGER.debug("Failed to read metadata for %s", input_path, exc_info=True)
         metadata = {}
+    metadata = _coerce_entry_metadata(metadata)
     preflight = read_structure_preflight(input_path, cif_file=cif_file)
     validate_preflight_inputs(input_path, preflight, settings)
     chain_inventory = read_chain_inventory(
@@ -263,6 +287,7 @@ def process_single_structure(
     )
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
+    summary.entry_metadata = metadata
 
     # Validate pre-split assembly files: chain IDs must be unique.
     if settings.input_assembly:

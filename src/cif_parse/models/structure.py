@@ -96,6 +96,7 @@ class StructureSummary:
     chain_type_counts: dict[str, int] = field(default_factory=dict)
     assembly_ids: list[str] = field(default_factory=list)
     assembly_descriptions: dict[str, str] = field(default_factory=dict)
+    entry_metadata: dict[str, Any] = field(default_factory=dict)
     title: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -115,5 +116,6 @@ class StructureSummary:
             "chain_type_counts": _json_cell(self.chain_type_counts),
             "assembly_ids": ";".join(self.assembly_ids),
             "assembly_descriptions": _json_cell(self.assembly_descriptions),
+            "entry_metadata": _json_cell(self.entry_metadata),
             "title": self.title or "",
         }
