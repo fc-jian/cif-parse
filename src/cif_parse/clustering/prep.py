@@ -697,10 +697,10 @@ def build_prep_database(
     from cif_parse.settings import get_fast_temp_dir
     tmp_phase1 = get_fast_temp_dir("phase1")
 
-    # Small batches for load balancing: at least 4× num_workers batches,
-    # but each batch has at least 500 cases.  ThreadPoolExecutor is sufficient
-    # because gzip decompression and JSON parsing release the GIL.
-    cases_per_batch = max(500, len(case_dirs) // (actual_jobs * 4)) if case_dirs else 500
+    # Small batches for load balancing: aim for at least 4× num_workers
+    # batches, but keep a modest minimum so 64+ workers are not underfed by
+    # a hard 500-case floor.
+    cases_per_batch = max(50, len(case_dirs) // (actual_jobs * 4)) if case_dirs else 50
     batches = [case_dirs[i:i + cases_per_batch] for i in range(0, len(case_dirs), cases_per_batch)]
     task_args = [(batch, str(tmp_phase1), bid, cif_files_directory) for bid, batch in enumerate(batches)]
 
