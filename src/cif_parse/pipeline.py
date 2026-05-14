@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+import csv
 import logging
 import pickle
 import re
+import threading
 import zlib
 from pathlib import Path
 from typing import Any
@@ -43,6 +45,9 @@ from cif_parse.settings import AppSettings
 
 
 LOGGER = logging.getLogger(__name__)
+
+_METADATA_TABLE_CACHE: dict[Path, dict[str, dict[str, Any]]] = {}
+_METADATA_TABLE_CACHE_LOCK = threading.Lock()
 
 
 class StructureSkipWarning(RuntimeError):
@@ -211,7 +216,6 @@ def _enrich_entry_metadata(
     settings: AppSettings,
 ) -> dict[str, Any]:
     """Enrich empty entry metadata from external sources for input-assembly mode."""
-    import csv
 
     pdb_id = _infer_pdb_id_from_assembly_path(input_path)
 
@@ -252,35 +256,63 @@ def _infer_pdb_id_from_assembly_path(path: Path) -> str:
 
 def _query_metadata_table(table_path: Path, pdb_id: str) -> dict[str, Any] | None:
     """Query a parquet or CSV metadata table for *pdb_id*."""
+    rows = _load_metadata_table(table_path)
+    row = rows.get(pdb_id.upper())
+    if row is None:
+        return None
+    return {
+        "experimental_method": str(row.get("experimental_method", "") or ""),
+        "resolution": _safe_float(row.get("resolution")),
+        "release_date": str(row.get("release_date", "") or ""),
+        "metadata_source": "metadata_table",
+    }
+
+
+def _load_metadata_table(table_path: Path) -> dict[str, dict[str, Any]]:
+    """Load a metadata table once per process and index it by upper-case PDB ID."""
+    table_path = table_path.resolve()
+    with _METADATA_TABLE_CACHE_LOCK:
+        cached = _METADATA_TABLE_CACHE.get(table_path)
+        if cached is not None:
+            return cached
     try:
+        rows: dict[str, dict[str, Any]] = {}
         if table_path.suffix in (".parquet", ".pq"):
             import pyarrow.parquet as pq
             table = pq.read_table(str(table_path))
-            df = table.to_pandas()
-            mask = df["pdb_id"].str.upper() == pdb_id.upper()
-            match = df[mask]
-            if not match.empty:
-                row = match.iloc[0]
-                return {
-                    "experimental_method": str(row.get("experimental_method", "") or ""),
-                    "resolution": _safe_float(row.get("resolution")),
-                    "release_date": str(row.get("release_date", "") or ""),
-                    "metadata_source": "metadata_table",
+            data = table.to_pydict()
+            pdb_ids = data.get("pdb_id") or data.get("PDB_ID") or []
+            for idx, pdb_value in enumerate(pdb_ids):
+                key = str(pdb_value or "").upper()
+                if not key:
+                    continue
+                rows[key] = {
+                    "experimental_method": _column_value(data, "experimental_method", idx),
+                    "resolution": _column_value(data, "resolution", idx),
+                    "release_date": _column_value(data, "release_date", idx),
                 }
         elif table_path.suffix == ".csv":
             with table_path.open("r", encoding="utf-8") as fh:
                 reader = csv.DictReader(fh)
                 for row in reader:
-                    if str(row.get("pdb_id", "")).upper() == pdb_id.upper():
-                        return {
-                            "experimental_method": str(row.get("experimental_method", "") or ""),
-                            "resolution": _safe_float(row.get("resolution")),
-                            "release_date": str(row.get("release_date", "") or ""),
-                            "metadata_source": "metadata_table",
-                        }
+                    key = str(row.get("pdb_id", "") or row.get("PDB_ID", "")).upper()
+                    if key:
+                        rows[key] = dict(row)
+        with _METADATA_TABLE_CACHE_LOCK:
+            _METADATA_TABLE_CACHE[table_path] = rows
+        return rows
     except Exception:
-        LOGGER.debug("Failed to query metadata table %s", table_path, exc_info=True)
-    return None
+        LOGGER.debug("Failed to load metadata table %s", table_path, exc_info=True)
+        with _METADATA_TABLE_CACHE_LOCK:
+            _METADATA_TABLE_CACHE[table_path] = {}
+        return {}
+
+
+def _column_value(data: dict[str, list[Any]], name: str, idx: int) -> Any:
+    values = data.get(name) or data.get(name.upper())
+    if values is None or idx >= len(values):
+        return ""
+    return values[idx]
 
 
 def _query_metadata_cif_dir(cif_dir: Path, pdb_id: str) -> dict[str, Any] | None:
@@ -447,6 +479,7 @@ def process_single_structure(
             assembly_mode=settings.assembly_mode,
             selected_assembly_id=selected_assembly_id,
             model=settings.model,
+            is_input_assembly=settings.input_assembly,
         )
         result = _process_single_structure_for_mode(
             input_path=input_path,
@@ -802,14 +835,10 @@ def _dump_atom_cache(
     assembly_mode: str,
     selected_assembly_id: str | None,
     model: int,
+    is_input_assembly: bool = False,
 ) -> None:
-    """Save the parsed atom array(s) to ``outdir/atoms/`` so that downstream
-    clustering can consume them directly without re-reading the original mmCIF.
+    """Save the parsed atom array(s) to ``outdir/atoms/``."""
 
-    Always saves ``atoms/_none.pkl`` (asymmetric unit).  For assembly modes
-    ``largest_assembly`` and ``all`` also saves the assembly-expanded atom
-    array as ``atoms/{assembly_id}.pkl``.
-    """
     atoms_dir = outdir / "atoms"
     atoms_dir.mkdir(parents=True, exist_ok=True)
 
@@ -817,6 +846,31 @@ def _dump_atom_cache(
         from biotite.structure.io.pdbx import get_assembly, get_structure
 
         cif_file = cif_file or read_cif_file(input_path)
+
+        # For pre-split assembly files the input CIF already contains the
+        # fully expanded assembly; there is no separate asymmetric unit.
+        # Keep _none.pkl as an alias for consumers that probe AU coordinates.
+        if is_input_assembly:
+            asm_id = selected_assembly_id or "1"
+            asm_cache_path = atoms_dir / f"{asm_id}.pkl"
+            au_cache_path = atoms_dir / "_none.pkl"
+            if not asm_cache_path.exists():
+                try:
+                    atom_array = get_structure(cif_file, model=model, use_author_fields=False)
+                    if atom_array is not None and len(atom_array) > 0:
+                        blob = zlib.compress(pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL), 3)
+                        asm_cache_path.write_bytes(blob)
+                except Exception:
+                    LOGGER.debug("Failed to cache assembly for %s", input_path)
+            if asm_cache_path.exists() and not au_cache_path.exists():
+                try:
+                    au_cache_path.symlink_to(asm_cache_path.name)
+                except OSError:
+                    try:
+                        au_cache_path.hardlink_to(asm_cache_path)
+                    except OSError:
+                        au_cache_path.write_bytes(asm_cache_path.read_bytes())
+            return
 
         # Always cache asymmetric unit (needed by monomer extraction)
         au_cache_path = atoms_dir / "_none.pkl"
