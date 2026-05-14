@@ -477,7 +477,7 @@ def _cache_sources_to_temp(
             if not atoms_dir:
                 for assembly_id in assembly_ids:
                     cache_key = f"{source_path}__{assembly_id or ''}"
-                    all_entries.append({"cache_key": cache_key, "status": "error", "error": "missing parse atom cache"})
+                    all_entries.append({"cache_key": cache_key, "status": "missing_atom_cache"})
                 continue
 
             atoms_dir = Path(atoms_dir)
@@ -585,9 +585,21 @@ def _count_cif_entries(result: dict[str, Any], stats: dict[str, int]) -> None:
     """Count cached/skipped/error entries from a Phase 2 worker result."""
     for entry in result.get("entries", []):
         status = entry.get("status", "")
-        if status in ("cached", "cached_alias"):
+        if status == "cached":
             stats["cached"] += 1
-        elif status in ("skipped", "empty", "error"):
+        elif status == "cached_alias":
+            stats["cached"] += 1
+            stats["cached_alias"] += 1
+        elif status == "empty":
+            stats["skipped"] += 1
+            stats["empty"] += 1
+        elif status == "missing_atom_cache":
+            stats["skipped"] += 1
+            stats["missing_atom_cache"] += 1
+        elif status == "error":
+            stats["skipped"] += 1
+            stats["errors"] += 1
+        elif status == "skipped":
             stats["skipped"] += 1
 
 
@@ -774,7 +786,14 @@ def build_prep_database(
                 time.monotonic() - t1, stats["ingested"], len(all_source_paths))
 
     # ── Phase 2: parse atom pkl → AtomArray binary cache ─────────────────
-    cif_stats = {"cached": 0, "skipped": 0}
+    cif_stats = {
+        "cached": 0,
+        "cached_alias": 0,
+        "skipped": 0,
+        "empty": 0,
+        "missing_atom_cache": 0,
+        "errors": 0,
+    }
     if load_cif_cache and all_source_paths:
         t2 = time.monotonic()
         LOGGER.info("Phase 2: caching atom arrays for %d parsed source files", len(all_source_paths))
@@ -861,8 +880,17 @@ def build_prep_database(
         finally:
             shutil.rmtree(tmp_phase2, ignore_errors=True)
 
-        LOGGER.info("Phase 2 complete (%.1fs): %d cached, %d skipped",
-                    time.monotonic() - t2, cif_stats["cached"], cif_stats["skipped"])
+        LOGGER.info(
+            "Phase 2 complete (%.1fs): %d cached (%d aliases), %d skipped "
+            "(%d empty, %d missing atom cache, %d errors)",
+            time.monotonic() - t2,
+            cif_stats["cached"],
+            cif_stats["cached_alias"],
+            cif_stats["skipped"],
+            cif_stats["empty"],
+            cif_stats["missing_atom_cache"],
+            cif_stats["errors"],
+        )
 
     # ── Final summary ────────────────────────────────────────────────────
     elapsed = time.monotonic() - t0
@@ -878,6 +906,12 @@ def build_prep_database(
         "total_source_paths": len(all_source_paths),
         "cif_cached": cif_stats["cached"],
         "cif_skipped": cif_stats["skipped"],
+        "coord_cached": cif_stats["cached"],
+        "coord_cached_alias": cif_stats["cached_alias"],
+        "coord_skipped": cif_stats["skipped"],
+        "coord_empty": cif_stats["empty"],
+        "coord_missing_atom_cache": cif_stats["missing_atom_cache"],
+        "coord_errors": cif_stats["errors"],
         "elapsed_seconds": round(elapsed, 1),
     }
     dump_path = prep_dir / "manifest.json"
@@ -1091,6 +1125,7 @@ def _read_blob(entry: tuple[Path, int, int]) -> dict[str, Any] | None:
         data = _os.pread(fd, length, offset)
         return pickle.loads(_decompress_blob(data))
     except Exception:
+        LOGGER.debug("Failed to read prep coordinate blob %s:%d+%d", bin_path, offset, length, exc_info=True)
         return None
 
 
