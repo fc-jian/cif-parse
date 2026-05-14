@@ -482,6 +482,7 @@ def _cache_sources_to_temp(
 
             atoms_dir = Path(atoms_dir)
             try:
+                written_aliases: dict[Path, dict[str, tuple[int, int]]] = {}
                 for assembly_id in assembly_ids:
                     cache_key = f"{source_path}__{assembly_id or ''}"
                     pkl_name = f"{assembly_id or '_none'}.pkl"
@@ -489,15 +490,28 @@ def _cache_sources_to_temp(
                     if not pkl_path.exists():
                         all_entries.append({"cache_key": cache_key, "status": "empty"})
                         continue
+                    real_pkl_path = pkl_path.resolve()
+                    alias_entries = written_aliases.get(real_pkl_path)
+                    if alias_entries is not None:
+                        for cid, (offset, length) in alias_entries.items():
+                            blob_key = _chain_blob_key(source_path, assembly_id, cid)
+                            idx_fh.write(_IDX_ENTRY_STRUCT.pack(
+                                blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
+                                offset, length,
+                            ))
+                        all_entries.append({"cache_key": cache_key, "status": "cached_alias" if alias_entries else "empty"})
+                        continue
                     raw = pickle.loads(zlib.decompress(pkl_path.read_bytes()))
                     if isinstance(raw, dict):
                         aa = raw.get("atom_array", raw)
                     else:
                         aa = raw
                     if aa is None or len(aa) == 0:
+                        written_aliases[real_pkl_path] = {}
                         all_entries.append({"cache_key": cache_key, "status": "empty"})
                         continue
                     cached_any = False
+                    alias_entries = {}
                     for cid in sorted(set(aa.chain_id)):
                         chain_atoms = aa[aa.chain_id == cid]
                         if chain_atoms is None or len(chain_atoms) == 0:
@@ -513,7 +527,9 @@ def _cache_sources_to_temp(
                             blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
                             offset, len(wrapped),
                         ))
+                        alias_entries[str(cid)] = (offset, len(wrapped))
                         cached_any = True
+                    written_aliases[real_pkl_path] = alias_entries
                     all_entries.append({"cache_key": cache_key, "status": "cached" if cached_any else "empty"})
             except Exception as exc:
                 LOGGER.warning("Failed to cache parse atom pkl for %s: %s", source_path, exc)
@@ -569,7 +585,7 @@ def _count_cif_entries(result: dict[str, Any], stats: dict[str, int]) -> None:
     """Count cached/skipped/error entries from a Phase 2 worker result."""
     for entry in result.get("entries", []):
         status = entry.get("status", "")
-        if status == "cached":
+        if status in ("cached", "cached_alias"):
             stats["cached"] += 1
         elif status in ("skipped", "empty", "error"):
             stats["skipped"] += 1
