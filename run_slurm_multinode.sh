@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=cif-parse-coordinator
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --output=slurm-%x-%j.out
+#SBATCH -c 1
+#SBATCH -t 7-00:00:00
+#SBATCH --mem=8g
+#SBATCH -p sugon
+#SBATCH -o slurm_logs/coordinator-%x-%j.out
 
 set -euo pipefail
 
@@ -32,6 +33,7 @@ Worker resources:
   --sbatch-extra VALUE       Extra sbatch option, repeatable
 
 Execution:
+  --config PATH              cif-parse config.toml; passed before the batch subcommand
   --cif-parse-cmd VALUE      Command before "batch" (default: python -m cif_parse.cli)
                              Example: --cif-parse-cmd "mamba run -n bioinfo cif-parse"
   --python VALUE             Python used for split/merge helpers (default: python)
@@ -49,6 +51,7 @@ Examples:
     --outdir batch_outputs/slurm_parse \
     --shards 8 \
     --jobs-per-shard 64 \
+    --config config.toml \
     --partition cpu \
     --time 48:00:00 \
     --cif-parse-cmd "mamba run -n bioinfo cif-parse" \
@@ -80,13 +83,14 @@ INPUT_LIST=""
 OUTDIR=""
 SHARDS=""
 JOBS_PER_SHARD=32
-SBATCH_TIME="24:00:00"
-SBATCH_MEM=""
-SBATCH_PARTITION=""
+SBATCH_TIME="3-00:00:00"
+SBATCH_MEM="250g"
+SBATCH_PARTITION="cpu1,cpu2,fat,sugon,hygon"
 SBATCH_ACCOUNT=""
 SBATCH_QOS=""
 JOB_NAME="cif-parse"
-CIF_PARSE_CMD="${CIF_PARSE_CMD:-python -m cif_parse.cli}"
+CIF_PARSE_CMD="${CIF_PARSE_CMD:-cif-parse}"
+CONFIG_PATH=""
 PYTHON_BIN="${PYTHON_BIN:-python}"
 LOCAL_RUN=0
 LOCAL_PARALLEL=1
@@ -147,6 +151,10 @@ while [[ $# -gt 0 ]]; do
             CIF_PARSE_CMD="${2:-}"
             shift 2
             ;;
+        --config)
+            CONFIG_PATH="${2:-}"
+            shift 2
+            ;;
         --python)
             PYTHON_BIN="${2:-}"
             shift 2
@@ -197,6 +205,10 @@ done
 [[ "$JOBS_PER_SHARD" =~ ^[0-9]+$ ]] && [[ "$JOBS_PER_SHARD" -ge 1 ]] || die "--jobs-per-shard must be >= 1"
 [[ "$LOCAL_PARALLEL" =~ ^[0-9]+$ ]] && [[ "$LOCAL_PARALLEL" -ge 1 ]] || die "--local-parallel must be >= 1"
 [[ -f "$INPUT_LIST" ]] || die "input list not found: $INPUT_LIST"
+if [[ -n "$CONFIG_PATH" ]]; then
+    [[ -f "$CONFIG_PATH" ]] || die "config file not found: $CONFIG_PATH"
+    CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" && pwd)/$(basename "$CONFIG_PATH")"
+fi
 
 if [[ "$LOCAL_RUN" -eq 0 && "$MERGE_ONLY" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
     command -v sbatch >/dev/null 2>&1 || die "sbatch not found; use --local-run for local smoke tests"
@@ -218,6 +230,7 @@ echo "Output dir : $OUTDIR"
 echo "Shards     : $SHARDS"
 echo "Jobs/shard : $JOBS_PER_SHARD"
 echo "Command    : $CIF_PARSE_CMD"
+echo "Config     : ${CONFIG_PATH:-(none)}"
 echo "Parse args : ${PARSE_ARGS[*]:-(none)}"
 
 if [[ "$MERGE_ONLY" -eq 0 ]]; then
@@ -231,6 +244,10 @@ mapfile -t SHARD_LISTS < <(find "$SHARD_LIST_DIR" -maxdepth 1 -name 'shard_*.txt
 [[ "${#SHARD_LISTS[@]}" -gt 0 ]] || die "No shard lists found in $SHARD_LIST_DIR"
 
 PARSE_ARGS_QUOTED="$(quote_args "${PARSE_ARGS[@]}")"
+CONFIG_ARG_QUOTED=""
+if [[ -n "$CONFIG_PATH" ]]; then
+    CONFIG_ARG_QUOTED="$(quote_args --config "$CONFIG_PATH")"
+fi
 WORKER_SCRIPT="$WORK_DIR/run_shard_worker.sh"
 cat > "$WORKER_SCRIPT" <<EOF
 #!/usr/bin/env bash
@@ -246,7 +263,7 @@ export MPLCONFIGDIR="\${MPLCONFIGDIR:-/tmp/mpl-cif-parse-\${SLURM_JOB_ID:-\$\$}}
 mkdir -p "\$MPLCONFIGDIR"
 echo "Shard \$SHARD_ID on \${HOSTNAME}: \$(wc -l < "\$SHARD_LIST") inputs, \$JOBS workers"
 set +e
-$CIF_PARSE_CMD batch --input-list "\$SHARD_LIST" --outdir "\$SHARD_OUT" --jobs "\$JOBS" $PARSE_ARGS_QUOTED
+$CIF_PARSE_CMD $CONFIG_ARG_QUOTED batch --input-list "\$SHARD_LIST" --outdir "\$SHARD_OUT" --jobs "\$JOBS" $PARSE_ARGS_QUOTED
 status=\$?
 set -e
 echo "\$status" > "\$SHARD_OUT/.exit_code"
@@ -290,8 +307,8 @@ submit_or_run_shards() {
                 --ntasks 1
                 --cpus-per-task "$JOBS_PER_SHARD"
                 --time "$SBATCH_TIME"
-                --output "$LOG_DIR/%x-%j.out"
-                --error "$LOG_DIR/%x-%j.err"
+                --output "$LOG_DIR/parse-%x-%j.out"
+                --error "$LOG_DIR/parse-%x-%j.err"
             )
             [[ -z "$SBATCH_MEM" ]] || sbatch_args+=(--mem "$SBATCH_MEM")
             [[ -z "$SBATCH_PARTITION" ]] || sbatch_args+=(--partition "$SBATCH_PARTITION")
