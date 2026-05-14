@@ -483,7 +483,19 @@ def extract_multimer_structures(
             lbl = str(inst.get("label_asym_id", "") or "")
             if not lbl:
                 continue
-            chain_specs.append((lbl, None))
+            sym = inst.get("sym_id")
+            if sym is None:
+                instance_id = str(inst.get("instance_id", "") or "")
+                if "@" in instance_id:
+                    try:
+                        sym = int(instance_id.rsplit("@", 1)[1]) - 1
+                    except ValueError:
+                        sym = None
+            try:
+                sym_id = int(sym) if sym is not None and str(sym) != "" else None
+            except (TypeError, ValueError):
+                sym_id = None
+            chain_specs.append((lbl, sym_id))
         if not chain_specs:
             return None
         return assemble_atom_array_from_chains(

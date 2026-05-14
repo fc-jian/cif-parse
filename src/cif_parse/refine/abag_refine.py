@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from cif_parse.clustering.prep import (
     assemble_atom_array_from_chains,
@@ -103,23 +104,27 @@ def _crop_atom_array(
 # Antigen contact graph + domain detection
 # ---------------------------------------------------------------------------
 
-def _ca_coords(atom_array: Any) -> dict[int, np.ndarray]:
+ResidueKey = Any
+
+
+def _ca_coords(atom_array: Any, chain_id: str | None = None) -> dict[ResidueKey, np.ndarray]:
     """Extract per-residue Cα coordinates (or P for nucleic acids)."""
-    coords: dict[int, np.ndarray] = {}
+    coords: dict[ResidueKey, np.ndarray] = {}
     for i in range(atom_array.array_length()):
         aname = str(atom_array.atom_name[i]).strip()
         if aname in ("CA", "P"):
             rid = int(atom_array.res_id[i])
-            if rid not in coords:
-                coords[rid] = np.asarray(atom_array.coord[i], dtype=np.float32)
+            key: ResidueKey = (chain_id, rid) if chain_id is not None else rid
+            if key not in coords:
+                coords[key] = np.asarray(atom_array.coord[i], dtype=np.float32)
     return coords
 
 
 def _residue_contacts(
-    ab_coords: dict[int, np.ndarray],
-    ag_coords: dict[int, np.ndarray],
+    ab_coords: dict[ResidueKey, np.ndarray],
+    ag_coords: dict[ResidueKey, np.ndarray],
     distance: float = 8.0,
-) -> list[tuple[int, int, float]]:
+) -> list[tuple[ResidueKey, ResidueKey, float]]:
     """Return antibody–antigen residue pairs within *distance* (Å)."""
     if not ab_coords or not ag_coords:
         return []
@@ -127,47 +132,48 @@ def _residue_contacts(
     ag_ids = list(ag_coords)
     ab_mat = np.asarray([ab_coords[r] for r in ab_ids], dtype=np.float32)
     ag_mat = np.asarray([ag_coords[r] for r in ag_ids], dtype=np.float32)
-    # Pairwise distances: (N_ab, N_ag, 3) → (N_ab, N_ag)
-    diffs = ab_mat[:, None, :] - ag_mat[None, :, :]
-    dists = np.sqrt((diffs * diffs).sum(axis=2))
-    pairs: list[tuple[int, int, float]] = []
-    for i, rid_ab in enumerate(ab_ids):
-        for j, rid_ag in enumerate(ag_ids):
-            d = float(dists[i, j])
-            if d <= distance:
-                pairs.append((rid_ab, rid_ag, d))
+    tree = cKDTree(ag_mat)
+    pairs: list[tuple[ResidueKey, ResidueKey, float]] = []
+    for i, neighbors in enumerate(tree.query_ball_point(ab_mat, r=distance)):
+        rid_ab = ab_ids[i]
+        for j in neighbors:
+            rid_ag = ag_ids[int(j)]
+            d = float(np.linalg.norm(ab_mat[i] - ag_mat[int(j)]))
+            pairs.append((rid_ab, rid_ag, d))
     return pairs
 
 
 def _ag_internal_graph(
-    ag_coords: dict[int, np.ndarray],
+    ag_coords: dict[ResidueKey, np.ndarray],
     distance: float = 8.0,
-) -> dict[int, set[int]]:
+) -> dict[ResidueKey, set[ResidueKey]]:
     """Build an adjacency dict for antigen residues within *distance*."""
     if not ag_coords:
         return {}
     ids = list(ag_coords)
     mat = np.asarray([ag_coords[r] for r in ids], dtype=np.float32)
-    diffs = mat[:, None, :] - mat[None, :, :]
-    dists = np.sqrt((diffs * diffs).sum(axis=2))
-    adj: dict[int, set[int]] = {rid: set() for rid in ids}
-    for i, rid_i in enumerate(ids):
-        for j, rid_j in enumerate(ids):
-            if i < j and float(dists[i, j]) <= distance:
+    adj: dict[ResidueKey, set[ResidueKey]] = {rid: set() for rid in ids}
+    tree = cKDTree(mat)
+    for i, neighbors in enumerate(tree.query_ball_point(mat, r=distance)):
+        rid_i = ids[i]
+        for j in neighbors:
+            j = int(j)
+            if i < j:
+                rid_j = ids[j]
                 adj[rid_i].add(rid_j)
                 adj[rid_j].add(rid_i)
     return adj
 
 
 def _identify_antigen_domains(
-    ag_coords: dict[int, np.ndarray],
-    ab_ag_contacts: set[int],
+    ag_coords: dict[ResidueKey, np.ndarray],
+    ab_ag_contacts: set[ResidueKey],
     *,
     distance: float = 8.0,
     louvain_resolution: float = 1.0,
     min_domain_size: int = 10,
     min_contact_residues: int = 3,
-) -> tuple[list[list[int]], list[list[int]]]:
+) -> tuple[list[list[ResidueKey]], list[list[ResidueKey]]]:
     """Partition antigen residues into domains and classify by antibody contact.
 
     Returns ``(contacting_domains, removed_domains)`` where each domain is a
@@ -192,8 +198,8 @@ def _identify_antigen_domains(
         LOGGER.debug("Louvain failed, treating antigen as single domain", exc_info=True)
         communities = [set(adj.keys())]
 
-    contacting: list[list[int]] = []
-    removed: list[list[int]] = []
+    contacting: list[list[ResidueKey]] = []
+    removed: list[list[ResidueKey]] = []
     for comm in communities:
         domain = sorted(comm)
         contact_count = len(set(domain) & ab_ag_contacts)
@@ -321,7 +327,7 @@ def refine_antibody_complex(
         cropped = _crop_atom_array(aa, start, end)
         pdb_chain = _pdb_chain_ids[_chain_idx % len(_pdb_chain_ids)]
         ab_cropped.append(cropped)
-        ab_res_ca.update(_ca_coords(cropped))
+        ab_res_ca.update(_ca_coords(cropped, chain_id=cid))
         chain_intervals.append({
             "label_asym_id": cid,
             "pdb_chain_id": pdb_chain,
@@ -353,7 +359,7 @@ def refine_antibody_complex(
         ann = _find_chain_annotation(chain_inventory, cid)
         chain_type = ann.get("chain_type", "unknown")
 
-        ag_coords = _ca_coords(aa)
+        ag_coords = _ca_coords(aa, chain_id=cid)
         contacts = _residue_contacts(ab_res_ca, ag_coords, distance=contact_distance)
         contact_residues = {rid_ag for _, rid_ag, _ in contacts}
 
@@ -365,12 +371,18 @@ def refine_antibody_complex(
             min_domain_size=min_domain_size,
             min_contact_residues=min_contact_residues,
         )
+        if not ag_coords:
+            warnings.append(f"chain {cid}: no CA/P coordinates for antigen domain filtering; kept full antigen")
+        elif not contacts:
+            warnings.append(f"chain {cid}: no antibody-antigen residue contacts within {contact_distance:g} A; kept full antigen")
+        elif not contacting:
+            warnings.append(f"chain {cid}: no contacting antigen domain passed filters; kept full antigen")
 
         for domain in contacting:
             antigen_domains.append({
                 "label_asym_id": cid,
                 "chain_type": chain_type,
-                "residue_ids": domain,
+                "residue_ids": [int(res_id) for _, res_id in domain],
                 "num_residues": len(domain),
                 "num_antibody_contacts": len(set(domain) & contact_residues),
             })
@@ -378,7 +390,7 @@ def refine_antibody_complex(
             removed_domains.append({
                 "label_asym_id": cid,
                 "chain_type": chain_type,
-                "residue_ids": domain,
+                "residue_ids": [int(res_id) for _, res_id in domain],
                 "num_residues": len(domain),
                 "num_antibody_contacts": len(set(domain) & contact_residues),
             })
@@ -386,7 +398,7 @@ def refine_antibody_complex(
         # Crop antigen chain to retained residue IDs.
         retained_ids: set[int] = set()
         for domain_residues in contacting:
-            retained_ids.update(domain_residues)
+            retained_ids.update(int(res_id) for _, res_id in domain_residues)
         if retained_ids:
             keep_mask = np.zeros(aa.array_length(), dtype=bool)
             for i in range(aa.array_length()):

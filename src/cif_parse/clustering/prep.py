@@ -618,6 +618,23 @@ def _group_source_tasks(
     return [tasks[i:i + chunk_size] for i in range(0, len(tasks), chunk_size)]
 
 
+def _atom_cache_task_weight(source_path: str, assembly_ids: list[str | None], atom_cache_map: dict[str, str]) -> int:
+    """Estimate prep Phase 2 cost from parse-stage atom pickle sizes."""
+
+    atoms_dir = atom_cache_map.get(source_path)
+    if not atoms_dir:
+        return 0
+    total = 0
+    base = Path(atoms_dir)
+    for assembly_id in assembly_ids:
+        pkl_path = base / f"{assembly_id or '_none'}.pkl"
+        try:
+            total += pkl_path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 # ── main builder ─────────────────────────────────────────────────────────────
 
 
@@ -788,6 +805,7 @@ def build_prep_database(
 
         tasks = [(sp, sorted(aids, key=lambda x: x or ""), cif_files_directory)
                  for sp, aids in sorted(cache_pairs.items())]
+        tasks.sort(key=lambda item: _atom_cache_task_weight(item[0], item[1], atom_cache_map), reverse=True)
 
         num_workers = max(1, min(actual_jobs, len(tasks)))
         LOGGER.info("Dispatching %d source files to %d worker processes", len(tasks), num_workers)
@@ -1125,6 +1143,13 @@ def assemble_atom_array_from_chains(
         aa = load_chain_atoms(prep_dir, source_path, lbl, assembly_id=assembly_id, index=idx)
         if aa is None or len(aa) == 0:
             return None
+        if sym is not None and hasattr(aa, "sym_id"):
+            sym_mask = aa.sym_id == sym
+            if not bool(sym_mask.any()):
+                return None
+            aa = aa[sym_mask].copy()
+            if len(aa) == 0:
+                return None
         arrays.append(aa)
     if not arrays:
         return None
