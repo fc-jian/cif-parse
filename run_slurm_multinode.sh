@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=cif-parse-coordinator
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --output=slurm-%x-%j.out
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ./run_slurm_multinode.sh --input-list inputs.txt --outdir OUT --shards N [options] -- [cif-parse batch args...]
+
+Coordinator script for multi-node Slurm parsing.  The coordinator itself uses
+one CPU.  It splits the input list, submits one multi-core Slurm job per shard,
+waits for all shards, then merges shard manifests/reviews/metadata into OUT.
+
+Required:
+  --input-list PATH          Text file with one CIF path per line
+  --outdir PATH              Final output directory
+  --shards N                 Number of shard jobs to submit
+
+Worker resources:
+  --jobs-per-shard N         cif-parse --jobs per shard (default: 32)
+  --time VALUE               sbatch --time for shard jobs (default: 24:00:00)
+  --mem VALUE                sbatch --mem for shard jobs (default: 0; cluster default)
+  --partition VALUE          sbatch partition
+  --account VALUE            sbatch account
+  --qos VALUE                sbatch qos
+  --job-name VALUE           Slurm job name prefix (default: cif-parse)
+  --sbatch-extra VALUE       Extra sbatch option, repeatable
+
+Execution:
+  --cif-parse-cmd VALUE      Command before "batch" (default: python -m cif_parse.cli)
+                             Example: --cif-parse-cmd "mamba run -n bioinfo cif-parse"
+  --python VALUE             Python used for split/merge helpers (default: python)
+  --local-run                Run shard workers locally instead of sbatch
+  --local-parallel N         Number of local shard workers (default: 1)
+  --wait-interval SEC        Poll interval while waiting for Slurm jobs (default: 30)
+  --resume                   Do not resubmit shards with an existing manifest.json.gz
+  --merge-only               Only merge existing shard outputs
+  --dry-run                  Split and print worker commands without running them
+
+Examples:
+  # Submit coordinator from login node; coordinator submits shard jobs.
+  ./run_slurm_multinode.sh \
+    --input-list test_large.txt \
+    --outdir batch_outputs/slurm_parse \
+    --shards 8 \
+    --jobs-per-shard 64 \
+    --partition cpu \
+    --time 48:00:00 \
+    --cif-parse-cmd "mamba run -n bioinfo cif-parse" \
+    -- --assembly-mode all --max-assembly-atoms 300000
+
+  # Submit the coordinator itself as a one-CPU Slurm job.
+  sbatch ./run_slurm_multinode.sh --input-list test_large.txt --outdir OUT --shards 8 --jobs-per-shard 64 -- --assembly-mode all
+
+  # Local smoke test without Slurm.
+  ./run_slurm_multinode.sh --input-list small.txt --outdir OUT --shards 2 --jobs-per-shard 4 --local-run -- --assembly-mode first_assembly
+EOF
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 2
+}
+
+quote_args() {
+    local out=""
+    local arg
+    for arg in "$@"; do
+        printf -v out '%s%q ' "$out" "$arg"
+    done
+    printf '%s' "$out"
+}
+
+INPUT_LIST=""
+OUTDIR=""
+SHARDS=""
+JOBS_PER_SHARD=32
+SBATCH_TIME="24:00:00"
+SBATCH_MEM=""
+SBATCH_PARTITION=""
+SBATCH_ACCOUNT=""
+SBATCH_QOS=""
+JOB_NAME="cif-parse"
+CIF_PARSE_CMD="${CIF_PARSE_CMD:-python -m cif_parse.cli}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+LOCAL_RUN=0
+LOCAL_PARALLEL=1
+WAIT_INTERVAL=30
+RESUME=0
+MERGE_ONLY=0
+DRY_RUN=0
+SBATCH_EXTRA=()
+PARSE_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --input-list)
+            INPUT_LIST="${2:-}"
+            shift 2
+            ;;
+        --outdir)
+            OUTDIR="${2:-}"
+            shift 2
+            ;;
+        --shards)
+            SHARDS="${2:-}"
+            shift 2
+            ;;
+        --jobs-per-shard)
+            JOBS_PER_SHARD="${2:-}"
+            shift 2
+            ;;
+        --time)
+            SBATCH_TIME="${2:-}"
+            shift 2
+            ;;
+        --mem)
+            SBATCH_MEM="${2:-}"
+            shift 2
+            ;;
+        --partition)
+            SBATCH_PARTITION="${2:-}"
+            shift 2
+            ;;
+        --account)
+            SBATCH_ACCOUNT="${2:-}"
+            shift 2
+            ;;
+        --qos)
+            SBATCH_QOS="${2:-}"
+            shift 2
+            ;;
+        --job-name)
+            JOB_NAME="${2:-}"
+            shift 2
+            ;;
+        --cif-parse-cmd)
+            CIF_PARSE_CMD="${2:-}"
+            shift 2
+            ;;
+        --python)
+            PYTHON_BIN="${2:-}"
+            shift 2
+            ;;
+        --local-run)
+            LOCAL_RUN=1
+            shift
+            ;;
+        --local-parallel)
+            LOCAL_PARALLEL="${2:-}"
+            shift 2
+            ;;
+        --wait-interval)
+            WAIT_INTERVAL="${2:-}"
+            shift 2
+            ;;
+        --resume)
+            RESUME=1
+            shift
+            ;;
+        --merge-only)
+            MERGE_ONLY=1
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --sbatch-extra)
+            SBATCH_EXTRA+=("${2:-}")
+            shift 2
+            ;;
+        --)
+            shift
+            PARSE_ARGS=("$@")
+            break
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -n "$INPUT_LIST" ]] || die "--input-list is required"
+[[ -n "$OUTDIR" ]] || die "--outdir is required"
+[[ -n "$SHARDS" ]] || die "--shards is required"
+[[ "$SHARDS" =~ ^[0-9]+$ ]] && [[ "$SHARDS" -ge 1 ]] || die "--shards must be >= 1"
+[[ "$JOBS_PER_SHARD" =~ ^[0-9]+$ ]] && [[ "$JOBS_PER_SHARD" -ge 1 ]] || die "--jobs-per-shard must be >= 1"
+[[ "$LOCAL_PARALLEL" =~ ^[0-9]+$ ]] && [[ "$LOCAL_PARALLEL" -ge 1 ]] || die "--local-parallel must be >= 1"
+[[ -f "$INPUT_LIST" ]] || die "input list not found: $INPUT_LIST"
+
+if [[ "$LOCAL_RUN" -eq 0 && "$MERGE_ONLY" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+    command -v sbatch >/dev/null 2>&1 || die "sbatch not found; use --local-run for local smoke tests"
+    command -v squeue >/dev/null 2>&1 || die "squeue not found; use --local-run for local smoke tests"
+fi
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTDIR="$(mkdir -p "$OUTDIR" && cd "$OUTDIR" && pwd)"
+INPUT_LIST="$(cd "$(dirname "$INPUT_LIST")" && pwd)/$(basename "$INPUT_LIST")"
+WORK_DIR="$OUTDIR/slurm"
+SHARD_LIST_DIR="$WORK_DIR/shard_lists"
+SHARD_OUT_DIR="$OUTDIR/shards"
+LOG_DIR="$WORK_DIR/logs"
+mkdir -p "$SHARD_LIST_DIR" "$SHARD_OUT_DIR" "$LOG_DIR"
+
+echo "Coordinator: $HOSTNAME"
+echo "Input list : $INPUT_LIST"
+echo "Output dir : $OUTDIR"
+echo "Shards     : $SHARDS"
+echo "Jobs/shard : $JOBS_PER_SHARD"
+echo "Command    : $CIF_PARSE_CMD"
+echo "Parse args : ${PARSE_ARGS[*]:-(none)}"
+
+if [[ "$MERGE_ONLY" -eq 0 ]]; then
+    "$PYTHON_BIN" "$REPO_ROOT/scripts/split_slurm_shards.py" \
+        --input-list "$INPUT_LIST" \
+        --shard-dir "$SHARD_LIST_DIR" \
+        --shards "$SHARDS"
+fi
+
+mapfile -t SHARD_LISTS < <(find "$SHARD_LIST_DIR" -maxdepth 1 -name 'shard_*.txt' -type f | sort)
+[[ "${#SHARD_LISTS[@]}" -gt 0 ]] || die "No shard lists found in $SHARD_LIST_DIR"
+
+PARSE_ARGS_QUOTED="$(quote_args "${PARSE_ARGS[@]}")"
+WORKER_SCRIPT="$WORK_DIR/run_shard_worker.sh"
+cat > "$WORKER_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+SHARD_ID="\${1:?shard id}"
+SHARD_LIST="\${2:?shard list}"
+SHARD_OUT="\${3:?shard output dir}"
+JOBS="\${4:?jobs}"
+mkdir -p "\$SHARD_OUT"
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src\${PYTHONPATH:+:\$PYTHONPATH}"
+export MPLCONFIGDIR="\${MPLCONFIGDIR:-/tmp/mpl-cif-parse-\${SLURM_JOB_ID:-\$\$}}"
+mkdir -p "\$MPLCONFIGDIR"
+echo "Shard \$SHARD_ID on \${HOSTNAME}: \$(wc -l < "\$SHARD_LIST") inputs, \$JOBS workers"
+set +e
+$CIF_PARSE_CMD batch --input-list "\$SHARD_LIST" --outdir "\$SHARD_OUT" --jobs "\$JOBS" $PARSE_ARGS_QUOTED
+status=\$?
+set -e
+echo "\$status" > "\$SHARD_OUT/.exit_code"
+if [[ -f "\$SHARD_OUT/manifest.json.gz" ]]; then
+    touch "\$SHARD_OUT/.done"
+fi
+exit "\$status"
+EOF
+chmod +x "$WORKER_SCRIPT"
+
+submit_or_run_shards() {
+    local shard_list shard_base shard_id shard_out
+    JOB_IDS=()
+    LOCAL_PIDS=()
+    for shard_list in "${SHARD_LISTS[@]}"; do
+        shard_base="$(basename "$shard_list" .txt)"
+        shard_id="${shard_base#shard_}"
+        shard_out="$SHARD_OUT_DIR/$shard_base"
+        if [[ "$RESUME" -eq 1 && -f "$shard_out/manifest.json.gz" ]]; then
+            echo "Resume: skip existing $shard_base"
+            continue
+        fi
+
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo "DRY-RUN: $WORKER_SCRIPT $shard_id $shard_list $shard_out $JOBS_PER_SHARD"
+            continue
+        fi
+
+        if [[ "$LOCAL_RUN" -eq 1 ]]; then
+            while [[ "$(jobs -rp | wc -l)" -ge "$LOCAL_PARALLEL" ]]; do
+                sleep 2
+            done
+            "$WORKER_SCRIPT" "$shard_id" "$shard_list" "$shard_out" "$JOBS_PER_SHARD" \
+                > "$LOG_DIR/${shard_base}.out" 2> "$LOG_DIR/${shard_base}.err" &
+            LOCAL_PIDS+=("$!")
+        else
+            sbatch_args=(
+                --parsable
+                --job-name "${JOB_NAME}_${shard_id}"
+                --nodes 1
+                --ntasks 1
+                --cpus-per-task "$JOBS_PER_SHARD"
+                --time "$SBATCH_TIME"
+                --output "$LOG_DIR/%x-%j.out"
+                --error "$LOG_DIR/%x-%j.err"
+            )
+            [[ -z "$SBATCH_MEM" ]] || sbatch_args+=(--mem "$SBATCH_MEM")
+            [[ -z "$SBATCH_PARTITION" ]] || sbatch_args+=(--partition "$SBATCH_PARTITION")
+            [[ -z "$SBATCH_ACCOUNT" ]] || sbatch_args+=(--account "$SBATCH_ACCOUNT")
+            [[ -z "$SBATCH_QOS" ]] || sbatch_args+=(--qos "$SBATCH_QOS")
+            sbatch_args+=("${SBATCH_EXTRA[@]}")
+            jid="$(sbatch "${sbatch_args[@]}" "$WORKER_SCRIPT" "$shard_id" "$shard_list" "$shard_out" "$JOBS_PER_SHARD")"
+            jid="${jid%%;*}"
+            JOB_IDS+=("$jid")
+            echo "Submitted $shard_base as job $jid"
+        fi
+    done
+}
+
+if [[ "$MERGE_ONLY" -eq 0 ]]; then
+    submit_or_run_shards
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "Dry run complete; not merging."
+    exit 0
+fi
+
+if [[ "$MERGE_ONLY" -eq 0 && "$LOCAL_RUN" -eq 1 && "${#LOCAL_PIDS[@]}" -gt 0 ]]; then
+    local_status=0
+    for pid in "${LOCAL_PIDS[@]}"; do
+        if ! wait "$pid"; then
+            local_status=1
+        fi
+    done
+    [[ "$local_status" -eq 0 ]] || echo "One or more local shard workers exited non-zero; merging available manifests." >&2
+fi
+
+if [[ "$MERGE_ONLY" -eq 0 && "$LOCAL_RUN" -eq 0 && "${#JOB_IDS[@]}" -gt 0 ]]; then
+    job_csv="$(IFS=,; echo "${JOB_IDS[*]}")"
+    echo "Waiting for Slurm jobs: $job_csv"
+    while squeue -h -j "$job_csv" | grep -q .; do
+        sleep "$WAIT_INTERVAL"
+    done
+fi
+
+echo "Merging shard outputs..."
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl-cif-parse-merge-${SLURM_JOB_ID:-$$}}"
+mkdir -p "$MPLCONFIGDIR"
+"$PYTHON_BIN" "$REPO_ROOT/scripts/merge_slurm_shards.py" \
+    --outdir "$OUTDIR" \
+    --shard-out-dir "$SHARD_OUT_DIR" \
+    --repo-root "$REPO_ROOT"
+
+echo "Done: $OUTDIR"
