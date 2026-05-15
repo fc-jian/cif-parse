@@ -33,9 +33,11 @@ memory-mapped I/O to fetch cached AtomArray objects via the binary index.
 
 from __future__ import annotations
 
+import heapq
 import hashlib
 import json
 import logging
+import math
 import os as _os
 import pickle
 import shutil
@@ -633,17 +635,60 @@ def _collect_source_paths_from_parquet(prep_dir: Path, sink: set[str]) -> None:
 def _group_source_tasks(
     tasks: list[tuple[str, list[str | None], str | None]],
     num_workers: int,
+    atom_cache_map: dict[str, str],
     *,
     target_chunks_per_worker: int = 4,
-    min_chunk_size: int = 50,
+    target_chunk_bytes: int = 1 << 30,
 ) -> list[list[tuple[str, list[str | None], str | None]]]:
-    """Split source-cache work into smaller chunks for better load balancing."""
+    """Split source-cache work into weight-balanced chunks.
+
+    Phase 2 cost is dominated by reading/decompressing parse atom pickle files
+    and writing compressed chain blobs.  Consecutive slicing after sorting by
+    size puts the largest structures into the same first chunks.  Use an LPT
+    greedy packing instead so large structures are spread across chunks and the
+    resulting ``cif_coords/chunk_*.bin`` files are less skewed.
+    """
 
     if not tasks:
         return []
-    desired_chunks = max(1, num_workers * target_chunks_per_worker)
-    chunk_size = max(min_chunk_size, (len(tasks) + desired_chunks - 1) // desired_chunks)
-    return [tasks[i:i + chunk_size] for i in range(0, len(tasks), chunk_size)]
+    weighted_tasks: list[tuple[int, tuple[str, list[str | None], str | None]]] = []
+    for task in tasks:
+        sp, aids, _ = task
+        weight = max(1, _atom_cache_task_weight(sp, aids, atom_cache_map))
+        weighted_tasks.append((weight, task))
+
+    total_weight = sum(weight for weight, _ in weighted_tasks)
+    chunks_by_workers = max(1, num_workers * target_chunks_per_worker)
+    chunks_by_bytes = max(1, math.ceil(total_weight / max(1, target_chunk_bytes)))
+    desired_chunks = max(chunks_by_workers, chunks_by_bytes)
+    desired_chunks = max(1, min(len(weighted_tasks), desired_chunks))
+
+    bins: list[tuple[int, int, list[tuple[str, list[str | None], str | None]]]] = [
+        (0, bin_id, []) for bin_id in range(desired_chunks)
+    ]
+    heapq.heapify(bins)
+
+    for weight, task in sorted(weighted_tasks, key=lambda item: item[0], reverse=True):
+        current_weight, bin_id, group = heapq.heappop(bins)
+        group.append(task)
+        heapq.heappush(bins, (current_weight + weight, bin_id, group))
+
+    return [group for current_weight, _bin_id, group in bins if group]
+
+
+def _summarize_ints(values: list[int]) -> dict[str, int | float]:
+    """Return compact distribution stats for manifest/debug logs."""
+
+    if not values:
+        return {"count": 0, "min": 0, "max": 0, "mean": 0.0, "total": 0}
+    total = sum(values)
+    return {
+        "count": len(values),
+        "min": min(values),
+        "max": max(values),
+        "mean": round(total / len(values), 1),
+        "total": total,
+    }
 
 
 def _atom_cache_task_weight(source_path: str, assembly_ids: list[str | None], atom_cache_map: dict[str, str]) -> int:
@@ -794,6 +839,7 @@ def build_prep_database(
         "missing_atom_cache": 0,
         "errors": 0,
     }
+    coord_chunk_sizes: list[int] = []
     if load_cif_cache and all_source_paths:
         t2 = time.monotonic()
         LOGGER.info("Phase 2: caching atom arrays for %d parsed source files", len(all_source_paths))
@@ -840,7 +886,6 @@ def build_prep_database(
 
         tasks = [(sp, sorted(aids, key=lambda x: x or ""), cif_files_directory)
                  for sp, aids in sorted(cache_pairs.items())]
-        tasks.sort(key=lambda item: _atom_cache_task_weight(item[0], item[1], atom_cache_map), reverse=True)
 
         num_workers = max(1, min(actual_jobs, len(tasks)))
         LOGGER.info("Dispatching %d source files to %d worker processes", len(tasks), num_workers)
@@ -853,8 +898,20 @@ def build_prep_database(
                 _count_cif_entries(result, cif_stats)
             else:
                 # Split source files into more chunks than workers so that large
-                # CIF files do not leave a single slow worker at the end.
-                grouped = _group_source_tasks(tasks, num_workers)
+                # atom caches are spread across workers and output chunks.
+                grouped = _group_source_tasks(tasks, num_workers, atom_cache_map)
+                group_sizes = [
+                    sum(max(1, _atom_cache_task_weight(sp, aids, atom_cache_map)) for sp, aids, _cfd in group)
+                    for group in grouped
+                ]
+                group_summary = _summarize_ints(group_sizes)
+                LOGGER.info(
+                    "Phase 2 weighted task chunks: %d chunks, estimated size min=%d max=%d mean=%.1f bytes",
+                    group_summary["count"],
+                    group_summary["min"],
+                    group_summary["max"],
+                    group_summary["mean"],
+                )
                 task_args = [(chunk_tasks, tmp_phase2, wid, atom_cache_map, input_assembly_sources)
                              for wid, chunk_tasks in enumerate(grouped)]
                 with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -873,7 +930,10 @@ def build_prep_database(
             if temp_bins:
                 coords_dir = prep_dir / "cif_coords"
                 coords_dir.mkdir(parents=True, exist_ok=True)
+                for old_chunk in list(coords_dir.glob("chunk_*.bin")) + list(coords_dir.glob("chunk_*.idx")):
+                    old_chunk.unlink()
                 for chunk_id, (tbin, tidx) in enumerate(zip(temp_bins, temp_idxs)):
+                    coord_chunk_sizes.append(tbin.stat().st_size)
                     shutil.move(str(tbin), str(coords_dir / f"chunk_{chunk_id}.bin"))
                     shutil.move(str(tidx), str(coords_dir / f"chunk_{chunk_id}.idx"))
 
@@ -891,6 +951,15 @@ def build_prep_database(
             cif_stats["missing_atom_cache"],
             cif_stats["errors"],
         )
+        if coord_chunk_sizes:
+            chunk_summary = _summarize_ints(coord_chunk_sizes)
+            LOGGER.info(
+                "Phase 2 output chunks: %d chunks, size min=%d max=%d mean=%.1f bytes",
+                chunk_summary["count"],
+                chunk_summary["min"],
+                chunk_summary["max"],
+                chunk_summary["mean"],
+            )
 
     # ── Final summary ────────────────────────────────────────────────────
     elapsed = time.monotonic() - t0
@@ -912,6 +981,12 @@ def build_prep_database(
         "coord_empty": cif_stats["empty"],
         "coord_missing_atom_cache": cif_stats["missing_atom_cache"],
         "coord_errors": cif_stats["errors"],
+        "coord_chunks": len(coord_chunk_sizes),
+        "coord_chunk_min_bytes": min(coord_chunk_sizes) if coord_chunk_sizes else 0,
+        "coord_chunk_max_bytes": max(coord_chunk_sizes) if coord_chunk_sizes else 0,
+        "coord_chunk_mean_bytes": (
+            round(sum(coord_chunk_sizes) / len(coord_chunk_sizes), 1) if coord_chunk_sizes else 0.0
+        ),
         "elapsed_seconds": round(elapsed, 1),
     }
     dump_path = prep_dir / "manifest.json"
