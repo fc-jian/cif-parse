@@ -81,6 +81,29 @@ def _warning_counts(records: list[dict[str, object]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _merge_count_maps(*maps: dict[str, int]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in maps:
+        for key, value in item.items():
+            counts[key] = counts.get(key, 0) + int(value)
+    return dict(sorted(counts.items()))
+
+
+def _summary_warning_counts(payloads: list[dict[str, object]]) -> dict[str, int]:
+    records: list[dict[str, object]] = []
+    for payload in payloads:
+        summary = payload.get("structure_summary")
+        if isinstance(summary, dict):
+            records.append(summary)
+            summary_warnings = set(_warning_list(summary))
+            metadata = summary.get("entry_metadata")
+            if isinstance(metadata, dict):
+                metadata_warning = metadata.get("metadata_warning")
+                if isinstance(metadata_warning, str) and metadata_warning and metadata_warning not in summary_warnings:
+                    records.append({"warnings": [metadata_warning]})
+    return _warning_counts(records)
+
+
 def collect_case_review_metrics(
     case_outdir: str | Path,
     *,
@@ -132,6 +155,14 @@ def collect_case_review_metrics(
     antibody_complex_warning_counts = _warning_counts(antibody_antigen_complexes)
     tcr_complex_warning_counts = _warning_counts(tcr_pmhc_complexes)
     multimer_warning_counts = _warning_counts(tight_multimers)
+    summary_warning_counts = _summary_warning_counts(payloads)
+    parse_warning_counts = _merge_count_maps(
+        summary_warning_counts,
+        chain_warning_counts,
+        antibody_complex_warning_counts,
+        tcr_complex_warning_counts,
+        multimer_warning_counts,
+    )
     for complex_record in tcr_pmhc_complexes:
         evidence = _evidence_dict(complex_record)
         contextual_peptide_chain_ids.update(_string_list(evidence.get("contextual_peptide_chain_ids")))
@@ -169,6 +200,9 @@ def collect_case_review_metrics(
         "antibody_complex_warning_counts": antibody_complex_warning_counts,
         "tcr_complex_warning_counts": dict(sorted(tcr_complex_warning_counts.items())),
         "multimer_warning_counts": multimer_warning_counts,
+        "summary_warning_counts": summary_warning_counts,
+        "parse_warning_counts": parse_warning_counts,
+        "total_parse_warnings": sum(parse_warning_counts.values()),
     }
 
 
@@ -230,6 +264,43 @@ def _top_warning_cases(
     return ranked[:limit]
 
 
+def _aggregate_metric_warning_counts(
+    successful_results: list[dict[str, object]],
+    metric_name: str,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in successful_results:
+        metrics = result.get("metrics", {})
+        if not isinstance(metrics, dict):
+            continue
+        warning_counts = metrics.get(metric_name, {})
+        if not isinstance(warning_counts, dict):
+            continue
+        for code, count in warning_counts.items():
+            if not isinstance(code, str) or not code:
+                continue
+            counts[code] = counts.get(code, 0) + int(count)
+    return dict(sorted(counts.items()))
+
+
+def _top_warning_cases_by_metric(
+    successful_results: list[dict[str, object]],
+    metric_name: str,
+    *,
+    limit_per_warning: int = 10,
+) -> dict[str, list[dict[str, object]]]:
+    aggregate = _aggregate_metric_warning_counts(successful_results, metric_name)
+    return {
+        warning_code: _top_warning_cases(
+            successful_results,
+            metric_name,
+            warning_code,
+            limit=limit_per_warning,
+        )
+        for warning_code in aggregate
+    }
+
+
 def _status_cases(results: list[dict[str, object]], status: str) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     for result in results:
@@ -272,6 +343,9 @@ def build_review_report(results: list[dict[str, object]]) -> dict[str, object]:
     successful_results = [result for result in results if result.get("status") == "ok" and "metrics" in result]
     skipped_targets = _status_cases(results, "skipped")
     failed_targets = _status_cases(results, "error")
+    successful_warning_counts = _aggregate_metric_warning_counts(successful_results, "parse_warning_counts")
+    skipped_warning_counts = _count_by_key(skipped_targets, key="warning_code")
+    batch_warning_counts = _merge_count_maps(successful_warning_counts, skipped_warning_counts)
     review = {
         "status_summary": {
             "success_count": len(successful_results),
@@ -279,8 +353,26 @@ def build_review_report(results: list[dict[str, object]]) -> dict[str, object]:
             "failure_count": len(failed_targets),
         },
         "skipped_targets": skipped_targets,
-        "skipped_target_counts_by_reason": _count_by_key(skipped_targets, key="warning_code"),
+        "skipped_target_counts_by_reason": skipped_warning_counts,
         "failed_targets": failed_targets,
+        "warning_counts": {
+            "batch": batch_warning_counts,
+            "successful_parse": successful_warning_counts,
+            "skipped": skipped_warning_counts,
+            "summary": _aggregate_metric_warning_counts(successful_results, "summary_warning_counts"),
+            "chain": _aggregate_metric_warning_counts(successful_results, "chain_warning_counts"),
+            "antibody_complex": _aggregate_metric_warning_counts(successful_results, "antibody_complex_warning_counts"),
+            "tcr_complex": _aggregate_metric_warning_counts(successful_results, "tcr_complex_warning_counts"),
+            "multimer": _aggregate_metric_warning_counts(successful_results, "multimer_warning_counts"),
+        },
+        "warning_cases": {
+            "summary": _top_warning_cases_by_metric(successful_results, "summary_warning_counts"),
+            "chain": _top_warning_cases_by_metric(successful_results, "chain_warning_counts"),
+            "antibody_complex": _top_warning_cases_by_metric(successful_results, "antibody_complex_warning_counts"),
+            "tcr_complex": _top_warning_cases_by_metric(successful_results, "tcr_complex_warning_counts"),
+            "multimer": _top_warning_cases_by_metric(successful_results, "multimer_warning_counts"),
+            "parse": _top_warning_cases_by_metric(successful_results, "parse_warning_counts"),
+        },
         "priority_cases": {
             "antibody_low_confidence": _top_cases(successful_results, "num_low_confidence_antibody_chains"),
             "antibody_unpaired_heavy": _top_cases(successful_results, "num_unpaired_antibody_heavy_chains"),
@@ -372,7 +464,7 @@ def _render_metric_table(metrics: dict[str, object]) -> str:
             rendered_value = _html_scalar(value)
         rows.append(
             "<tr>"
-            f"<th>{html.escape(str(key))}</th>"
+            f"<th scope='row'>{html.escape(str(key))}</th>"
             f"<td>{rendered_value}</td>"
             "</tr>"
         )
@@ -419,6 +511,28 @@ def _render_priority_groups(priority_cases: dict[str, object]) -> str:
     return "".join(groups)
 
 
+def _render_warning_case_groups(warning_cases: dict[str, object]) -> str:
+    groups = []
+    for source_name, raw_by_code in warning_cases.items():
+        by_code = raw_by_code if isinstance(raw_by_code, dict) else {}
+        inner = []
+        for warning_code, raw_items in by_code.items():
+            items = raw_items if isinstance(raw_items, list) else []
+            inner.append(
+                "<details class='record'>"
+                f"<summary>{html.escape(str(warning_code))} <span class='count'>{len(items)}</span></summary>"
+                f"{_render_record_details(items, empty_message='No cases for this warning.')}"
+                "</details>"
+            )
+        groups.append(
+            "<details class='section'>"
+            f"<summary>{html.escape(str(source_name))} <span class='count'>{len(by_code)}</span></summary>"
+            f"{''.join(inner) if inner else '<p class=\"muted\">No warnings in this source.</p>'}"
+            "</details>"
+        )
+    return "".join(groups)
+
+
 def build_batch_html_report(
     *,
     summary: dict[str, object],
@@ -433,6 +547,8 @@ def build_batch_html_report(
     artifact_paths = artifact_paths or {}
     status_summary = review.get("status_summary", {})
     priority_cases = review.get("priority_cases", {})
+    warning_counts = review.get("warning_counts", {})
+    warning_cases = review.get("warning_cases", {})
     skipped_targets = review.get("skipped_targets", [])
     failed_targets = review.get("failed_targets", [])
     manifest_metadata = {
@@ -447,6 +563,9 @@ def build_batch_html_report(
     status_table = _render_metric_table(status_summary if isinstance(status_summary, dict) else {})
     manifest_table = _render_metric_table(manifest_metadata)
     skipped_reason_counts = review.get("skipped_target_counts_by_reason", {})
+    warning_count_table = _render_metric_table(
+        warning_counts if isinstance(warning_counts, dict) else {}
+    )
     skipped_reason_table = _render_metric_table(
         skipped_reason_counts if isinstance(skipped_reason_counts, dict) else {}
     )
@@ -508,10 +627,10 @@ def build_batch_html_report(
       margin: 8px 0 0;
       color: var(--muted);
     }}
-    .grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 16px;
+    .summary-stack {{
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
       margin-bottom: 20px;
     }}
     .card {{
@@ -554,28 +673,41 @@ def build_batch_html_report(
     .metrics-table {{
       width: 100%;
       border-collapse: collapse;
+      table-layout: fixed;
+    }}
+    .metrics-table tr {{
+      display: block;
+      border-top: 1px solid var(--line);
+      padding: 9px 0;
     }}
     .metrics-table th,
     .metrics-table td {{
+      display: block;
       text-align: left;
       vertical-align: top;
-      padding: 8px 10px;
-      border-top: 1px solid var(--line);
+      padding: 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }}
     .metrics-table th {{
-      width: 38%;
+      width: auto;
       color: var(--muted);
       font-weight: 600;
+      margin-bottom: 4px;
+    }}
+    .metrics-table td {{
+      color: var(--ink);
     }}
     pre {{
       margin: 10px 0 0;
       padding: 12px;
-      overflow-x: auto;
+      overflow-x: hidden;
       border-radius: 12px;
       background: var(--code);
       border: 1px solid var(--line);
       font: 12px/1.5 "DejaVu Sans Mono", "Noto Sans Mono", monospace;
       white-space: pre-wrap;
+      overflow-wrap: anywhere;
       word-break: break-word;
     }}
   </style>
@@ -586,7 +718,7 @@ def build_batch_html_report(
       <h1>{html.escape(title)}</h1>
       <p>Batch-level human-readable summary. Expand sections below for skipped targets, failures, and priority review groups.</p>
     </section>
-    <section class="grid">
+    <section class="summary-stack">
       <div class="card">
         <h2>Artifacts</h2>
         {artifact_table}
@@ -607,6 +739,14 @@ def build_batch_html_report(
     <details class="section" open>
       <summary>Skipped Target Counts By Reason <span class="count">{len(skipped_reason_counts) if isinstance(skipped_reason_counts, dict) else 0}</span></summary>
       {skipped_reason_table}
+    </details>
+    <details class="section" open>
+      <summary>Warning Counts <span class="count">{len(warning_counts) if isinstance(warning_counts, dict) else 0}</span></summary>
+      {warning_count_table}
+    </details>
+    <details class="section">
+      <summary>Warning Cases <span class="count">{len(warning_cases) if isinstance(warning_cases, dict) else 0}</span></summary>
+      {_render_warning_case_groups(warning_cases if isinstance(warning_cases, dict) else {})}
     </details>
     <details class="section">
       <summary>Skipped Targets <span class="count">{len(skipped_targets) if isinstance(skipped_targets, list) else 0}</span></summary>

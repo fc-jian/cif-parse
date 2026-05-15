@@ -210,6 +210,23 @@ def _coerce_entry_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _append_summary_warning(summary: Any, warning_code: str, detail: dict[str, Any] | None = None) -> None:
+    """Attach a parse-level warning to StructureSummary for persisted reports."""
+
+    warnings = getattr(summary, "warnings", None)
+    if not isinstance(warnings, list):
+        warnings = []
+        setattr(summary, "warnings", warnings)
+    if warning_code not in warnings:
+        warnings.append(warning_code)
+    if detail:
+        warning_details = getattr(summary, "warning_details", None)
+        if not isinstance(warning_details, dict):
+            warning_details = {}
+            setattr(summary, "warning_details", warning_details)
+        warning_details[warning_code] = detail
+
+
 def _enrich_entry_metadata(
     input_path: Path,
     existing: dict[str, Any],
@@ -445,6 +462,16 @@ def process_single_structure(
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
     summary.entry_metadata = metadata
+    metadata_warning = str(metadata.get("metadata_warning", "") or "")
+    if metadata_warning:
+        _append_summary_warning(
+            summary,
+            metadata_warning,
+            {
+                "metadata_source": metadata.get("metadata_source", ""),
+                "input_path": str(input_path),
+            },
+        )
 
     # Validate pre-split assembly files: chain IDs must be unique.
     if settings.input_assembly:
@@ -471,6 +498,7 @@ def process_single_structure(
             cif_file=cif_file,
             settings=settings,
             pdb_id=summary.pdb_id,
+            summary=summary,
         )
         _dump_atom_cache(
             outdir=outdir,
@@ -540,6 +568,15 @@ def process_single_structure(
                     summary.pdb_id,
                     max_assembly_atoms,
                     ", ".join(skipped_large),
+                )
+                _append_summary_warning(
+                    summary,
+                    "assemblies_skipped_by_max_atoms",
+                    {
+                        "assembly_ids": skipped_large,
+                        "assembly_atom_counts": {aid: atom_counts.get(aid, 0) for aid in skipped_large},
+                        "max_assembly_atoms": max_assembly_atoms,
+                    },
                 )
             assembly_ids = [
                 aid
@@ -664,6 +701,7 @@ def _resolve_single_mode_assembly_id(
     cif_file: CIFFile,
     settings: AppSettings,
     pdb_id: str,
+    summary: Any | None = None,
 ) -> str | None:
     if settings.input_assembly:
         return _infer_input_assembly_id(input_path)
@@ -675,6 +713,12 @@ def _resolve_single_mode_assembly_id(
     available_assembly_ids = read_available_assembly_ids(input_path, cif_file=cif_file)
     if not available_assembly_ids:
         LOGGER.warning("No biological assembly ids found for %s in first_assembly mode; using asymmetric unit", pdb_id)
+        if summary is not None:
+            _append_summary_warning(
+                summary,
+                "first_assembly_no_biological_assembly_using_asymmetric_unit",
+                {"assembly_ids": []},
+            )
         return None
 
     atom_counts: dict[str, int] = {}
@@ -724,6 +768,17 @@ def _resolve_single_mode_assembly_id(
             max_assembly_atoms,
             ", ".join(skipped_before_selected),
         )
+        if summary is not None:
+            _append_summary_warning(
+                summary,
+                "first_assembly_skipped_earlier_large_assemblies",
+                {
+                    "selected_assembly_id": selected_assembly_id,
+                    "skipped_assembly_ids": skipped_before_selected,
+                    "assembly_atom_counts": {aid: atom_counts.get(aid, 0) for aid in skipped_before_selected},
+                    "max_assembly_atoms": max_assembly_atoms,
+                },
+            )
     return selected_assembly_id
 
 

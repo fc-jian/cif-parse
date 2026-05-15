@@ -97,6 +97,8 @@ class StructureSummary:
     assembly_ids: list[str] = field(default_factory=list)
     assembly_descriptions: dict[str, str] = field(default_factory=dict)
     entry_metadata: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    warning_details: dict[str, Any] = field(default_factory=dict)
     title: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -117,5 +119,7 @@ class StructureSummary:
             "assembly_ids": ";".join(self.assembly_ids),
             "assembly_descriptions": _json_cell(self.assembly_descriptions),
             "entry_metadata": _json_cell(self.entry_metadata),
+            "warnings": _json_cell(self.warnings),
+            "warning_details": _json_cell(self.warning_details),
             "title": self.title or "",
         }

@@ -502,6 +502,11 @@ def _summarize_batch_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     successes = [result for result in results if result["status"] == "ok"]
     skipped = [result for result in results if result["status"] == "skipped"]
     failures = [result for result in results if result["status"] == "error"]
+    skipped_warning_counts: dict[str, int] = {}
+    for result in skipped:
+        warning_code = str(result.get("warning_code", "") or "")
+        if warning_code:
+            skipped_warning_counts[warning_code] = skipped_warning_counts.get(warning_code, 0) + 1
     total_success = len(successes)
     total_cases = len(results)
     total_chains = sum(int(result.get("num_chains", 0)) for result in successes)
@@ -526,6 +531,7 @@ def _summarize_batch_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "average_chains_per_successful_case": round(total_chains / total_success, 2) if total_success else 0.0,
         "average_dimers_per_successful_case": round(total_dimers / total_success, 2) if total_success else 0.0,
         "average_multimers_per_successful_case": round(total_multimers / total_success, 2) if total_success else 0.0,
+        "skipped_warning_counts": dict(sorted(skipped_warning_counts.items())),
     }
 
 
@@ -978,6 +984,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         review_results.append(review_result)
     review = build_review_report(review_results)
+    warning_counts = review.get("warning_counts", {})
+    if isinstance(warning_counts, dict):
+        batch_warning_counts = warning_counts.get("batch", {})
+        if isinstance(batch_warning_counts, dict):
+            summary["warning_counts"] = batch_warning_counts
+            summary["warning_count"] = sum(int(value) for value in batch_warning_counts.values())
     manifest = {
         "settings": settings_payload,
         "input_paths": [str(path) for path in input_paths],
