@@ -14,6 +14,8 @@ from cif_parse.constants import (
 )
 from cif_parse.export import load_case_output_bundles
 
+HTML_WARNING_CASE_DETAIL_LIMIT = 10
+
 
 def _antibody_analysis(chain: dict[str, object]) -> dict[str, object]:
     features = chain.get("features")
@@ -301,6 +303,32 @@ def _top_warning_cases_by_metric(
     }
 
 
+def _warning_cases_by_metric(
+    successful_results: list[dict[str, object]],
+    metric_name: str,
+) -> dict[str, list[dict[str, object]]]:
+    aggregate = _aggregate_metric_warning_counts(successful_results, metric_name)
+    cases_by_warning: dict[str, list[dict[str, object]]] = {}
+    for warning_code in aggregate:
+        cases = []
+        for result in successful_results:
+            metrics = result.get("metrics", {})
+            if not isinstance(metrics, dict):
+                continue
+            warning_count = _warning_case_count(metrics, metric_name, warning_code)
+            if warning_count <= 0:
+                continue
+            cases.append(
+                {
+                    "case_id": str(result["case_id"]),
+                    "warning_count": warning_count,
+                }
+            )
+        cases.sort(key=lambda item: (-int(item["warning_count"]), item["case_id"]))
+        cases_by_warning[warning_code] = cases
+    return cases_by_warning
+
+
 def _status_cases(results: list[dict[str, object]], status: str) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     for result in results:
@@ -366,12 +394,12 @@ def build_review_report(results: list[dict[str, object]]) -> dict[str, object]:
             "multimer": _aggregate_metric_warning_counts(successful_results, "multimer_warning_counts"),
         },
         "warning_cases": {
-            "summary": _top_warning_cases_by_metric(successful_results, "summary_warning_counts"),
-            "chain": _top_warning_cases_by_metric(successful_results, "chain_warning_counts"),
-            "antibody_complex": _top_warning_cases_by_metric(successful_results, "antibody_complex_warning_counts"),
-            "tcr_complex": _top_warning_cases_by_metric(successful_results, "tcr_complex_warning_counts"),
-            "multimer": _top_warning_cases_by_metric(successful_results, "multimer_warning_counts"),
-            "parse": _top_warning_cases_by_metric(successful_results, "parse_warning_counts"),
+            "summary": _warning_cases_by_metric(successful_results, "summary_warning_counts"),
+            "chain": _warning_cases_by_metric(successful_results, "chain_warning_counts"),
+            "antibody_complex": _warning_cases_by_metric(successful_results, "antibody_complex_warning_counts"),
+            "tcr_complex": _warning_cases_by_metric(successful_results, "tcr_complex_warning_counts"),
+            "multimer": _warning_cases_by_metric(successful_results, "multimer_warning_counts"),
+            "parse": _warning_cases_by_metric(successful_results, "parse_warning_counts"),
         },
         "priority_cases": {
             "antibody_low_confidence": _top_cases(successful_results, "num_low_confidence_antibody_chains"),
@@ -518,10 +546,19 @@ def _render_warning_case_groups(warning_cases: dict[str, object]) -> str:
         inner = []
         for warning_code, raw_items in by_code.items():
             items = raw_items if isinstance(raw_items, list) else []
+            visible_items = items[:HTML_WARNING_CASE_DETAIL_LIMIT]
+            omitted = len(items) - len(visible_items)
+            omitted_note = (
+                f"<p class='muted'>... omitted {omitted} additional case(s) in HTML; "
+                "see review.json.gz for the complete list.</p>"
+                if omitted > 0
+                else ""
+            )
             inner.append(
                 "<details class='record'>"
-                f"<summary>{html.escape(str(warning_code))} <span class='count'>{len(items)}</span></summary>"
-                f"{_render_record_details(items, empty_message='No cases for this warning.')}"
+                f"<summary>{html.escape(str(warning_code))} <span class='count'>{len(items)} total</span></summary>"
+                f"{_render_record_details(visible_items, empty_message='No cases for this warning.')}"
+                f"{omitted_note}"
                 "</details>"
             )
         groups.append(
