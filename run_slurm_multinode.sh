@@ -37,6 +37,11 @@ Execution:
   --cif-parse-cmd VALUE      Command before "batch" (default: python -m cif_parse.cli)
                              Example: --cif-parse-cmd "mamba run -n bioinfo cif-parse"
   --python VALUE             Python used for split/merge helpers (default: python)
+  Parse-stage options such as --input-assembly, --assembly-mode, and
+  --max-assembly-atoms must appear after "--" so they are forwarded to
+  cif-parse batch on every shard.  --metadata-cif-dir and --metadata-table may
+  be passed either to this wrapper or after "--"; paths are normalized before
+  shard submission.
   --local-run                Run shard workers locally instead of sbatch
   --local-parallel N         Number of local shard workers (default: 1)
   --wait-interval SEC        Poll interval while waiting for Slurm jobs (default: 30)
@@ -79,6 +84,64 @@ quote_args() {
     printf '%s' "$out"
 }
 
+abs_dir_arg() {
+    local path="$1"
+    [[ -d "$path" ]] || die "directory not found: $path"
+    (cd "$path" && pwd)
+}
+
+abs_file_arg() {
+    local path="$1"
+    [[ -e "$path" ]] || die "file not found: $path"
+    printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+}
+
+normalize_parse_path_args() {
+    local normalized=()
+    local i=0
+    local arg value
+    while [[ "$i" -lt "${#PARSE_ARGS[@]}" ]]; do
+        arg="${PARSE_ARGS[$i]}"
+        case "$arg" in
+            --metadata-cif-dir)
+                value="${PARSE_ARGS[$((i + 1))]:-}"
+                [[ -n "$value" ]] || die "--metadata-cif-dir requires a path"
+                value="$(abs_dir_arg "$value")"
+                METADATA_CIF_DIR="$value"
+                normalized+=("$arg" "$value")
+                i=$((i + 2))
+                ;;
+            --metadata-cif-dir=*)
+                value="${arg#--metadata-cif-dir=}"
+                value="$(abs_dir_arg "$value")"
+                METADATA_CIF_DIR="$value"
+                normalized+=("--metadata-cif-dir=$value")
+                i=$((i + 1))
+                ;;
+            --metadata-table)
+                value="${PARSE_ARGS[$((i + 1))]:-}"
+                [[ -n "$value" ]] || die "--metadata-table requires a path"
+                value="$(abs_file_arg "$value")"
+                METADATA_TABLE="$value"
+                normalized+=("$arg" "$value")
+                i=$((i + 2))
+                ;;
+            --metadata-table=*)
+                value="${arg#--metadata-table=}"
+                value="$(abs_file_arg "$value")"
+                METADATA_TABLE="$value"
+                normalized+=("--metadata-table=$value")
+                i=$((i + 1))
+                ;;
+            *)
+                normalized+=("$arg")
+                i=$((i + 1))
+                ;;
+        esac
+    done
+    PARSE_ARGS=("${normalized[@]}")
+}
+
 INPUT_LIST=""
 OUTDIR=""
 SHARDS=""
@@ -100,6 +163,8 @@ MERGE_ONLY=0
 DRY_RUN=0
 SBATCH_EXTRA=()
 PARSE_ARGS=()
+METADATA_CIF_DIR=""
+METADATA_TABLE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -155,6 +220,16 @@ while [[ $# -gt 0 ]]; do
             CONFIG_PATH="${2:-}"
             shift 2
             ;;
+        --metadata-cif-dir)
+            METADATA_CIF_DIR="${2:-}"
+            shift 2
+            PARSE_ARGS+=("--metadata-cif-dir" "$METADATA_CIF_DIR")
+            ;;
+        --metadata-table)
+            METADATA_TABLE="${2:-}"
+            shift 2
+            PARSE_ARGS+=("--metadata-table" "$METADATA_TABLE")
+            ;;
         --python)
             PYTHON_BIN="${2:-}"
             shift 2
@@ -189,7 +264,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --)
             shift
-            PARSE_ARGS=("$@")
+            PARSE_ARGS+=("$@")
             break
             ;;
         *)
@@ -209,6 +284,14 @@ if [[ -n "$CONFIG_PATH" ]]; then
     [[ -f "$CONFIG_PATH" ]] || die "config file not found: $CONFIG_PATH"
     CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" && pwd)/$(basename "$CONFIG_PATH")"
 fi
+
+if [[ -n "$METADATA_CIF_DIR" ]]; then
+    METADATA_CIF_DIR="$(abs_dir_arg "$METADATA_CIF_DIR")"
+fi
+if [[ -n "$METADATA_TABLE" ]]; then
+    METADATA_TABLE="$(abs_file_arg "$METADATA_TABLE")"
+fi
+normalize_parse_path_args
 
 if [[ "$LOCAL_RUN" -eq 0 && "$MERGE_ONLY" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
     command -v sbatch >/dev/null 2>&1 || die "sbatch not found; use --local-run for local smoke tests"
@@ -231,6 +314,8 @@ echo "Shards     : $SHARDS"
 echo "Jobs/shard : $JOBS_PER_SHARD"
 echo "Command    : $CIF_PARSE_CMD"
 echo "Config     : ${CONFIG_PATH:-(none)}"
+echo "Meta CIF   : ${METADATA_CIF_DIR:-(none)}"
+echo "Meta table : ${METADATA_TABLE:-(none)}"
 echo "Parse args : ${PARSE_ARGS[*]:-(none)}"
 
 if [[ "$MERGE_ONLY" -eq 0 ]]; then

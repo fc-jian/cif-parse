@@ -227,6 +227,19 @@ def _append_summary_warning(summary: Any, warning_code: str, detail: dict[str, A
         warning_details[warning_code] = detail
 
 
+def _metadata_warning_codes(metadata: dict[str, Any]) -> list[str]:
+    raw = metadata.get("metadata_warning")
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item)]
+    text = str(raw or "")
+    return [item for item in (part.strip() for part in text.split(";")) if item]
+
+
+def _set_metadata_warning_codes(metadata: dict[str, Any], codes: list[str]) -> None:
+    unique_codes = list(dict.fromkeys(code for code in codes if code))
+    metadata["metadata_warning"] = "; ".join(unique_codes)
+
+
 def _enrich_entry_metadata(
     input_path: Path,
     existing: dict[str, Any],
@@ -235,6 +248,12 @@ def _enrich_entry_metadata(
     """Enrich empty entry metadata from external sources for input-assembly mode."""
 
     pdb_id = _infer_pdb_id_from_assembly_path(input_path)
+    needs_enrichment = any(
+        not existing.get(field)
+        for field in ("experimental_method", "resolution", "release_date")
+    )
+    if not needs_enrichment:
+        return existing
 
     # 1) --metadata-table: pre-generated parquet or CSV.
     table_path = (settings.metadata_table or "").strip()
@@ -253,8 +272,31 @@ def _enrich_entry_metadata(
 
     # 3) No external metadata found — keep existing empty values.
     if existing:
-        existing["metadata_warning"] = "no_entry_metadata_found_for_input_assembly"
+        codes = _metadata_warning_codes(existing)
+        codes.append("no_entry_metadata_found_for_input_assembly")
+        _set_metadata_warning_codes(existing, codes)
     return existing
+
+
+def _ensure_resolution_warning(summary: Any, metadata: dict[str, Any]) -> None:
+    """Persist a parse warning when entry resolution remains unavailable."""
+
+    resolution = metadata.get("resolution")
+    if resolution not in (None, "", ".", "?"):
+        return
+    warning_code = "missing_resolution_in_entry_metadata"
+    codes = _metadata_warning_codes(metadata)
+    codes.append(warning_code)
+    _set_metadata_warning_codes(metadata, codes)
+    _append_summary_warning(
+        summary,
+        warning_code,
+        {
+            "metadata_source": str(metadata.get("metadata_source", "") or ""),
+            "experimental_method": str(metadata.get("experimental_method", "") or ""),
+            "input_path": str(getattr(summary, "source_path", "") or ""),
+        },
+    )
 
 
 def _infer_pdb_id_from_assembly_path(path: Path) -> str:
@@ -432,7 +474,7 @@ def process_single_structure(
         enriched = _enrich_entry_metadata(input_path, metadata, settings)
         if enriched is not metadata:
             metadata = enriched
-    elif not metadata.get("experimental_method") and not metadata.get("resolution"):
+    elif not metadata.get("experimental_method") or not metadata.get("resolution") or not metadata.get("release_date"):
         enriched = _enrich_entry_metadata(input_path, metadata, settings)
         if enriched is not metadata:
             metadata = enriched
@@ -462,16 +504,18 @@ def process_single_structure(
     LOGGER.debug("Read structure summary for %s with %d chains", summary.pdb_id, len(summary.chain_ids))
     LOGGER.debug("Built chain inventory for %s with %d chains", summary.pdb_id, len(chain_inventory))
     summary.entry_metadata = metadata
+    _ensure_resolution_warning(summary, metadata)
     metadata_warning = str(metadata.get("metadata_warning", "") or "")
     if metadata_warning:
-        _append_summary_warning(
-            summary,
-            metadata_warning,
-            {
-                "metadata_source": metadata.get("metadata_source", ""),
-                "input_path": str(input_path),
-            },
-        )
+        for warning_code in _metadata_warning_codes(metadata):
+            _append_summary_warning(
+                summary,
+                warning_code,
+                {
+                    "metadata_source": metadata.get("metadata_source", ""),
+                    "input_path": str(input_path),
+                },
+            )
 
     # Validate pre-split assembly files: chain IDs must be unique.
     if settings.input_assembly:
