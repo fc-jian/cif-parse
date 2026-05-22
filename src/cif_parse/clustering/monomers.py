@@ -30,7 +30,9 @@ def _assembly_sort_key(label: str) -> tuple[int, int | str]:
     return (1, label)
 
 
-def _canonical_monomer_id(pdb_id: str, label_asym_id: str) -> str:
+def _canonical_monomer_id(pdb_id: str, label_asym_id: str, assembly_id: str = "") -> str:
+    if assembly_id:
+        return f"{pdb_id}:{assembly_id}:{label_asym_id}"
     return f"{pdb_id}:{label_asym_id}"
 
 
@@ -94,7 +96,7 @@ class MonomerSample:
     unresolved_sequence_segments: list[dict[str, Any]] = field(default_factory=list)
     special_residue_details: list[dict[str, Any]] = field(default_factory=list)
     special_component_details: list[dict[str, Any]] = field(default_factory=list)
-    observed_assembly_ids: list[str] = field(default_factory=list)
+    assembly_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -118,7 +120,7 @@ class MonomerSample:
             "atom_count": self.atom_count,
             "num_parsed_coordinate_segments": len(self.parsed_coordinate_segments),
             "num_unresolved_sequence_segments": len(self.unresolved_sequence_segments),
-            "observed_assembly_ids": json.dumps(self.observed_assembly_ids, ensure_ascii=False),
+            "assembly_id": self.assembly_id or "",
             "source_path": self.source_path,
             "source_case_dir": self.source_case_dir,
         }
@@ -164,10 +166,11 @@ def collect_canonical_monomers(
                 continue
             eligible_observations += 1
             source_path = resolve_source_path(str(row.get("source_path", "") or ""), cif_files_directory)
-            key = (pdb_id, label_asym_id)
+            assembly_id = str(row.get("assembly_id", "") or "")
+            key = (source_path, assembly_id, pdb_id, label_asym_id)
             if key not in canonical:
                 canonical[key] = MonomerSample(
-                    monomer_id=_canonical_monomer_id(pdb_id, label_asym_id),
+                    monomer_id=_canonical_monomer_id(pdb_id, label_asym_id, assembly_id),
                     pdb_id=pdb_id,
                     label_asym_id=label_asym_id,
                     auth_asym_id=row.get("auth_asym_id"),
@@ -188,18 +191,12 @@ def collect_canonical_monomers(
                     unresolved_sequence_segments=json.loads(row.get("unresolved_sequence_segments", "[]") or "[]"),
                     special_residue_details=json.loads(row.get("special_residue_details", "[]") or "[]"),
                     special_component_details=json.loads(row.get("special_component_details", "[]") or "[]"),
-                    observed_assembly_ids=[],
+                    assembly_id=assembly_id,
                 )
                 counts_by_polymer_class[str(row.get("polymer_class", "") or "")] += 1
             source_case_dir = str(row.get("source_case_dir", "") or "")
             if source_case_dir:
                 prep_case_ids.add(source_case_dir)
-            sample = canonical[key]
-            assembly_ids = json.loads(row.get("assembly_ids", "[]") or "[]")
-            sample.observed_assembly_ids = sorted(
-                {*(sample.observed_assembly_ids), *(str(a) for a in assembly_ids if str(a))},
-                key=_assembly_sort_key,
-            )
         num_case_bundles = len(prep_case_ids)
     else:
         # Slow path: read individual JSON bundles
@@ -234,10 +231,13 @@ def collect_canonical_monomers(
                         skipped_missing_identity += 1
                         continue
                     eligible_observations += 1
-                    key = (pdb_id, label_asym_id)
+                    bundle_assembly_id = str(summary.get("assembly_id", "") or "")
+                    if not bundle_assembly_id and assembly_ids:
+                        bundle_assembly_id = assembly_ids[0]
+                    key = (source_path, bundle_assembly_id, pdb_id, label_asym_id)
                     if key not in canonical:
                         sample = MonomerSample(
-                            monomer_id=_canonical_monomer_id(pdb_id, label_asym_id),
+                            monomer_id=_canonical_monomer_id(pdb_id, label_asym_id, bundle_assembly_id),
                             pdb_id=pdb_id,
                             label_asym_id=label_asym_id,
                             auth_asym_id=str(chain_payload.get("auth_asym_id")) if chain_payload.get("auth_asym_id") is not None else None,
@@ -256,12 +256,10 @@ def collect_canonical_monomers(
                             unresolved_sequence_segments=list(chain_payload.get("unresolved_sequence_segments", []) or []),
                             special_residue_details=list(chain_payload.get("special_residue_details", []) or []),
                             special_component_details=list(chain_payload.get("special_component_details", []) or []),
-                            observed_assembly_ids=[],
+                            assembly_id=bundle_assembly_id,
                         )
                         canonical[key] = sample
                         counts_by_polymer_class[polymer_class] += 1
-                    sample = canonical[key]
-                    sample.observed_assembly_ids = sorted({*(sample.observed_assembly_ids), *assembly_ids}, key=_assembly_sort_key)
 
     monomers = sorted(
         canonical.values(),

@@ -245,7 +245,7 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
                 "unresolved_sequence_segments": json.dumps(chain.get("unresolved_sequence_segments", []) or [], ensure_ascii=False),
                 "special_residue_details": json.dumps(chain.get("special_residue_details", []) or [], ensure_ascii=False),
                 "special_component_details": json.dumps(chain.get("special_component_details", []) or [], ensure_ascii=False),
-                "assembly_ids": json.dumps(assembly_ids, ensure_ascii=False),
+                "assembly_id": assembly_id,
             })
 
     # ── dimers ───────────────────────────────────────────────────────────

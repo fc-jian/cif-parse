@@ -338,7 +338,7 @@ def run_usalign_alignment(
     usalign_executable: str = "USalign",
     mol: str = "auto",
     tm_score_threshold: float = 0.50,
-    min_alignment_coverage_ratio: float = 0.80,
+    min_alignment_coverage_ratio: float = 0.50,
 ) -> USalignAlignmentResult:
     """Run USalign on one monomer pair and parse the result."""
 
@@ -437,19 +437,19 @@ def extract_protein_monomer_structures(
         return load_chain_from_prep(prep_dir, _source_path, _label_asym_id,
                                     assembly_id=_assembly_id, index=cif_idx)
 
-    def _load_atom_array_for_monomer(_source_path, _label_asym_id, _observed_assembly_ids):
-        """Try asymmetric unit chain first, then each observed assembly."""
+    def _load_atom_array_for_monomer(_source_path, _label_asym_id, _assembly_id):
+        """Try the monomer's specific assembly first, then asymmetric unit."""
         if cif_idx is None:
             return None
-        # Try asymmetric unit chain
+        # Try the monomer's own assembly
+        if _assembly_id:
+            cached = _load_chain_from_prep_fn(_source_path, _label_asym_id, _assembly_id)
+            if cached is not None and cached.get("atom_array") is not None:
+                return cached["atom_array"]
+        # Fallback: asymmetric unit
         cached = _load_chain_from_prep_fn(_source_path, _label_asym_id, None)
         if cached is not None and cached.get("atom_array") is not None:
             return cached["atom_array"]
-        # Try each observed assembly
-        for aid in (_observed_assembly_ids or []):
-            cached = _load_chain_from_prep_fn(_source_path, _label_asym_id, str(aid))
-            if cached is not None and cached.get("atom_array") is not None:
-                return cached["atom_array"]
         # Fallback: try legacy full-assembly blob
         cached = _load_cif_cache(prep_dir, _source_path, None, cif_idx)
         if cached is not None and cached.get("atom_array") is not None:
@@ -469,7 +469,7 @@ def extract_protein_monomer_structures(
             _atom_key = f"{monomer.source_path}__{monomer.label_asym_id}"
             if _atom_key not in atom_array_cache:
                 _prep_atoms = _load_atom_array_for_monomer(
-                    monomer.source_path, monomer.label_asym_id, monomer.observed_assembly_ids)
+                    monomer.source_path, monomer.label_asym_id, monomer.assembly_id)
                 if _prep_atoms is not None:
                     atom_array_cache[_atom_key] = _prep_atoms
             if monomer.source_path not in quality_cache:
@@ -511,7 +511,7 @@ def extract_protein_monomer_structures(
             # Phase 2: do I/O outside lock
             if _need_atoms:
                 _prep = _load_atom_array_for_monomer(
-                    monomer.source_path, monomer.label_asym_id, monomer.observed_assembly_ids)
+                    monomer.source_path, monomer.label_asym_id, monomer.assembly_id)
                 if _prep is not None:
                     with cache_lock:
                         atom_array_cache[_atom_key_local] = _prep
@@ -578,6 +578,7 @@ def greedy_cluster_protein_structures(
     sequence_cluster_jobs: int = 1,
     pairwise_alignment_jobs: int = 1,
     extract_fn: Callable[[MonomerSample], ExtractedMonomerStructure | None] | None = None,
+    protein_subcluster_by_sequence: bool = True,
 ) -> dict[str, Any]:
     """Perform quality-directed greedy structural clustering inside protein sequence buckets.
 
@@ -718,12 +719,38 @@ def greedy_cluster_protein_structures(
                 "num_all_failure_sequence_cluster_collapses": local_all_failure_cluster_collapses,
             }
 
+        # --- subcluster by exact sequence identity --------------------------------
+        # Group monomers with 100% identical sequences into subclusters.  Only
+        # subcluster representatives participate in pairwise USalign; other
+        # members are assigned to the same structure cluster as their rep.
+        subcluster_rep: dict[str, str] = {}  # monomer_id → representative monomer_id
+        if protein_subcluster_by_sequence:
+            from collections import defaultdict as _defaultdict
+            seq_groups: dict[str, list[ExtractedMonomerStructure]] = _defaultdict(list)
+            monomer_seq: dict[str, str] = {}
+            for candidate in candidates:
+                monomer = monomer_index.get(candidate.monomer_id)
+                seq = monomer.sequence if monomer else ""
+                monomer_seq[candidate.monomer_id] = seq
+                seq_groups[seq].append(candidate)
+            candidates = []
+            for _seq, members in seq_groups.items():
+                rep = min(members, key=lambda item: item.quality_sort_key())
+                candidates.append(rep)
+                for m in members:
+                    subcluster_rep[m.monomer_id] = rep.monomer_id
+            if len(candidates) < len(seq_groups):
+                LOGGER.debug(
+                    "Subcluster: %d extracted → %d unique sequences in %s",
+                    len(seq_groups), len(candidates), sequence_cluster_id,
+                )
+
         pending = sorted(candidates, key=lambda item: item.quality_sort_key())
         cluster_states: list[dict[str, Any]] = []
         failed_candidates: list[dict[str, Any]] = []
         alignment_success_count = 0
         sequence_member_ids = {candidate.monomer_id for candidate in candidates}
-        missing_structure_member_ids = sorted(set(member_ids) - sequence_member_ids)
+        missing_structure_member_ids = sorted(set(member_ids) - {m.monomer_id for m in pending})
         local_cluster_index = 0
         while pending:
             representative = pending[0]
@@ -952,6 +979,28 @@ def greedy_cluster_protein_structures(
                     }
                 )
 
+                # Expand subcluster members: any monomer that has an identical
+                # sequence to the rep (but was never aligned via USalign) gets
+                # the same structure cluster assignment.
+                if subcluster_rep:
+                    for m_id, rep_id in subcluster_rep.items():
+                        if rep_id == representative.monomer_id and m_id != rep_id:
+                            local_membership_rows.append(
+                                {
+                                    "polymer_class": "protein",
+                                    "sequence_cluster_id": sequence_cluster_id,
+                                    "structure_cluster_id": structure_cluster_id,
+                                    "representative_monomer_id": representative.monomer_id,
+                                    "member_monomer_id": m_id,
+                                    "assignment_reason": "identical_sequence_subcluster",
+                                    "tm_score_min": "",
+                                    "tm_score_max": "",
+                                    "tm_score_for_clustering": "",
+                                    "alignment_coverage_shorter": "",
+                                    "alignment_coverage_resolved": "",
+                                }
+                            )
+
             for member_id in sorted(cluster_state["fallback_member_ids"]):
                 local_membership_rows.append(
                     {
@@ -969,12 +1018,16 @@ def greedy_cluster_protein_structures(
                     }
                 )
 
+            subcluster_extra = sum(
+                1 for m_id, rep_id in subcluster_rep.items()
+                if rep_id == representative.monomer_id and m_id != rep_id
+            ) if subcluster_rep else 0
             local_representative_rows.append(
                 {
                     "sequence_cluster_id": sequence_cluster_id,
                     "structure_cluster_id": structure_cluster_id,
                     "representative_monomer_id": representative.monomer_id,
-                    "num_members": len(cluster_state["members"]) + len(cluster_state["fallback_member_ids"]),
+                    "num_members": len(cluster_state["members"]) + len(cluster_state["fallback_member_ids"]) + subcluster_extra,
                     "pdb_id": representative.pdb_id,
                     "label_asym_id": representative.label_asym_id,
                     "auth_asym_id": representative.auth_asym_id or "",

@@ -243,7 +243,7 @@ def _build_antibody_observation(
     light_cluster_id: str | None = None
 
     for chain_id in antibody_chain_ids:
-        monomer_id = canonical_monomer_id(pdb_id, chain_id)
+        monomer_id = canonical_monomer_id(pdb_id, chain_id, assembly_id or "")
         cluster_source, cluster_id, _ = resolve_monomer_cluster(monomer_id, monomer_cluster_assignments)
         if cluster_source == "unclustered":
             num_unclustered += 1
@@ -256,14 +256,14 @@ def _build_antibody_observation(
         antibody_member_descriptors.append({"role": role, "monomer_cluster_id": cluster_id})
 
     for chain_id, chain_type in zip(antigen_chain_ids, antigen_chain_types):
-        monomer_id = canonical_monomer_id(pdb_id, chain_id)
+        monomer_id = canonical_monomer_id(pdb_id, chain_id, assembly_id or "")
         cluster_source, cluster_id, _ = resolve_monomer_cluster(monomer_id, monomer_cluster_assignments)
         if cluster_source == "unclustered":
             num_unclustered += 1
         antigen_member_descriptors.append({"chain_type": chain_type, "monomer_cluster_id": cluster_id})
 
     for chain_id in auxiliary_component_ids:
-        monomer_id = canonical_monomer_id(pdb_id, chain_id)
+        monomer_id = canonical_monomer_id(pdb_id, chain_id, assembly_id or "")
         chain_payload = monomer_inventory.get(monomer_id, {})
         if monomer_id in monomer_inventory or monomer_id in monomer_cluster_assignments:
             cluster_source, cluster_id, _ = resolve_monomer_cluster(monomer_id, monomer_cluster_assignments)
@@ -410,8 +410,9 @@ def collect_antibody_complex_observations(
                 num_unclustered = 0
                 heavy_cluster_id: str | None = None
                 light_cluster_id: str | None = None
+                slow_ab_asm = str(complex_payload.get("assembly_id") or default_assembly_id or "")
                 for chain_id in antibody_chain_ids:
-                    monomer_id = canonical_monomer_id(pdb_id, chain_id)
+                    monomer_id = canonical_monomer_id(pdb_id, chain_id, slow_ab_asm)
                     cluster_source, cluster_id, _ = resolve_monomer_cluster(
                         monomer_id,
                         monomer_cluster_assignments,
@@ -441,7 +442,7 @@ def collect_antibody_complex_observations(
                     antigen_chain_types,
                     strict=False,
                 ):
-                    monomer_id = canonical_monomer_id(pdb_id, chain_id)
+                    monomer_id = canonical_monomer_id(pdb_id, chain_id, slow_ab_asm)
                     cluster_source, cluster_id, _ = resolve_monomer_cluster(
                         monomer_id,
                         monomer_cluster_assignments,
@@ -463,7 +464,7 @@ def collect_antibody_complex_observations(
                 auxiliary_component_descriptors: list[dict[str, str]] = []
                 structural_auxiliary_chain_ids: list[str] = []
                 for chain_id in auxiliary_component_ids:
-                    monomer_id = canonical_monomer_id(pdb_id, chain_id)
+                    monomer_id = canonical_monomer_id(pdb_id, chain_id, slow_ab_asm)
                     chain_payload = monomer_inventory.get(monomer_id, {})
                     if monomer_id in monomer_inventory or monomer_id in monomer_cluster_assignments:
                         cluster_source, cluster_id, _ = resolve_monomer_cluster(

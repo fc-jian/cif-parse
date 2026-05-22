@@ -164,6 +164,7 @@ class ClusteringSettings:
     outdir: Path | str = DEFAULT_CLUSTERING_OUTDIR
     protein_sequence_mode: str = "mmseqs2"
     protein_structure_mode: str = "greedy"
+    protein_subcluster_by_sequence: bool = True
     dimer_mode: str = "signature"
     dimer_structure_mode: str = "greedy"
     dimer_tm_score_threshold: float = 0.50
@@ -293,6 +294,7 @@ def default_cli_config() -> dict[str, Any]:
             "outdir": DEFAULT_CLUSTERING_OUTDIR,
             "protein_sequence_mode": "mmseqs2",
             "protein_structure_mode": "greedy",
+            "protein_subcluster_by_sequence": True,
             "dimer_mode": "signature",
             "dimer_structure_mode": "greedy",
             "dimer_tm_score_threshold": 0.50,
@@ -423,6 +425,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "outdir",
             "protein_sequence_mode",
             "protein_structure_mode",
+            "protein_subcluster_by_sequence",
             "dimer_mode",
             "dimer_structure_mode",
             "dimer_tm_score_threshold",
@@ -491,6 +494,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "outdir": validated_clustering.outdir,
         "protein_sequence_mode": validated_clustering.protein_sequence_mode,
         "protein_structure_mode": validated_clustering.protein_structure_mode,
+        "protein_subcluster_by_sequence": validated_clustering.protein_subcluster_by_sequence,
         "dimer_mode": validated_clustering.dimer_mode,
         "dimer_structure_mode": validated_clustering.dimer_structure_mode,
         "dimer_tm_score_threshold": validated_clustering.dimer_tm_score_threshold,

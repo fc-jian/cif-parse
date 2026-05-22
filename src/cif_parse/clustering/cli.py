@@ -302,6 +302,12 @@ def build_parser(
         help="How to perform protein structure clustering within sequence buckets",
     )
     parser.add_argument(
+        "--protein-subcluster-by-sequence",
+        action=argparse.BooleanOptionalAction,
+        default=bool(clustering_defaults.get("protein_subcluster_by_sequence", True)),
+        help="Pre-group monomers with identical sequences before pairwise USalign (reduces alignments by ~70%%)",
+    )
+    parser.add_argument(
         "--ignore-structure",
         action="store_true",
         default=bool(clustering_defaults.get("ignore_structure", False)),
@@ -599,23 +605,37 @@ def _run_structure(
             from cif_parse.clustering.prep import load_chain_atoms, load_cif_from_prep
 
             found = None
-            for aid in [None] + (monomer.observed_assembly_ids or []):
+            for aid in (monomer.assembly_id, None):
+                if not aid:
+                    continue
                 candidate = load_chain_atoms(
                     prep_dir,
                     monomer.source_path,
                     monomer.label_asym_id,
-                    assembly_id=str(aid) if aid else None,
+                    assembly_id=str(aid),
                     index=cif_idx_for_pipeline,
                 )
                 if candidate is not None:
                     found = candidate
                     break
             if found is None:
-                for aid in [None] + (monomer.observed_assembly_ids or []):
+                candidate = load_chain_atoms(
+                    prep_dir,
+                    monomer.source_path,
+                    monomer.label_asym_id,
+                    assembly_id=None,
+                    index=cif_idx_for_pipeline,
+                )
+                if candidate is not None:
+                    found = candidate
+            if found is None:
+                for aid in (monomer.assembly_id, None):
+                    if not aid:
+                        continue
                     candidate = load_cif_from_prep(
                         prep_dir,
                         monomer.source_path,
-                        str(aid) if aid else None,
+                        str(aid),
                         index=cif_idx_for_pipeline,
                     )
                     if candidate is not None and candidate.get("atom_array") is not None:
@@ -663,6 +683,7 @@ def _run_structure(
         sequence_cluster_jobs=args.sequence_cluster_jobs,
         pairwise_alignment_jobs=args.usalign_jobs,
         extract_fn=_pipeline_extract,
+        protein_subcluster_by_sequence=args.protein_subcluster_by_sequence,
     )
     manifest = result.get("manifest", {})
     LOGGER.info(

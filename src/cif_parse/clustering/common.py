@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-def canonical_monomer_id(pdb_id: str, label_asym_id: str) -> str:
+def canonical_monomer_id(pdb_id: str, label_asym_id: str, assembly_id: str = "") -> str:
+    if assembly_id:
+        return f"{pdb_id}:{assembly_id}:{label_asym_id}"
     return f"{pdb_id}:{label_asym_id}"
 
 

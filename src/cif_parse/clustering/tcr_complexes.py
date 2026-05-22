@@ -221,21 +221,22 @@ def _build_tcr_observation(
     monomer_inventory: dict[str, dict[str, Any]],
 ) -> TcrComplexObservation:
     num_unclustered = 0
+    tcr_asm = assembly_id or ""
     tcr_desc: list[dict[str, str]] = []
     for role, cid in zip(_tcr_roles(tcr_type, len(tcr_chain_ids)), tcr_chain_ids):
-        cs, cluster_id, _ = resolve_monomer_cluster(canonical_monomer_id(pdb_id, cid), monomer_cluster_assignments)
+        cs, cluster_id, _ = resolve_monomer_cluster(canonical_monomer_id(pdb_id, cid, tcr_asm), monomer_cluster_assignments)
         if cs == "unclustered": num_unclustered += 1
         tcr_desc.append({"role": role, "monomer_cluster_id": cluster_id})
 
     mhc_desc: list[dict[str, str]] = []
     for cid, role in zip(mhc_chain_ids, mhc_chain_roles):
-        cs, cluster_id, _ = resolve_monomer_cluster(canonical_monomer_id(pdb_id, cid), monomer_cluster_assignments)
+        cs, cluster_id, _ = resolve_monomer_cluster(canonical_monomer_id(pdb_id, cid, tcr_asm), monomer_cluster_assignments)
         if cs == "unclustered": num_unclustered += 1
         mhc_desc.append({"role": role, "monomer_cluster_id": cluster_id})
 
     pep_desc: list[dict[str, str]] = []
     for cid in peptide_chain_ids:
-        mid = canonical_monomer_id(pdb_id, cid)
+        mid = canonical_monomer_id(pdb_id, cid, tcr_asm)
         cp = monomer_inventory.get(mid, {})
         cs, cluster_id, _ = resolve_monomer_cluster(mid, monomer_cluster_assignments)
         if cs == "unclustered": num_unclustered += 1
@@ -244,7 +245,7 @@ def _build_tcr_observation(
     aux_desc: list[dict[str, str]] = []
     structural_aux: list[str] = []
     for cid in auxiliary_chain_ids:
-        mid = canonical_monomer_id(pdb_id, cid)
+        mid = canonical_monomer_id(pdb_id, cid, tcr_asm)
         cp = monomer_inventory.get(mid, {})
         if mid in monomer_inventory or mid in monomer_cluster_assignments:
             cs, cluster_id, _ = resolve_monomer_cluster(mid, monomer_cluster_assignments)
@@ -355,13 +356,14 @@ def collect_tcr_complex_observations(
                     continue
 
                 num_unclustered = 0
+                slow_tcr_asm = str(complex_payload.get("assembly_id") or default_assembly_id or "")
                 tcr_member_descriptors: list[dict[str, str]] = []
                 for role, chain_id in zip(
                     _tcr_roles(str(complex_payload.get("tcr_type", "") or ""), len(tcr_chain_ids)),
                     tcr_chain_ids,
                     strict=False,
                 ):
-                    monomer_id = canonical_monomer_id(pdb_id, chain_id)
+                    monomer_id = canonical_monomer_id(pdb_id, chain_id, slow_tcr_asm)
                     cluster_source, cluster_id, _ = resolve_monomer_cluster(
                         monomer_id,
                         monomer_cluster_assignments,
@@ -381,7 +383,7 @@ def collect_tcr_complex_observations(
                     [str(item) for item in complex_payload.get("mhc_chain_roles", [])],
                     strict=False,
                 ):
-                    monomer_id = canonical_monomer_id(pdb_id, chain_id)
+                    monomer_id = canonical_monomer_id(pdb_id, chain_id, slow_tcr_asm)
                     cluster_source, cluster_id, _ = resolve_monomer_cluster(
                         monomer_id,
                         monomer_cluster_assignments,
@@ -398,7 +400,7 @@ def collect_tcr_complex_observations(
                 peptide_member_descriptors: list[dict[str, str]] = []
                 for chain_id in complex_payload.get("peptide_chain_ids", []) or []:
                     chain_label = str(chain_id)
-                    monomer_id = canonical_monomer_id(pdb_id, chain_label)
+                    monomer_id = canonical_monomer_id(pdb_id, chain_label, slow_tcr_asm)
                     chain_payload = monomer_inventory.get(monomer_id, {})
                     cluster_source, cluster_id, _ = resolve_monomer_cluster(
                         monomer_id,
@@ -417,7 +419,7 @@ def collect_tcr_complex_observations(
                 structural_auxiliary_chain_ids: list[str] = []
                 for chain_id in complex_payload.get("auxiliary_chain_ids", []) or []:
                     chain_label = str(chain_id)
-                    monomer_id = canonical_monomer_id(pdb_id, chain_label)
+                    monomer_id = canonical_monomer_id(pdb_id, chain_label, slow_tcr_asm)
                     chain_payload = monomer_inventory.get(monomer_id, {})
                     if monomer_id in monomer_inventory or monomer_id in monomer_cluster_assignments:
                         cluster_source, cluster_id, _ = resolve_monomer_cluster(

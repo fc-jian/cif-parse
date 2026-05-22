@@ -227,8 +227,9 @@ def collect_dimer_observations(
             if not pdb_id or not lbl1 or not lbl2:
                 continue
             source_path = resolve_source_path(row.get("source_path", ""), cif_files_directory)
-            monomer_id_1 = canonical_monomer_id(pdb_id, lbl1)
-            monomer_id_2 = canonical_monomer_id(pdb_id, lbl2)
+            dim_assembly_id = str(row.get("assembly_id", "") or "")
+            monomer_id_1 = canonical_monomer_id(pdb_id, lbl1, dim_assembly_id)
+            monomer_id_2 = canonical_monomer_id(pdb_id, lbl2, dim_assembly_id)
             cs1, cid1, scid1 = _resolve_monomer_cluster(monomer_id_1, monomer_cluster_assignments)
             cs2, cid2, scid2 = _resolve_monomer_cluster(monomer_id_2, monomer_cluster_assignments)
             sm = sorted([
@@ -293,8 +294,9 @@ def collect_dimer_observations(
                 lbl2 = str(dimer.get("label_asym_id_2", "") or "")
                 if not lbl1 or not lbl2:
                     continue
-                mid1 = canonical_monomer_id(pdb_id, lbl1)
-                mid2 = canonical_monomer_id(pdb_id, lbl2)
+                slow_asm_id = str(dimer.get("assembly_id", "") or default_assembly_id or "")
+                mid1 = canonical_monomer_id(pdb_id, lbl1, slow_asm_id)
+                mid2 = canonical_monomer_id(pdb_id, lbl2, slow_asm_id)
                 cs1, cid1, scid1 = _resolve_monomer_cluster(mid1, monomer_cluster_assignments)
                 cs2, cid2, scid2 = _resolve_monomer_cluster(mid2, monomer_cluster_assignments)
                 sm = sorted([

@@ -172,8 +172,9 @@ def collect_multimer_observations(
             m_cnums = [int(c or 0) for c in json.loads(row.get("member_copy_numbers", "[]"))]
             descriptors = []
             m_mids, m_scids, m_stcids, m_csrcs = [], [], [], []
+            mul_asm_id = str(row.get("assembly_id", "") or "")
             for cid, ctype, cnum in zip(m_cids, m_ctypes, m_cnums):
-                mid = canonical_monomer_id(pdb_id, cid)
+                mid = canonical_monomer_id(pdb_id, cid, mul_asm_id)
                 cs, cid_cluster, scid = resolve_monomer_cluster(mid, monomer_cluster_assignments)
                 m_mids.append(mid); m_csrcs.append(cs)
                 m_scids.append(scid)
@@ -258,7 +259,8 @@ def collect_multimer_observations(
                     member_copy_numbers,
                     strict=False,
                 ):
-                    monomer_id = canonical_monomer_id(pdb_id, chain_id)
+                    slow_mul_asm = str(multimer.get("assembly_id") or summary.get("assembly_id") or "")
+                    monomer_id = canonical_monomer_id(pdb_id, chain_id, slow_mul_asm)
                     member_monomer_ids.append(monomer_id)
                     cluster_source, cluster_id, sequence_cluster_id = resolve_monomer_cluster(
                         monomer_id,
