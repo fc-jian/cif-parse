@@ -26,6 +26,7 @@ def _make_identical_alignment(query_id: str, target_id: str) -> USalignAlignment
         min_tm_score=1.0,
         max_tm_score=1.0,
         shorter_length_coverage=1.0,
+        resolved_length_coverage=1.0,
         meets_tm_threshold=True,
         meets_coverage_threshold=True,
     )

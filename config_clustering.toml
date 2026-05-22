@@ -123,10 +123,10 @@ keep_hydrogens = false
 # Allowed values: float in [0, 1].
 tm_score_threshold = 0.50
 
-# Minimum aligned-length / shorter-sequence-length ratio for protein monomer
-# structure clustering.
+# Minimum aligned-length / shorter resolved-structure length ratio for protein
+# monomer structure clustering.
 # Allowed values: float in [0, 1].
-min_alignment_coverage_ratio = 0.80
+min_alignment_coverage_ratio = 0.50
 
 # USalign executable name or absolute path.
 # Allowed values: executable available on PATH or absolute executable path.

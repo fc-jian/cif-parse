@@ -430,7 +430,7 @@ def build_parser(
         "--min-alignment-coverage-ratio",
         type=float,
         default=float(clustering_defaults.get("min_alignment_coverage_ratio", 0.80)),
-        help="Minimum aligned-length / shorter-sequence-length ratio for structural clustering",
+        help="Minimum aligned-length / shorter resolved-structure length ratio for protein structure clustering",
     )
     parser.add_argument(
         "--usalign-executable",

@@ -199,6 +199,7 @@ class USalignAlignmentResult:
     min_tm_score: float
     max_tm_score: float
     shorter_length_coverage: float
+    resolved_length_coverage: float
     meets_tm_threshold: bool
     meets_coverage_threshold: bool
 
@@ -286,6 +287,8 @@ def parse_usalign_output(
     target_monomer_id: str,
     query_length: int,
     target_length: int,
+    query_resolved_residue_count: int | None = None,
+    target_resolved_residue_count: int | None = None,
     tm_score_threshold: float,
     min_alignment_coverage_ratio: float,
 ) -> USalignAlignmentResult:
@@ -308,6 +311,10 @@ def parse_usalign_output(
     max_tm_score = max(tm_score_query, tm_score_target)
     shorter_length = max(1, min(int(query_length), int(target_length)))
     shorter_length_coverage = float(aligned_length) / float(shorter_length)
+    query_resolved = int(query_resolved_residue_count or query_length)
+    target_resolved = int(target_resolved_residue_count or target_length)
+    shorter_resolved_length = max(1, min(query_resolved, target_resolved))
+    resolved_length_coverage = min(1.0, float(aligned_length) / float(shorter_resolved_length))
     return USalignAlignmentResult(
         query_monomer_id=query_monomer_id,
         target_monomer_id=target_monomer_id,
@@ -318,8 +325,9 @@ def parse_usalign_output(
         min_tm_score=min_tm_score,
         max_tm_score=max_tm_score,
         shorter_length_coverage=shorter_length_coverage,
+        resolved_length_coverage=resolved_length_coverage,
         meets_tm_threshold=max_tm_score >= tm_score_threshold,
-        meets_coverage_threshold=shorter_length_coverage >= min_alignment_coverage_ratio,
+        meets_coverage_threshold=resolved_length_coverage >= min_alignment_coverage_ratio,
     )
 
 
@@ -351,6 +359,8 @@ def run_usalign_alignment(
         target_monomer_id=target.monomer_id,
         query_length=query.sequence_length,
         target_length=target.sequence_length,
+        query_resolved_residue_count=query.resolved_residue_count,
+        target_resolved_residue_count=target.resolved_residue_count,
         tm_score_threshold=tm_score_threshold,
         min_alignment_coverage_ratio=min_alignment_coverage_ratio,
     )
@@ -679,6 +689,7 @@ def greedy_cluster_protein_structures(
                         "tm_score_max": "",
                         "tm_score_for_clustering": "",
                         "alignment_coverage_shorter": "",
+                        "alignment_coverage_resolved": "",
                     }
                 )
             local_representative_rows.append(
@@ -791,6 +802,7 @@ def greedy_cluster_protein_structures(
                                 "tm_score_max": result.max_tm_score,
                                 "tm_score_for_clustering": result.max_tm_score,
                                 "alignment_coverage_shorter": result.shorter_length_coverage,
+                                "alignment_coverage_resolved": result.resolved_length_coverage,
                                 "meets_tm_threshold": result.meets_tm_threshold,
                                 "meets_coverage_threshold": result.meets_coverage_threshold,
                             }
@@ -911,6 +923,7 @@ def greedy_cluster_protein_structures(
                 tm_score_max: float | str = ""
                 tm_score_for_clustering: float | str = ""
                 alignment_coverage_shorter: float | str = ""
+                alignment_coverage_resolved: float | str = ""
                 if member.monomer_id != representative.monomer_id:
                     pair_key = tuple(sorted((representative.monomer_id, member.monomer_id)))
                     if pair_key in local_alignment_cache:
@@ -920,6 +933,7 @@ def greedy_cluster_protein_structures(
                         tm_score_max = result.max_tm_score
                         tm_score_for_clustering = result.max_tm_score
                         alignment_coverage_shorter = result.shorter_length_coverage
+                        alignment_coverage_resolved = result.resolved_length_coverage
                     elif failed_candidates:
                         assignment_reason = "tm_failure_sequence_fallback"
                 local_membership_rows.append(
@@ -934,6 +948,7 @@ def greedy_cluster_protein_structures(
                         "tm_score_max": tm_score_max,
                         "tm_score_for_clustering": tm_score_for_clustering,
                         "alignment_coverage_shorter": alignment_coverage_shorter,
+                        "alignment_coverage_resolved": alignment_coverage_resolved,
                     }
                 )
 
@@ -950,6 +965,7 @@ def greedy_cluster_protein_structures(
                         "tm_score_max": "",
                         "tm_score_for_clustering": "",
                         "alignment_coverage_shorter": "",
+                        "alignment_coverage_resolved": "",
                     }
                 )
 

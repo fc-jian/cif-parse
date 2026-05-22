@@ -150,7 +150,7 @@ Key clustering defaults:
 
 1. Protein sequence clustering uses `mmseqs2` with sequence identity threshold `0.40`.
 2. Protein monomer structure clustering uses `max(TM(query,target), TM(target,query)) >= 0.50`.
-3. Protein monomer alignment coverage requires `aligned_length / shorter_length >= 0.80`.
+3. Protein monomer alignment coverage requires `aligned_length / shorter_resolved_structure_length >= 0.80`; full-sequence coverage is still reported for diagnostics.
 4. Dimer, multimer, antibody-antigen, and TCR-pMHC complex clustering default to signature clustering plus overall `USalign -mm 1 -ter 1` refinement with TM-score threshold `0.50`.
 5. Monomer extraction and structure clustering run in a **pipelined** mode: structures are extracted per sequence cluster on-the-fly while USalign runs on previously extracted clusters, overlapping I/O and computation.
 6. The legacy full command now calls the split stages as `seq -> structure -> parallel(tcr, abag, multimer, dimer)`. For maximum throughput on a scheduler, run `seq` and `structure` first, then submit high-order stage subcommands in parallel.
