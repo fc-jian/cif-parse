@@ -1449,6 +1449,13 @@ def _run_three_phase_clustering(
     # Sort largest groups first to minimize ProcessPool long tail
     _group_payloads.sort(key=lambda g: -len(g[1]))
 
+    # Save lightweight structures needed by Phase 3, then release heavy ones
+    # before forking ProcessPool workers.
+    _group_member_map: dict[str, list[str]] = {k: list(v) for k, v in sequence_groups.items()}
+    _monomer_index_light: dict[str, Any] = {mid: m for mid, m in monomer_index.items()
+                                             if mid in to_extract}
+    del monomer_index, sequence_groups
+
     n_workers = max(1, min(sequence_cluster_jobs, len(_group_payloads))) if sequence_cluster_jobs > 1 else 1
     if n_workers > 1 and len(_group_payloads) > 1:
         from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
@@ -1537,7 +1544,7 @@ def _run_three_phase_clustering(
 
     # ---- Phase 3: per-group greedy reconstruction --------------------------
     LOGGER.info("[checkpoint] Phase 3 start: %d groups, %d total members",
-                len(cluster_order), sum(len(sequence_groups[g[0]]) for g in cluster_order))
+                len(cluster_order), sum(len(_group_member_map[g[0]]) for g in cluster_order))
 
     alignment_rows: list[dict[str, Any]] = []
     membership_rows: list[dict[str, Any]] = []
@@ -1551,7 +1558,7 @@ def _run_three_phase_clustering(
     total_all_failure_collapses = 0
 
     for seq_cluster_id, group_idx in tqdm(cluster_order, desc="Phase 3 (reconstruct)", unit="group"):
-        member_ids = sequence_groups[seq_cluster_id]
+        member_ids = _group_member_map[seq_cluster_id]
         subcluster_rep = all_subcluster.get(seq_cluster_id, {})
         db_tasks = cache_db.tasks_for_group(seq_cluster_id)
 
@@ -1634,7 +1641,7 @@ def _run_three_phase_clustering(
 
             for candidate in pending[1:]:
                 ck = alignment_cache_key(
-                    seq_query=monomer_index[rep.monomer_id].sequence if rep.monomer_id in monomer_index else "",
+                    seq_query=_monomer_index_light[rep.monomer_id].sequence if rep.monomer_id in _monomer_index_light else "",
                     seq_target=monomer_index[candidate.monomer_id].sequence if candidate.monomer_id in monomer_index else "",
                     source_query=rep.source_path,
                     source_target=candidate.source_path,
@@ -1693,7 +1700,7 @@ def _run_three_phase_clustering(
                 if member.monomer_id != rep.monomer_id:
                     reason = "representative_alignment"
                     pair_key = alignment_cache_key(
-                        seq_query=monomer_index[rep.monomer_id].sequence if rep.monomer_id in monomer_index else "",
+                        seq_query=_monomer_index_light[rep.monomer_id].sequence if rep.monomer_id in _monomer_index_light else "",
                         seq_target=monomer_index[member.monomer_id].sequence if member.monomer_id in monomer_index else "",
                         source_query=rep.source_path, source_target=member.source_path,
                     )
