@@ -1446,11 +1446,18 @@ def _run_three_phase_clustering(
     # Each worker is fully self-contained for one sequence group.
     LOGGER.info("[checkpoint] Phase 1: Start building payloads")
 
+    # Pre-serialize once, not per-group.
+    _monomer_dicts: dict[str, dict[str, Any]] = {
+        mid: asdict(m) for mid, m in monomer_index.items() if mid in to_extract
+    }
+    _quality_dicts: dict[str, dict[str, Any]] = {
+        k: asdict(v) for k, v in quality_by_source.items()
+    }
     _group_payloads = [
         (seq_id, member_ids,
-         [asdict(monomer_index[mid]) for mid in member_ids if mid in monomer_index],
+         [{**_monomer_dicts[mid]} for mid in member_ids if mid in _monomer_dicts],
          cases_root, str(pdb_dir), min_alignment_coverage_ratio,
-         {k: asdict(v) for k, v in quality_by_source.items()})
+         _quality_dicts)
         for seq_id, member_ids in sorted(sequence_groups.items())
     ]
 
@@ -1463,7 +1470,6 @@ def _run_three_phase_clustering(
     ext_fail = 0
 
     # Sort largest groups first to minimize ProcessPool long tail
-    LOGGER.info("[checkpoint] Phase 1: Sorting %d payloads", len(_group_payloads))
     _group_payloads.sort(key=lambda g: -len(g[1]))
 
     # Save lightweight structures needed by Phase 3, then release heavy ones
