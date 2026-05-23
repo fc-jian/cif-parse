@@ -1444,6 +1444,8 @@ def _run_three_phase_clustering(
     # ---- Phase 1: per-group ProcessPool (extract + subcluster + PDB + tasks) ---
     # Build picklable payloads, sorted largest-first to minimize long tail.
     # Each worker is fully self-contained for one sequence group.
+    LOGGER.info("[checkpoint] Phase 1: Start building payloads")
+
     _group_payloads = [
         (seq_id, member_ids,
          [asdict(monomer_index[mid]) for mid in member_ids if mid in monomer_index],
@@ -1461,6 +1463,7 @@ def _run_three_phase_clustering(
     ext_fail = 0
 
     # Sort largest groups first to minimize ProcessPool long tail
+    LOGGER.info("[checkpoint] Phase 1: Sorting %d payloads", len(_group_payloads))
     _group_payloads.sort(key=lambda g: -len(g[1]))
 
     # Save lightweight structures needed by Phase 3, then release heavy ones
