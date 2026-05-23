@@ -1444,11 +1444,12 @@ def _run_three_phase_clustering(
     # ---- Phase 1: per-group ProcessPool (extract + subcluster + PDB + tasks) ---
     # Build picklable payloads, sorted largest-first to minimize long tail.
     # Each worker is fully self-contained for one sequence group.
-    LOGGER.info("[checkpoint] Phase 1: Start building payloads")
 
     # Pre-serialize once, not per-group.
     _monomer_dicts: dict[str, dict[str, Any]] = {
-        mid: asdict(m) for mid, m in monomer_index.items() if mid in to_extract
+        mid: asdict(m)
+        for mid in tqdm(to_extract, desc="Serialize monomers", unit="monomer")
+        if (m := monomer_index.get(mid))
     }
     _quality_dicts: dict[str, dict[str, Any]] = {
         k: asdict(v) for k, v in quality_by_source.items()
@@ -1458,7 +1459,7 @@ def _run_three_phase_clustering(
          [{**_monomer_dicts[mid]} for mid in member_ids if mid in _monomer_dicts],
          cases_root, str(pdb_dir), min_alignment_coverage_ratio,
          _quality_dicts)
-        for seq_id, member_ids in sorted(sequence_groups.items())
+        for seq_id, member_ids in tqdm(sorted(sequence_groups.items()), desc="Build group payloads", unit="group")
     ]
 
     task_rows: list[dict[str, Any]] = []
