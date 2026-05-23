@@ -1209,8 +1209,8 @@ def greedy_cluster_protein_structures(
         "membership_rows": membership_out_rows,
         "representative_rows": representative_rows,
         "alignment_rows": alignment_rows,
-        "sequence_groups": sequence_groups,
-        "monomer_index": monomer_index,
+        "sequence_groups": _group_member_map if '_group_member_map' in dir() else sequence_groups,
+        "monomer_index": _monomer_index_light if '_monomer_index_light' in dir() else monomer_index,
     }
 
 
@@ -1591,7 +1591,7 @@ def _run_three_phase_clustering(
                     "tm_score_min": "", "tm_score_max": "", "tm_score_for_clustering": "",
                     "alignment_coverage_shorter": "", "alignment_coverage_resolved": "",
                 })
-            rep_mono = monomer_index.get(member_ids[0])
+            rep_mono = _monomer_index_light.get(member_ids[0])
             representative_rows.append({
                 "sequence_cluster_id": seq_cluster_id,
                 "structure_cluster_id": scid,
@@ -1642,7 +1642,7 @@ def _run_three_phase_clustering(
             for candidate in pending[1:]:
                 ck = alignment_cache_key(
                     seq_query=_monomer_index_light[rep.monomer_id].sequence if rep.monomer_id in _monomer_index_light else "",
-                    seq_target=monomer_index[candidate.monomer_id].sequence if candidate.monomer_id in monomer_index else "",
+                    seq_target=_monomer_index_light[candidate.monomer_id].sequence if candidate.monomer_id in _monomer_index_light else "",
                     source_query=rep.source_path,
                     source_target=candidate.source_path,
                 )
@@ -1701,7 +1701,7 @@ def _run_three_phase_clustering(
                     reason = "representative_alignment"
                     pair_key = alignment_cache_key(
                         seq_query=_monomer_index_light[rep.monomer_id].sequence if rep.monomer_id in _monomer_index_light else "",
-                        seq_target=monomer_index[member.monomer_id].sequence if member.monomer_id in monomer_index else "",
+                        seq_target=_monomer_index_light[member.monomer_id].sequence if member.monomer_id in _monomer_index_light else "",
                         source_query=rep.source_path, source_target=member.source_path,
                     )
                     result = results_by_key.get(pair_key)
@@ -1769,7 +1769,7 @@ def _run_three_phase_clustering(
     cache_db.close()
 
     manifest = {
-        "num_sequence_groups": len(sequence_groups),
+        "num_sequence_groups": len(_group_member_map),
         "num_structure_clusters": total_struct_clusters,
         "num_alignment_runs": total_alignments,
         "num_alignment_failures": total_alignment_failures,
@@ -1794,6 +1794,6 @@ def _run_three_phase_clustering(
         "representative_rows": representative_rows,
         "alignment_rows": alignment_rows,
         "warning_rows": warning_rows,
-        "sequence_groups": sequence_groups,
-        "monomer_index": monomer_index,
+        "sequence_groups": _group_member_map if '_group_member_map' in dir() else sequence_groups,
+        "monomer_index": _monomer_index_light if '_monomer_index_light' in dir() else monomer_index,
     }
