@@ -180,7 +180,7 @@ def _ensure_prep_for_full_command(args: argparse.Namespace) -> str | None:
         inputs=args.inputs,
         prep_dir=temp_prep_dir,
         prep_jobs=args.jobs,
-        load_cif_cache=True,
+        load_cif_cache=False,
     )
     args.prep_dir = temp_prep_dir
     return str(temp_prep_dir)
@@ -502,7 +502,7 @@ def _run_prep(args: argparse.Namespace) -> int:
         prep_dir=args.prep_dir,
         cif_files_directory=None,
         prep_jobs=args.prep_jobs,
-        load_cif_cache=not args.no_cif_cache,
+        load_cif_cache=False,  # deprecated — now reads directly from parse pkl
     )
     LOGGER.info("Prep complete: %s", result)
     return 0

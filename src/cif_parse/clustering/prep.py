@@ -717,7 +717,7 @@ def build_prep_database(
     *,
     cif_files_directory: str | None = None,
     prep_jobs: int = 4,
-    load_cif_cache: bool = True,
+    load_cif_cache: bool = False,  # deprecated — now reads directly from parse pkl
 ) -> dict[str, Any]:
     """Build (or refresh) the clustering prep directory.
 
@@ -1030,11 +1030,14 @@ def iter_parquet_rows(
     pf = open_prep_parquet(prep_dir, table_name, required=required)
     if pf is None:
         return
-    for rg_idx in range(pf.metadata.num_row_groups):
-        tbl = pf.read_row_group(rg_idx, columns=columns)
-        column_data = tbl.to_pydict()
-        for i in range(tbl.num_rows):
-            yield {c: values[i] for c, values in column_data.items()}
+    try:
+        for rg_idx in range(pf.metadata.num_row_groups):
+            tbl = pf.read_row_group(rg_idx, columns=columns)
+            column_data = tbl.to_pydict()
+            for i in range(tbl.num_rows):
+                yield {c: values[i] for c, values in column_data.items()}
+    finally:
+        pf.close()
 
 
 # Shared index: set by CLI so that dimer/multimer/antibody/TCR builders

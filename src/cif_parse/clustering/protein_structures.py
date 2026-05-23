@@ -7,7 +7,7 @@ import math
 import re
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -1456,21 +1456,30 @@ def _run_three_phase_clustering(
                                              if mid in to_extract}
     del monomer_index, sequence_groups
 
+    # Close SQLite before fork — each worker opens its own if needed.
+    # An open SQLite connection inherited by 64 forked processes causes
+    # file descriptor exhaustion and WAL locking conflicts.
+    cache_db.close()
+
     n_workers = max(1, min(sequence_cluster_jobs, len(_group_payloads))) if sequence_cluster_jobs > 1 else 1
     if n_workers > 1 and len(_group_payloads) > 1:
         from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
+        # Submit in chunks to avoid blocking on full multiprocessing queue.
+        chunk_size = n_workers * 4
         with _PPE(max_workers=n_workers) as _gex:
-            futures = {_gex.submit(_process_one_group_worker, g): i for i, g in enumerate(_group_payloads)}
-            for f in tqdm(_ac(futures), total=len(futures), desc="Phase 1 (extract+subcluster)", unit="group"):
-                r = f.result()
-                cluster_order.append((r["cluster_id"], len(cluster_order)))
-                all_subcluster[r["cluster_id"]] = r["subcluster"]
-                total_prefiltered += r.get("prefiltered", 0)
-                for mid, ext in r.get("extracted", {}).items():
-                    extracted_structures[mid] = ext
-                local_tasks = r["tasks"]
-                total_tasks += len(local_tasks)
-                task_rows.extend(local_tasks)
+            for chunk_start in tqdm(range(0, len(_group_payloads), chunk_size),
+                                    desc="Phase 1 (extract+subcluster)", unit="chunk"):
+                chunk = _group_payloads[chunk_start:chunk_start + chunk_size]
+                futures = {_gex.submit(_process_one_group_worker, g): i for i, g in enumerate(chunk)}
+                for f in _ac(futures):
+                    r = f.result()
+                    cluster_order.append((r["cluster_id"], len(cluster_order)))
+                    all_subcluster[r["cluster_id"]] = r["subcluster"]
+                    total_prefiltered += r.get("prefiltered", 0)
+                    for mid, ext in r.get("extracted", {}).items():
+                        extracted_structures[mid] = ext
+                    task_rows.extend(r["tasks"])
+                    total_tasks += len(r["tasks"])
     else:
         for g in tqdm(_group_payloads, desc="Phase 1 (extract+subcluster)", unit="group"):
             r = _process_one_group_worker(g)
@@ -1486,6 +1495,9 @@ def _run_three_phase_clustering(
     ext_fail = len(to_extract) - ext_success
     LOGGER.info("[checkpoint] Phase 1: %d/%d monomers extracted (%d failures), %d tasks",
                 ext_success, len(to_extract), ext_fail, total_tasks)
+
+    # Reopen SQLite after fork
+    cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
 
     # Batch insert tasks into SQLite + upsert cache entries
     if task_rows:
