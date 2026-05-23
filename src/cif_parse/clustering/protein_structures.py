@@ -1214,6 +1214,31 @@ def greedy_cluster_protein_structures(
     }
 
 
+def _reconstruct_structure(
+    monomer_id: str,
+    info: tuple,
+    monomer_index: dict[str, Any],
+) -> ExtractedMonomerStructure:
+    """Rebuild ExtractedMonomerStructure from compact worker return + monomer index."""
+    (res_frac, meth_pri, res, res_cnt, src_path, pdb_path,
+     pdb_id, lbl, auth, atom_cnt) = info
+    m = monomer_index.get(monomer_id)
+    return ExtractedMonomerStructure(
+        monomer_id=monomer_id, pdb_id=pdb_id, label_asym_id=lbl,
+        auth_asym_id=auth, source_path=src_path,
+        extracted_pdb_path=pdb_path,
+        sequence_length=m.length if m else 0, residue_count=res_cnt,
+        resolved_residue_count=int(res_frac * res_cnt) if res_cnt else 0,
+        resolved_fraction=res_frac, atom_count=atom_cnt,
+        filter_counts={},
+        quality=EntryQualityMetadata(
+            pdb_id=pdb_id, source_path=src_path,
+            experimental_methods=[], primary_method=None,
+            method_priority=int(meth_pri), resolution=res,
+        ),
+    )
+
+
 def _process_one_group_worker(
     payload: tuple,
 ) -> dict[str, Any]:
@@ -1248,9 +1273,9 @@ def _process_one_group_worker(
     reader = PklAtomReader(cases_root)
 
     # Extract chains for all monomers in this group
-    extracted: dict[str, ExtractedMonomerStructure] = {}
     extracted_list: list[ExtractedMonomerStructure] = []
     _chain_atoms_for_pdb: dict[str, Any] = {}
+    _extract_info: dict[str, tuple] = {}
     for mid in member_ids:
         monomer = monomer_map.get(mid)
         if monomer is None:
@@ -1291,14 +1316,48 @@ def _process_one_group_worker(
             filter_counts=atom_array_filter_counts(filter_counts),
             quality=quality_by_source.get(monomer.source_path) or _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
         )
-        extracted[mid] = ext
+        # Store compact tuple for main-process reconstruction (avoids ~1KB pickle
+        # per structure through multiprocessing queues at million-scale).
+        _extract_info[mid] = (
+            ext.resolved_fraction,
+            ext.quality.method_priority if ext.quality else 99,
+            ext.quality.resolution if ext.quality else None,
+            ext.residue_count,
+            ext.source_path,
+            ext.extracted_pdb_path,
+            ext.pdb_id,
+            ext.label_asym_id,
+            ext.auth_asym_id or "",
+            ext.atom_count,
+        )
         extracted_list.append(ext)
 
     if not extracted_list:
         return {
             "cluster_id": seq_cluster_id, "tasks": [], "subcluster": {},
-            "prefiltered": 0, "extracted": {},
+            "prefiltered": 0, "extracted_info": {},
         }
+
+    # Reconstruct ExtractedMonomerStructure from compact info for local greedy use.
+    # The compact info is what gets returned to the main process.
+    extracted: dict[str, ExtractedMonomerStructure] = {}
+    for mid, info in _extract_info.items():
+        (res_frac, meth_pri, res, res_cnt, src_path, pdb_path,
+         pdb_id, lbl, auth, atom_cnt) = info
+        m = monomer_map.get(mid)
+        extracted[mid] = ExtractedMonomerStructure(
+            monomer_id=mid, pdb_id=pdb_id, label_asym_id=lbl, auth_asym_id=auth,
+            source_path=src_path, extracted_pdb_path=pdb_path,
+            sequence_length=m.length if m else 0, residue_count=res_cnt,
+            resolved_residue_count=int(res_frac * res_cnt) if res_cnt else 0,
+            resolved_fraction=res_frac, atom_count=atom_cnt,
+            filter_counts={},
+            quality=EntryQualityMetadata(
+                pdb_id=pdb_id, source_path=src_path,
+                experimental_methods=[], primary_method=None,
+                method_priority=int(meth_pri), resolution=res,
+            ),
+        )
 
     candidates = sorted(extracted_list, key=lambda item: item.quality_sort_key())
 
@@ -1315,17 +1374,24 @@ def _process_one_group_worker(
         candidates.append(rep)
         for m in members:
             subcluster_rep[m.monomer_id] = rep.monomer_id
-        # Write PDB only for the representative
+        # Write PDB only for the representative, in a group subdirectory
         chain_aa = _chain_atoms_for_pdb.get(rep.monomer_id)
         if chain_aa is not None and not rep.extracted_pdb_path:
+            group_dir = pdb_dir / seq_cluster_id
+            group_dir.mkdir(parents=True, exist_ok=True)
             asm_tag = monomer_map[rep.monomer_id].assembly_id or "na"
-            pdb_path = pdb_dir / f"{rep.pdb_id}_{asm_tag}_{rep.label_asym_id}.pdb"
+            pdb_path = group_dir / f"{rep.pdb_id}_{asm_tag}_{rep.label_asym_id}.pdb"
             _coerced = chain_aa.copy()
             _coerced.chain_id[:] = "A"
             pdb_file = PDBFile()
             pdb_file.set_structure(_coerced)
             pdb_file.write(pdb_path)
             rep.extracted_pdb_path = str(pdb_path)
+            # Update compact info with the actual PDB path
+            prev = _extract_info.get(rep.monomer_id)
+            if prev is not None:
+                _extract_info[rep.monomer_id] = (prev[0], prev[1], prev[2], prev[3], prev[4],
+                                                  str(pdb_path), prev[6], prev[7], prev[8], prev[9])
 
     # Greedy round enumeration
     local_tasks = []
@@ -1378,7 +1444,7 @@ def _process_one_group_worker(
         "tasks": local_tasks,
         "subcluster": subcluster_rep,
         "prefiltered": local_prefiltered,
-        "extracted": extracted,
+        "extracted_info": _extract_info,
     }
 
 
@@ -1488,30 +1554,26 @@ def _run_three_phase_clustering(
     n_workers = max(1, min(sequence_cluster_jobs, len(_group_payloads))) if sequence_cluster_jobs > 1 else 1
     if n_workers > 1 and len(_group_payloads) > 1:
         from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
-        # Submit in chunks to avoid blocking on full multiprocessing queue.
-        chunk_size = n_workers * 4
         with _PPE(max_workers=n_workers) as _gex:
-            for chunk_start in tqdm(range(0, len(_group_payloads), chunk_size),
-                                    desc="Phase 1 (extract+subcluster)", unit="chunk"):
-                chunk = _group_payloads[chunk_start:chunk_start + chunk_size]
-                futures = {_gex.submit(_process_one_group_worker, g): i for i, g in enumerate(chunk)}
-                for f in _ac(futures):
-                    r = f.result()
-                    cluster_order.append((r["cluster_id"], len(cluster_order)))
-                    all_subcluster[r["cluster_id"]] = r["subcluster"]
-                    total_prefiltered += r.get("prefiltered", 0)
-                    for mid, ext in r.get("extracted", {}).items():
-                        extracted_structures[mid] = ext
-                    task_rows.extend(r["tasks"])
-                    total_tasks += len(r["tasks"])
+            futures = {_gex.submit(_process_one_group_worker, g): i for i, g in enumerate(_group_payloads)}
+            for f in tqdm(_ac(futures), total=len(futures),
+                          desc="Phase 1 (extract+subcluster)", unit="group"):
+                r = f.result()
+                cluster_order.append((r["cluster_id"], len(cluster_order)))
+                all_subcluster[r["cluster_id"]] = r["subcluster"]
+                total_prefiltered += r.get("prefiltered", 0)
+                for mid, info in r.get("extracted_info", {}).items():
+                    extracted_structures[mid] = _reconstruct_structure(mid, info, _monomer_index_light)
+                task_rows.extend(r["tasks"])
+                total_tasks += len(r["tasks"])
     else:
         for g in tqdm(_group_payloads, desc="Phase 1 (extract+subcluster)", unit="group"):
             r = _process_one_group_worker(g)
             cluster_order.append((r["cluster_id"], len(cluster_order)))
             all_subcluster[r["cluster_id"]] = r["subcluster"]
             total_prefiltered += r.get("prefiltered", 0)
-            for mid, ext in r.get("extracted", {}).items():
-                extracted_structures[mid] = ext
+            for mid, info in r.get("extracted_info", {}).items():
+                extracted_structures[mid] = _reconstruct_structure(mid, info, _monomer_index_light)
             task_rows.extend(r["tasks"])
             total_tasks += len(r["tasks"])
 
@@ -1524,6 +1586,7 @@ def _run_three_phase_clustering(
     cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
 
     # Batch insert tasks into SQLite + upsert cache entries
+    LOGGER.info("[checkpoint] Phase 1: Start insert %d tasks into SQLite", total_tasks)
     if task_rows:
         cache_db.task_insert_many(task_rows)
         for t in tqdm(task_rows, desc="Phase 1b (cache upsert)", unit="task"):
