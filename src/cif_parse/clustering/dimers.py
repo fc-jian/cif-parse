@@ -20,7 +20,7 @@ from cif_parse.clustering.common import (
     load_monomer_cluster_assignments as _load_monomer_cluster_assignments,
     resolve_monomer_cluster as _common_resolve_monomer_cluster,
 )
-from cif_parse.clustering.high_order_refinement import refine_signature_groups_greedy
+from cif_parse.clustering.high_order_refinement import refine_signature_groups_three_phase
 from cif_parse.clustering.protein_structures import (
     USalignAlignmentResult,
     parse_usalign_output,
@@ -581,7 +581,7 @@ def refine_dimer_signature_clusters(
         if show_progress
         else signature_groups
     )
-    refined = refine_signature_groups_greedy(
+    refined = refine_signature_groups_three_phase(
         signature_iter,
         extracted_structures,
         member_id=lambda item: item.dimer_observation_id,

@@ -580,17 +580,11 @@ def _run_structure(
     # Build direct pkl reader from parse atoms (primary coordinate source).
     pkl_reader = None
     if prep_dir:
-        from cif_parse.clustering.atom_cache import (
-            resolve_parsed_case_dirs, build_source_to_atoms_map, PklAtomReader,
-        )
-        case_dirs = resolve_parsed_case_dirs(prep_dir)
-        if case_dirs:
-            try:
-                s2a = build_source_to_atoms_map(case_dirs)
-                if s2a:
-                    pkl_reader = PklAtomReader(s2a)
-            except Exception:
-                pass
+        from cif_parse.clustering.atom_cache import resolve_cases_root, PklAtomReader
+        try:
+            pkl_reader = PklAtomReader(resolve_cases_root(prep_dir))
+        except Exception:
+            LOGGER.warning("[fallback] Failed to init PklAtomReader", exc_info=True)
 
     cif_idx_for_pipeline: dict | None = None
     if prep_dir:

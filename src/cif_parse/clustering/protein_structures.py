@@ -209,18 +209,16 @@ class USalignAlignmentResult:
 
 def extract_monomer_from_pkl(
     monomer: MonomerSample,
-    source_to_atoms: dict[str, str],
+    cases_root: str,
     outdir: str,
+    quality_by_source: dict[str, EntryQualityMetadata] | None = None,
     *,
     drop_hydrogens: bool = True,
 ) -> ExtractedMonomerStructure | None:
-    """ProcessPool-safe: load chain from parse atoms pkl, write PDB, return structure.
-
-    Each worker builds its own :class:`PklAtomReader` — no locks needed.
-    """
+    """ProcessPool-safe: load chain from parse atoms pkl, write PDB, return structure."""
     from cif_parse.clustering.atom_cache import PklAtomReader
 
-    reader = PklAtomReader(source_to_atoms)
+    reader = PklAtomReader(cases_root)
     chain_atoms = None
     for aid in (monomer.assembly_id, None):
         if not aid:
@@ -253,6 +251,11 @@ def extract_monomer_from_pkl(
     pdb_file.set_structure(_coerced)
     pdb_file.write(pdb_path)
 
+    quality = (quality_by_source or {}).get(
+        monomer.source_path,
+        _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
+    )
+
     return ExtractedMonomerStructure(
         monomer_id=monomer.monomer_id,
         pdb_id=monomer.pdb_id, label_asym_id=monomer.label_asym_id, auth_asym_id=monomer.auth_asym_id,
@@ -262,7 +265,7 @@ def extract_monomer_from_pkl(
         resolved_fraction=resolved_count / max(1, monomer.residue_count),
         atom_count=int(chain_atoms.array_length()),
         filter_counts=atom_array_filter_counts(filter_counts),
-        quality=_default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
+        quality=quality,
     )
 
 
@@ -1347,16 +1350,22 @@ def _run_three_phase_clustering(
         if mid in monomer_index and mid not in extracted_structures
     ]
     if _monomers_to_extract and prep_dir:
-        # Build source_to_atoms map for pkl reader
-        from cif_parse.clustering.atom_cache import resolve_parsed_case_dirs, build_source_to_atoms_map
-        source_to_atoms: dict[str, str] = build_source_to_atoms_map(resolve_parsed_case_dirs(prep_dir))
-        if source_to_atoms:
+        # Build direct pkl reader from parsed cases root
+        from cif_parse.clustering.atom_cache import resolve_cases_root
+        cases_root: str = str(resolve_cases_root(prep_dir))
+        # Load entry quality metadata for representative ranking
+        quality_by_source: dict[str, EntryQualityMetadata] = {}
+        try:
+            quality_by_source = load_entry_quality_metadata_from_prep(prep_dir)
+        except Exception:
+            LOGGER.debug("[fallback] Failed to load entry quality metadata", exc_info=True)
+        if cases_root:
             n_workers = max(1, min(sequence_cluster_jobs, len(_monomers_to_extract)))
             if n_workers > 1 and len(_monomers_to_extract) > 1:
                 from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
                 with _PPE(max_workers=n_workers) as _ex:
                     futures = {
-                        _ex.submit(extract_monomer_from_pkl, m, source_to_atoms, str(pdb_dir)): m.monomer_id
+                        _ex.submit(extract_monomer_from_pkl, m, cases_root, str(pdb_dir), quality_by_source): m.monomer_id
                         for m in _monomers_to_extract
                     }
                     for f in _ac(futures):
@@ -1370,7 +1379,7 @@ def _run_three_phase_clustering(
             else:
                 for m in _monomers_to_extract:
                     try:
-                        ext = extract_monomer_from_pkl(m, source_to_atoms, str(pdb_dir))
+                        ext = extract_monomer_from_pkl(m, cases_root, str(pdb_dir), quality_by_source)
                         if ext is not None:
                             extracted_structures[m.monomer_id] = ext
                     except Exception:
@@ -1396,7 +1405,7 @@ def _run_three_phase_clustering(
     ext_success = sum(1 for mid in to_extract if mid in extracted_structures)
     ext_fail = len(to_extract) - ext_success
     LOGGER.info("[checkpoint] Phase 1 extraction: %d/%d monomers (%d failures), source_to_atoms=%d entries",
-                ext_success, len(to_extract), ext_fail, len(source_to_atoms) if source_to_atoms else 0)
+                ext_success, len(to_extract), ext_fail, len(quality_by_source) if quality_by_source else 0)
 
     # ---- Phase 1b: group subcluster + task generation (ProcessPool, CPU) ---
     task_rows: list[dict[str, Any]] = []
@@ -1668,15 +1677,32 @@ def _run_three_phase_clustering(
 
             ordered = sorted(state["assigned"], key=lambda item: (item.monomer_id != rep.monomer_id, item.monomer_id))
             for member in ordered:
-                reason = "representative" if member.monomer_id == rep.monomer_id else "representative_alignment"
+                reason = "representative"
+                tm_min, tm_max, tm_clus, cov_shorter, cov_resolved = "", "", "", "", ""
+                if member.monomer_id != rep.monomer_id:
+                    reason = "representative_alignment"
+                    pair_key = alignment_cache_key(
+                        seq_query=monomer_index[rep.monomer_id].sequence if rep.monomer_id in monomer_index else "",
+                        seq_target=monomer_index[member.monomer_id].sequence if member.monomer_id in monomer_index else "",
+                        source_query=rep.source_path, source_target=member.source_path,
+                    )
+                    result = results_by_key.get(pair_key)
+                    if result is not None:
+                        tm_min = result.get("tm_score_min", "") or result.get("tm_score_max", "")
+                        tm_max = result.get("tm_score_max", "")
+                        tm_clus = result.get("tm_score_max", "")
+                        cov_shorter = result.get("shorter_length_coverage", "")
+                        cov_resolved = result.get("resolved_length_coverage", "")
                 membership_rows.append({
                     "polymer_class": "protein", "sequence_cluster_id": seq_cluster_id,
                     "structure_cluster_id": scid,
                     "representative_monomer_id": rep.monomer_id,
                     "member_monomer_id": member.monomer_id,
                     "assignment_reason": reason,
-                    "tm_score_min": "", "tm_score_max": "", "tm_score_for_clustering": "",
-                    "alignment_coverage_shorter": "", "alignment_coverage_resolved": "",
+                    "tm_score_min": tm_min, "tm_score_max": tm_max,
+                    "tm_score_for_clustering": tm_clus,
+                    "alignment_coverage_shorter": cov_shorter,
+                    "alignment_coverage_resolved": cov_resolved,
                 })
 
             # Expand subcluster members
