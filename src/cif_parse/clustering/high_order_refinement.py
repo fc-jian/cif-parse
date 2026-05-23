@@ -14,12 +14,19 @@ MemberT = TypeVar("MemberT")
 StructureT = TypeVar("StructureT")
 
 
-def _make_identical_alignment(query_id: str, target_id: str) -> USalignAlignmentResult:
+def _make_identical_alignment(
+    query_id: str,
+    target_id: str,
+    query_residue_count: int = 1,
+    target_residue_count: int = 1,
+) -> USalignAlignmentResult:
     """Return a synthetic perfect-match result for structurally identical members."""
+    aligned_len = min(query_residue_count, target_residue_count)
+    shorter_len = min(query_residue_count, target_residue_count)
     return USalignAlignmentResult(
         query_monomer_id=query_id,
         target_monomer_id=target_id,
-        aligned_length=1,
+        aligned_length=aligned_len,
         rmsd=0.0,
         tm_score_query=1.0,
         tm_score_target=1.0,
@@ -124,8 +131,12 @@ def refine_signature_groups_greedy(
                 if pair_key in alignment_cache:
                     continue
                 if can_skip_alignment is not None and can_skip_alignment(representative, candidate):
+                    qs = extracted_structures.get(member_id(representative))
+                    ts = extracted_structures.get(member_id(candidate))
                     alignment_cache[pair_key] = _make_identical_alignment(
                         member_id(representative), member_id(candidate),
+                        query_residue_count=getattr(qs, "residue_count", 1) or 1,
+                        target_residue_count=getattr(ts, "residue_count", 1) or 1,
                     )
                     continue
                 alignment_tasks.append(

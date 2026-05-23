@@ -1496,8 +1496,8 @@ def _run_three_phase_clustering(
             all_successes.extend(successes)
             all_failures.extend(failures)
 
-            # Write results back to cache + update task status
-            done_keys: list[str] = []
+            # Write results back to cache + update task status by task_id
+            done_task_ids: list[int] = []
             for task, result in successes:
                 cache_db.cache_write_result(task.key, {
                     "tm_score_query": result.tm_score_query,
@@ -1508,13 +1508,17 @@ def _run_three_phase_clustering(
                     "shorter_length_coverage": result.shorter_length_coverage,
                     "resolved_length_coverage": result.resolved_length_coverage,
                 })
-                done_keys.append(task.key)
+                tid = task.context.get("task", {}).get("task_id")
+                if tid is not None:
+                    done_task_ids.append(int(tid))
             for task, exc in failures:
                 cache_db.cache_write_error(task.key, str(exc))
-                done_keys.append(task.key)
+                tid = task.context.get("task", {}).get("task_id")
+                if tid is not None:
+                    done_task_ids.append(int(tid))
 
-            if done_keys:
-                cache_db.task_status_batch_update(done_keys, "completed")
+            if done_task_ids:
+                cache_db.task_status_batch_update(done_task_ids, "completed")
 
         LOGGER.info(
             "Phase 2 complete: %d successes, %d failures",

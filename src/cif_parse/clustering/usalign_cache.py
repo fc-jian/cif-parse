@@ -173,14 +173,19 @@ class AlignmentCacheDB:
         self,
         cache_key: str,
     ) -> dict[str, Any] | None:
-        """Return cached USalign result or None."""
+        """Return cached USalign result, or None if pending/failed."""
         row = self._get_conn().execute(
             "SELECT tm_score_query, tm_score_target, tm_score_max, rmsd, "
-            "aligned_length, shorter_length_coverage, resolved_length_coverage "
-            "FROM alignment_cache WHERE cache_key=? AND tm_score_max IS NOT NULL",
+            "aligned_length, shorter_length_coverage, resolved_length_coverage, "
+            "error_message "
+            "FROM alignment_cache WHERE cache_key=?",
             (cache_key,),
         ).fetchone()
         if row is None:
+            return None
+        if row[7]:  # error_message is not NULL — failed permanently
+            return None  # caller should treat as failure, not re-submit
+        if row[2] is None:  # tm_score_max is NULL — pending
             return None
         self._get_conn().execute(
             "UPDATE alignment_cache SET queried_at=? WHERE cache_key=?",
@@ -195,6 +200,7 @@ class AlignmentCacheDB:
             "aligned_length": row[4],
             "shorter_length_coverage": row[5],
             "resolved_length_coverage": row[6],
+            "error_message": row[7],
         }
 
     def cache_upsert_pending(
@@ -294,31 +300,31 @@ class AlignmentCacheDB:
         )
         self._get_conn().commit()
 
-    def task_update_status(self, cache_key: str, status: str) -> None:
+    def task_update_status(self, task_id: int, status: str) -> None:
         self._get_conn().execute(
-            "UPDATE phase1_tasks SET status=? WHERE cache_key=?",
-            (status, cache_key),
+            "UPDATE phase1_tasks SET status=? WHERE task_id=?",
+            (status, task_id),
         )
         self._get_conn().commit()
 
     def task_get_pending(self) -> list[dict[str, Any]]:
-        """Return all pending tasks, sorted by combined PDB size descending."""
+        """Return all pending tasks, sorted by estimated cost descending."""
         rows = self._get_conn().execute(
-            """SELECT cache_key, query_monomer_id, target_monomer_id,
+            """SELECT task_id, cache_key, query_monomer_id, target_monomer_id,
                       query_pdb_path, target_pdb_path,
                       query_residue_count, target_residue_count,
                       query_pdb_size, target_pdb_size,
                       sequence_cluster_id, subcluster_rep_id
                FROM phase1_tasks WHERE status='pending'
-               ORDER BY (query_pdb_size + target_pdb_size) DESC"""
+               ORDER BY (query_residue_count * target_residue_count) DESC"""
         ).fetchall()
         return [
             {
-                "cache_key": r[0], "query_monomer_id": r[1], "target_monomer_id": r[2],
-                "query_pdb_path": r[3], "target_pdb_path": r[4],
-                "query_residue_count": r[5], "target_residue_count": r[6],
-                "query_pdb_size": r[7], "target_pdb_size": r[8],
-                "sequence_cluster_id": r[9], "subcluster_rep_id": r[10],
+                "task_id": r[0], "cache_key": r[1], "query_monomer_id": r[2],
+                "target_monomer_id": r[3], "query_pdb_path": r[4], "target_pdb_path": r[5],
+                "query_residue_count": r[6], "target_residue_count": r[7],
+                "query_pdb_size": r[8], "target_pdb_size": r[9],
+                "sequence_cluster_id": r[10], "subcluster_rep_id": r[11],
             }
             for r in rows
         ]
@@ -360,9 +366,9 @@ class AlignmentCacheDB:
             for r in rows
         ]
 
-    def task_status_batch_update(self, cache_keys: list[str], status: str) -> None:
+    def task_status_batch_update(self, task_ids: list[int], status: str) -> None:
         self._get_conn().executemany(
-            "UPDATE phase1_tasks SET status=? WHERE cache_key=?",
-            [(status, k) for k in cache_keys],
+            "UPDATE phase1_tasks SET status=? WHERE task_id=?",
+            [(status, tid) for tid in task_ids],
         )
         self._get_conn().commit()
