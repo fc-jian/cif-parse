@@ -21,6 +21,7 @@ import logging
 import os
 import sqlite3
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,11 @@ def _seq_hash(sequence: str) -> str:
     return hashlib.sha256(sequence.upper().encode()).hexdigest()[:16]
 
 
+@lru_cache(maxsize=1 << 20)
+def _resolve_cached(path_str: str) -> str:
+    return str(Path(path_str).resolve())
+
+
 def alignment_cache_key(
     *,
     seq_query: str,
@@ -99,8 +105,8 @@ def alignment_cache_key(
     raw = "|".join([
         _seq_hash(seq_query),
         _seq_hash(seq_target),
-        str(Path(source_query).resolve()),
-        str(Path(source_target).resolve()),
+        _resolve_cached(source_query),
+        _resolve_cached(source_target),
         str(int(model)),
         "1" if keep_h else "0",
     ])
@@ -222,6 +228,30 @@ class AlignmentCacheDB:
                VALUES (?,?,?,?,?,?,?,?)""",
             (cache_key, seq_hash_query, seq_hash_target, source_query, source_target,
              model, int(keep_h), _now()),
+        )
+        self._get_conn().commit()
+
+    def cache_upsert_pending_many(
+        self,
+        keys: list[str],
+        *,
+        seq_hash_query: str = "",
+        seq_hash_target: str = "",
+        source_query: str = "",
+        source_target: str = "",
+        model: int = 1,
+        keep_h: bool = False,
+    ) -> None:
+        """Batch-insert placeholder rows for many pending alignments."""
+        now = _now()
+        rows = [(k, seq_hash_query, seq_hash_target, source_query, source_target,
+                 model, int(keep_h), now) for k in keys]
+        self._get_conn().executemany(
+            """INSERT OR IGNORE INTO alignment_cache
+               (cache_key, seq_hash_query, seq_hash_target, source_query, source_target,
+                model, keep_h, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            rows,
         )
         self._get_conn().commit()
 

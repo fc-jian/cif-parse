@@ -181,7 +181,7 @@ class ClusteringSettings:
     model: int = 1
     keep_hydrogens: bool = False
     tm_score_threshold: float = 0.50
-    min_alignment_coverage_ratio: float = 0.80
+    min_alignment_coverage_ratio: float = 0.50
     usalign_executable: str = "USalign"
     jobs: int = _DEFAULT_JOB_COUNT
     mmseqs_threads: int | None = None

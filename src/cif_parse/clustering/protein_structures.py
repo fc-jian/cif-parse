@@ -1221,7 +1221,7 @@ def _reconstruct_structure(
 ) -> ExtractedMonomerStructure:
     """Rebuild ExtractedMonomerStructure from compact worker return + monomer index."""
     (res_frac, meth_pri, res, res_cnt, src_path, pdb_path,
-     pdb_id, lbl, auth, atom_cnt) = info
+     pdb_id, lbl, auth, atom_cnt, primary_method) = info
     m = monomer_index.get(monomer_id)
     return ExtractedMonomerStructure(
         monomer_id=monomer_id, pdb_id=pdb_id, label_asym_id=lbl,
@@ -1233,7 +1233,7 @@ def _reconstruct_structure(
         filter_counts={},
         quality=EntryQualityMetadata(
             pdb_id=pdb_id, source_path=src_path,
-            experimental_methods=[], primary_method=None,
+            experimental_methods=[], primary_method=primary_method,
             method_priority=int(meth_pri), resolution=res,
         ),
     )
@@ -1329,6 +1329,7 @@ def _process_one_group_worker(
             ext.label_asym_id,
             ext.auth_asym_id or "",
             ext.atom_count,
+            ext.quality.primary_method if ext.quality else None,
         )
         extracted_list.append(ext)
 
@@ -1343,7 +1344,7 @@ def _process_one_group_worker(
     extracted: dict[str, ExtractedMonomerStructure] = {}
     for mid, info in _extract_info.items():
         (res_frac, meth_pri, res, res_cnt, src_path, pdb_path,
-         pdb_id, lbl, auth, atom_cnt) = info
+         pdb_id, lbl, auth, atom_cnt, primary_method) = info
         m = monomer_map.get(mid)
         extracted[mid] = ExtractedMonomerStructure(
             monomer_id=mid, pdb_id=pdb_id, label_asym_id=lbl, auth_asym_id=auth,
@@ -1354,7 +1355,7 @@ def _process_one_group_worker(
             filter_counts={},
             quality=EntryQualityMetadata(
                 pdb_id=pdb_id, source_path=src_path,
-                experimental_methods=[], primary_method=None,
+                experimental_methods=[], primary_method=primary_method,
                 method_priority=int(meth_pri), resolution=res,
             ),
         )
@@ -1391,7 +1392,8 @@ def _process_one_group_worker(
             prev = _extract_info.get(rep.monomer_id)
             if prev is not None:
                 _extract_info[rep.monomer_id] = (prev[0], prev[1], prev[2], prev[3], prev[4],
-                                                  str(pdb_path), prev[6], prev[7], prev[8], prev[9])
+                                                  str(pdb_path), prev[6], prev[7], prev[8], prev[9],
+                                                  prev[10])
 
     # Greedy round enumeration
     local_tasks = []
@@ -1405,8 +1407,8 @@ def _process_one_group_worker(
         rep = pending[0]
         round_num += 1
         for candidate in pending[1:]:
-            shorter = min(rep.residue_count, candidate.residue_count)
-            longer = max(rep.residue_count, candidate.residue_count)
+            shorter = min(rep.resolved_residue_count, candidate.resolved_residue_count)
+            longer = max(rep.resolved_residue_count, candidate.resolved_residue_count)
             if longer > 0 and shorter / longer < min_cov:
                 local_prefiltered += 1
                 continue
@@ -1589,11 +1591,8 @@ def _run_three_phase_clustering(
     LOGGER.info("[checkpoint] Phase 1: Start insert %d tasks into SQLite", total_tasks)
     if task_rows:
         cache_db.task_insert_many(task_rows)
-        for t in tqdm(task_rows, desc="Phase 1b (cache upsert)", unit="task"):
-            cache_db.cache_upsert_pending(
-                t["cache_key"], seq_hash_query="", seq_hash_target="",
-                source_query="", source_target="",
-            )
+        all_keys = [t["cache_key"] for t in task_rows]
+        cache_db.cache_upsert_pending_many(all_keys)
 
     # ---- Phase 2: execute all pending USalign tasks globally ---------------
     pending_tasks = cache_db.task_get_pending()
@@ -1620,6 +1619,7 @@ def _run_three_phase_clustering(
                 max_workers=pairwise_alignment_jobs,
                 usalign_executable=usalign_executable,
                 tm_score_threshold=tm_score_threshold,
+                min_alignment_coverage_ratio=min_alignment_coverage_ratio,
             )
             done_ids: list[int] = []
             for task, result in successes:
@@ -1758,11 +1758,13 @@ def _run_three_phase_clustering(
                 if ck in failures_by_key:
                     total_alignment_failures += 1
                     remaining.append(candidate)
-                elif result and result.get("tm_score_max", 0) >= tm_score_threshold:
+                elif (result
+                      and result.get("tm_score_max", 0) >= tm_score_threshold
+                      and result.get("resolved_length_coverage", 0) >= min_alignment_coverage_ratio):
                     assigned.append(candidate)
                     total_alignments += 1
                     alignment_rows.append({
-                        "signature_cluster_id": seq_cluster_id,
+                        "sequence_cluster_id": seq_cluster_id,
                         "query_monomer_id": rep.monomer_id,
                         "target_monomer_id": candidate.monomer_id,
                         "aligned_length": result.get("aligned_length", 0),
@@ -1822,11 +1824,11 @@ def _run_three_phase_clustering(
                     "alignment_coverage_resolved": cov_resolved,
                 })
 
-            # Expand subcluster members: follow each rep's cluster assignment
+            # Expand subcluster members assigned to this cluster
             if subcluster_rep:
                 for mid, rid in subcluster_rep.items():
                     assigned_cluster = rep_to_cluster.get(rid)
-                    if assigned_cluster and mid != rid:
+                    if assigned_cluster and assigned_cluster == scid and mid != rid:
                         membership_rows.append({
                             "polymer_class": "protein", "sequence_cluster_id": seq_cluster_id,
                             "structure_cluster_id": assigned_cluster,
