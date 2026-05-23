@@ -242,24 +242,16 @@ def extract_monomer_from_pkl(
     if resolved_count <= 2:
         return None
 
-    outdir_path = Path(outdir)
-    outdir_path.mkdir(parents=True, exist_ok=True)
-    pdb_path = outdir_path / f"{monomer.pdb_id}_{monomer.label_asym_id}.pdb"
-    _coerced = chain_atoms.copy()
-    _coerced.chain_id[:] = "A"
-    pdb_file = PDBFile()
-    pdb_file.set_structure(_coerced)
-    pdb_file.write(pdb_path)
-
     quality = (quality_by_source or {}).get(
         monomer.source_path,
         _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
     )
 
+    # PDB file written lazily in Phase 1b (only for subcluster representatives)
     return ExtractedMonomerStructure(
         monomer_id=monomer.monomer_id,
         pdb_id=monomer.pdb_id, label_asym_id=monomer.label_asym_id, auth_asym_id=monomer.auth_asym_id,
-        source_path=monomer.source_path, extracted_pdb_path=str(pdb_path),
+        source_path=monomer.source_path, extracted_pdb_path="",
         sequence_length=monomer.length, residue_count=monomer.residue_count,
         resolved_residue_count=resolved_count,
         resolved_fraction=resolved_count / max(1, monomer.residue_count),
@@ -1211,6 +1203,16 @@ def greedy_cluster_protein_structures(
     }
 
 
+def _write_monomer_pdb(structure: ExtractedMonomerStructure, outdir: Path) -> str:
+    """Write a single-chain PDB and return the path."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    pdb_path = outdir / f"{structure.pdb_id}_{structure.label_asym_id}.pdb"
+    pdb_file = PDBFile()
+    pdb_file.set_structure(structure)
+    pdb_file.write(pdb_path)
+    return str(pdb_path)
+
+
 def _process_one_group_worker(
     payload: tuple,
 ) -> dict[str, Any]:
@@ -1226,6 +1228,7 @@ def _process_one_group_worker(
     monomer_map = {m.monomer_id: m for m in monomers}
 
     # Subcluster by exact sequence
+    pdb_dir = Path(payload[5]) if len(payload) > 5 else Path(".")
     subcluster_rep: dict[str, str] = {}
     from collections import defaultdict as _dd
     seq_groups: dict[str, list[Any]] = _dd(list)
@@ -1238,6 +1241,8 @@ def _process_one_group_worker(
         candidates.append(rep)
         for m in members:
             subcluster_rep[m.monomer_id] = rep.monomer_id
+        # Write PDB only for the representative (needed for USalign)
+        rep.extracted_pdb_path = rep.extracted_pdb_path or _write_monomer_pdb(rep, pdb_dir)
 
     # Greedy round enumeration
     local_tasks = []
@@ -1363,6 +1368,7 @@ def _run_three_phase_clustering(
             n_workers = max(1, min(sequence_cluster_jobs, len(_monomers_to_extract)))
             if n_workers > 1 and len(_monomers_to_extract) > 1:
                 from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
+                LOGGER.info("[checkpoint] %d workers for %d monomers", n_workers, len(_monomers_to_extract))
                 with _PPE(max_workers=n_workers) as _ex:
                     futures = {
                         _ex.submit(extract_monomer_from_pkl, m, cases_root, str(pdb_dir), quality_by_source): m.monomer_id
@@ -1377,6 +1383,7 @@ def _run_three_phase_clustering(
                         except Exception:
                             pass
             else:
+                LOGGER.info("[checkpoint] %d monomers to extract on single worker", len(_monomers_to_extract))
                 for m in _monomers_to_extract:
                     try:
                         ext = extract_monomer_from_pkl(m, cases_root, str(pdb_dir), quality_by_source)
@@ -1418,7 +1425,7 @@ def _run_three_phase_clustering(
     _group_payloads = [
         (seq_id, member_ids, [extracted_structures[mid] for mid in member_ids if mid in extracted_structures],
          [monomer_index[mid] for mid in member_ids if mid in extracted_structures],
-         min_alignment_coverage_ratio)
+         min_alignment_coverage_ratio, str(pdb_dir))
         for seq_id, member_ids in sorted(sequence_groups.items())
     ]
 

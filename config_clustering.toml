@@ -158,4 +158,4 @@ jobs = 8
 
 # Root logging level for clustering runs.
 # Options: "DEBUG", "INFO", "WARNING", "ERROR".
-log_level = "INFO"
+log_level = "DEBUG"

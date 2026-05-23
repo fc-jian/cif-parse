@@ -82,7 +82,7 @@ class AppSettings:
     metadata_table: str = ""
     coverage_mode: str = "nearest"
     debug: bool = False
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"
     verbose: bool = False
     model: int = 1
     use_author_fields: bool = False
@@ -187,7 +187,7 @@ class ClusteringSettings:
     mmseqs_threads: int | None = None
     sequence_cluster_jobs: int | None = None
     usalign_jobs: int | None = None
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"
 
     def __post_init__(self) -> None:
         self.outdir = Path(self.outdir)
@@ -257,7 +257,7 @@ def default_cli_config() -> dict[str, Any]:
             "metadata_table": "",
             "coverage_mode": "nearest",
             "debug": False,
-            "log_level": "INFO",
+            "log_level": "DEBUG",
             "verbose": False,
             "model": 1,
             "use_author_fields": False,
@@ -314,7 +314,7 @@ def default_cli_config() -> dict[str, Any]:
             "min_alignment_coverage_ratio": 0.80,
             "usalign_executable": "USalign",
             "jobs": _DEFAULT_JOB_COUNT,
-            "log_level": "INFO",
+            "log_level": "DEBUG",
         },
     }
 
