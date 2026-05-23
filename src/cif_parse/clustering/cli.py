@@ -580,21 +580,13 @@ def _run_structure(
     # Build direct pkl reader from parse atoms (primary coordinate source).
     pkl_reader = None
     if prep_dir:
-        atoms_base = getattr(args, "atoms_dir", None)
-        if not atoms_base:
-            for cand in [
-                Path(prep_dir).parent / "parsed" / "cases",
-                Path(prep_dir).parent.parent / "parsed" / "cases",
-            ]:
-                if cand.is_dir():
-                    atoms_base = str(cand)
-                    break
-        if atoms_base:
+        from cif_parse.clustering.atom_cache import (
+            resolve_parsed_case_dirs, build_source_to_atoms_map, PklAtomReader,
+        )
+        case_dirs = resolve_parsed_case_dirs(prep_dir)
+        if case_dirs:
             try:
-                from cif_parse.clustering.atom_cache import build_source_to_atoms_map, PklAtomReader
-                s2a = build_source_to_atoms_map(
-                    [str(d) for d in Path(atoms_base).iterdir() if d.is_dir()]
-                )
+                s2a = build_source_to_atoms_map(case_dirs)
                 if s2a:
                     pkl_reader = PklAtomReader(s2a)
             except Exception:

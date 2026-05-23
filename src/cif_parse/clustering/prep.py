@@ -968,6 +968,7 @@ def build_prep_database(
 
     manifest = {
         "prep_dir": str(prep_dir.resolve()),
+        "parsed_inputs": [str(Path(d).resolve()) for d in inputs],
         "total_cases": stats["total_cases"],
         "ingested": stats["ingested"],
         "skipped_no_bundles": stats["skipped_no_bundles"],

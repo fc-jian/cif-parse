@@ -1320,13 +1320,14 @@ def _run_three_phase_clustering(
     )
 
     tmp_root = get_fast_temp_dir("struct_cluster", fallback=outdir / "tmp")
+    LOGGER.info("[checkpoint] temp directory: %s", tmp_root)
     cache_db = AlignmentCacheDB(tmp_root / "tasks.db")
     pdb_dir = outdir / "pdbs"
     pdb_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Phase 1: extract + subcluster + generate tasks --------------------
-    LOGGER.info("Phase 1: extracting + generating alignment tasks for %d groups",
-                len(sequence_groups))
+    LOGGER.info("[checkpoint] Phase 1 start: %d sequence groups, %d monomers to extract",
+                len(sequence_groups), sum(len(v) for v in sequence_groups.values()))
 
     all_subcluster: dict[str, dict[str, str]] = {}  # seq_group → {member_id: rep_id}
     total_tasks = 0
@@ -1347,19 +1348,8 @@ def _run_three_phase_clustering(
     ]
     if _monomers_to_extract and prep_dir:
         # Build source_to_atoms map for pkl reader
-        source_to_atoms: dict[str, str] = {}
-        for cand in [
-            Path(prep_dir).parent / "parsed" / "cases",
-            Path(prep_dir).parent.parent / "parsed" / "cases",
-        ]:
-            if cand.is_dir():
-                from cif_parse.clustering.atom_cache import build_source_to_atoms_map
-                source_to_atoms = build_source_to_atoms_map(
-                    [str(d) for d in cand.iterdir() if d.is_dir()]
-                )
-                if source_to_atoms:
-                    break
-
+        from cif_parse.clustering.atom_cache import resolve_parsed_case_dirs, build_source_to_atoms_map
+        source_to_atoms: dict[str, str] = build_source_to_atoms_map(resolve_parsed_case_dirs(prep_dir))
         if source_to_atoms:
             n_workers = max(1, min(sequence_cluster_jobs, len(_monomers_to_extract)))
             if n_workers > 1 and len(_monomers_to_extract) > 1:
@@ -1387,6 +1377,11 @@ def _run_three_phase_clustering(
                         pass
         elif extract_fn is not None:
             # Fallback to closure-based extraction
+            LOGGER.warning(
+                "[fallback] No parse atoms directories found for %d monomers; "
+                "using closure-based extraction (slower, may be GIL-bound)",
+                len(_monomers_to_extract),
+            )
             from concurrent.futures import ThreadPoolExecutor as _TPE
             with _TPE(max_workers=max(1, min(sequence_cluster_jobs * 2, len(_monomers_to_extract)))) as _ex:
                 def _extract_one(m: Any) -> None:
@@ -1400,8 +1395,8 @@ def _run_three_phase_clustering(
 
     ext_success = sum(1 for mid in to_extract if mid in extracted_structures)
     ext_fail = len(to_extract) - ext_success
-    LOGGER.info("Phase 1 extraction: %d/%d monomers extracted (%d failures)",
-                ext_success, len(to_extract), ext_fail)
+    LOGGER.info("[checkpoint] Phase 1 extraction: %d/%d monomers (%d failures), source_to_atoms=%d entries",
+                ext_success, len(to_extract), ext_fail, len(source_to_atoms) if source_to_atoms else 0)
 
     # ---- Phase 1b: group subcluster + task generation (ProcessPool, CPU) ---
     task_rows: list[dict[str, Any]] = []
@@ -1441,6 +1436,7 @@ def _run_three_phase_clustering(
 
     # Batch insert tasks into SQLite + upsert cache entries
     if task_rows:
+        LOGGER.info("[checkpoint] Phase 1b: inserting %d tasks into SQLite", len(task_rows))
         cache_db.task_insert_many(task_rows)
         for t in task_rows:
             cache_db.cache_upsert_pending(
@@ -1460,8 +1456,9 @@ def _run_three_phase_clustering(
     pending_tasks = cache_db.task_get_pending()
     if pending_tasks:
         LOGGER.info(
-            "Phase 2: executing %d USalign tasks across %d workers",
+            "[checkpoint] Phase 2 start: %d USalign tasks, %d workers, %d cache hits, %d prefiltered",
             len(pending_tasks), pairwise_alignment_jobs,
+            cache_db.task_count_by_status().get("cached", 0), total_prefiltered,
         )
         from cif_parse.clustering.parallel import AlignmentTask
 
@@ -1526,7 +1523,8 @@ def _run_three_phase_clustering(
         )
 
     # ---- Phase 3: per-group greedy reconstruction --------------------------
-    LOGGER.info("Phase 3: reconstructing clusters for %d groups", len(cluster_order))
+    LOGGER.info("[checkpoint] Phase 3 start: %d groups, %d total members",
+                len(cluster_order), sum(len(sequence_groups[g[0]]) for g in cluster_order))
 
     alignment_rows: list[dict[str, Any]] = []
     membership_rows: list[dict[str, Any]] = []

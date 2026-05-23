@@ -27,6 +27,7 @@ def _load_pkl_bytes(path: str) -> bytes | None:
     try:
         return zlib.decompress(Path(path).read_bytes())
     except Exception:
+        LOGGER.warning("[fallback] Failed to read/decompress pkl: %s", path)
         return None
 
 
@@ -118,6 +119,51 @@ class PklAtomReader:
         self.load_assembly(source_path, assembly_id)
 
 
+def resolve_parsed_case_dirs(prep_dir: str | Path) -> list[str]:
+    """Find parsed case directories from prep manifest ``parsed_inputs`` field."""
+    import json as _json
+    manifest = Path(prep_dir) / "manifest.json"
+    if not manifest.exists():
+        raise FileNotFoundError(
+            f"Prep manifest not found at {manifest}. "
+            f"Run `cif-parse-cluster prep` first to build the prep database."
+        )
+    try:
+        data = _json.loads(manifest.read_text(encoding="utf-8"))
+        inputs = data.get("parsed_inputs")
+        if not inputs:
+            raise ValueError(
+                f"Prep manifest at {manifest} has no 'parsed_inputs'. "
+                f"Rebuild prep with the current version of cif-parse-cluster."
+            )
+        # Expand: each input may be a parent dir containing case subdirs
+        case_dirs: list[str] = []
+        for inp in inputs:
+            p = Path(inp)
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"Parsed input not found: {p}. "
+                    f"Ensure parse output is available at the path recorded by prep."
+                )
+            if p.is_dir():
+                children = [d for d in p.iterdir() if d.is_dir()]
+                if any((d / "atoms").is_dir() for d in children):
+                    case_dirs.extend(str(d) for d in children if (d / "atoms").is_dir())
+                elif (p / "atoms").is_dir():
+                    case_dirs.append(str(p))
+                else:
+                    case_dirs.extend(str(d) for d in children if d.is_dir())
+            else:
+                case_dirs.append(str(p))
+        if not case_dirs:
+            raise FileNotFoundError(
+                f"No case directories with atoms/ found under parsed_inputs: {inputs}"
+            )
+        return case_dirs
+    except (json.JSONDecodeError, KeyError) as e:
+        raise ValueError(f"Invalid prep manifest at {manifest}: {e}") from e
+
+
 def build_source_to_atoms_map(
     case_dirs: list[str | Path],
 ) -> dict[str, str]:
@@ -127,7 +173,6 @@ def build_source_to_atoms_map(
         atoms = Path(case_dir) / "atoms"
         if not atoms.is_dir():
             continue
-        # Find result bundles to extract source_path
         for bundle_path in sorted(Path(case_dir).glob("result*.json.gz")):
             try:
                 import gzip as _gz, json as _json
