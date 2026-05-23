@@ -1398,9 +1398,8 @@ def _run_three_phase_clustering(
         AlignmentCacheDB, alignment_cache_key, get_fast_temp_dir,
     )
 
-    tmp_root = get_fast_temp_dir("struct_cluster", fallback=outdir / "tmp")
-    LOGGER.info("[checkpoint] temp directory: %s", tmp_root)
-    cache_db = AlignmentCacheDB(tmp_root / "tasks.db")
+    cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
+    LOGGER.info("[checkpoint] SQLite db: %s", outdir / "usalign_tasks.db")
     pdb_dir = outdir / "pdbs"
     pdb_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1429,7 +1428,9 @@ def _run_three_phase_clustering(
     except Exception:
         LOGGER.debug("[fallback] Failed to load entry quality metadata", exc_info=True)
 
-    # Build picklable payloads: (seq_id, member_ids, [monomer_dicts], cases_root, pdb_dir, min_cov)
+    # ---- Phase 1: per-group ProcessPool (extract + subcluster + PDB + tasks) ---
+    # Build picklable payloads, sorted largest-first to minimize long tail.
+    # Each worker is fully self-contained for one sequence group.
     _group_payloads = [
         (seq_id, member_ids,
          [asdict(monomer_index[mid]) for mid in member_ids if mid in monomer_index],
@@ -1445,6 +1446,9 @@ def _run_three_phase_clustering(
     ext_success = 0
     ext_fail = 0
 
+    # Sort largest groups first to minimize ProcessPool long tail
+    _group_payloads.sort(key=lambda g: -len(g[1]))
+
     n_workers = max(1, min(sequence_cluster_jobs, len(_group_payloads))) if sequence_cluster_jobs > 1 else 1
     if n_workers > 1 and len(_group_payloads) > 1:
         from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
@@ -1454,21 +1458,22 @@ def _run_three_phase_clustering(
                 r = f.result()
                 cluster_order.append((r["cluster_id"], len(cluster_order)))
                 all_subcluster[r["cluster_id"]] = r["subcluster"]
-                task_rows.extend(r["tasks"])
                 total_prefiltered += r.get("prefiltered", 0)
-                total_tasks += len(r["tasks"])
                 for mid, ext in r.get("extracted", {}).items():
                     extracted_structures[mid] = ext
+                local_tasks = r["tasks"]
+                total_tasks += len(local_tasks)
+                task_rows.extend(local_tasks)
     else:
         for g in tqdm(_group_payloads, desc="Phase 1 (extract+subcluster)", unit="group"):
             r = _process_one_group_worker(g)
             cluster_order.append((r["cluster_id"], len(cluster_order)))
             all_subcluster[r["cluster_id"]] = r["subcluster"]
-            task_rows.extend(r["tasks"])
             total_prefiltered += r.get("prefiltered", 0)
-            total_tasks += len(r["tasks"])
             for mid, ext in r.get("extracted", {}).items():
                 extracted_structures[mid] = ext
+            task_rows.extend(r["tasks"])
+            total_tasks += len(r["tasks"])
 
     ext_success = sum(1 for mid in to_extract if mid in extracted_structures)
     ext_fail = len(to_extract) - ext_success
@@ -1477,30 +1482,18 @@ def _run_three_phase_clustering(
 
     # Batch insert tasks into SQLite + upsert cache entries
     if task_rows:
-        LOGGER.info("[checkpoint] Phase 1b: inserting %d tasks into SQLite", len(task_rows))
         cache_db.task_insert_many(task_rows)
         for t in tqdm(task_rows, desc="Phase 1b (cache upsert)", unit="task"):
             cache_db.cache_upsert_pending(
-                t["cache_key"],
-                seq_hash_query="",
-                seq_hash_target="",
-                source_query="",
-                source_target="",
+                t["cache_key"], seq_hash_query="", seq_hash_target="",
+                source_query="", source_target="",
             )
-
-    LOGGER.info(
-        "Phase 1 complete: %d tasks generated, %d cache hits, %d prefiltered",
-        total_tasks, total_cached, total_prefiltered,
-    )
 
     # ---- Phase 2: execute all pending USalign tasks globally ---------------
     pending_tasks = cache_db.task_get_pending()
     if pending_tasks:
-        LOGGER.info(
-            "[checkpoint] Phase 2 start: %d USalign tasks, %d workers, %d cache hits, %d prefiltered",
-            len(pending_tasks), pairwise_alignment_jobs,
-            cache_db.task_count_by_status().get("cached", 0), total_prefiltered,
-        )
+        LOGGER.info("[checkpoint] Phase 2 start: %d USalign tasks, %d workers",
+                    len(pending_tasks), pairwise_alignment_jobs)
         from cif_parse.clustering.parallel import AlignmentTask
 
         def _build_alignment_task(t: dict[str, Any]) -> AlignmentTask:
@@ -1508,25 +1501,12 @@ def _run_three_phase_clustering(
             tgt = extracted_structures.get(t["target_monomer_id"])
             if q is None or tgt is None:
                 raise ValueError(f"Missing structure for {t['query_monomer_id']} or {t['target_monomer_id']}")
-            return AlignmentTask(
-                key=t["cache_key"],
-                query=q,
-                target=tgt,
-                context={"task": t},
-            )
+            return AlignmentTask(key=t["cache_key"], query=q, target=tgt, context={"task": t})
 
-        # Sort by combined PDB size descending
         pending_tasks.sort(key=lambda t: -(t["query_pdb_size"] + t["target_pdb_size"]))
-
         batch_size = max(1, min(200, len(pending_tasks)))
-        all_successes: list[tuple[Any, Any]] = []
-        all_failures: list[tuple[Any, Exception]] = []
 
-        batch_count = (len(pending_tasks) + batch_size - 1) // batch_size
-        batch_iter = range(0, len(pending_tasks), batch_size)
-        if batch_count > 1:
-            batch_iter = tqdm(batch_iter, total=batch_count, desc="Phase 2 (USalign)", unit="batch")
-        for i in batch_iter:
+        for i in tqdm(range(0, len(pending_tasks), batch_size), desc="Phase 2 (USalign)", unit="batch"):
             batch = pending_tasks[i:i + batch_size]
             align_tasks = [_build_alignment_task(t) for t in batch]
             successes, failures = run_alignment_tasks(
@@ -1535,37 +1515,25 @@ def _run_three_phase_clustering(
                 usalign_executable=usalign_executable,
                 tm_score_threshold=tm_score_threshold,
             )
-            all_successes.extend(successes)
-            all_failures.extend(failures)
-
-            # Write results back to cache + update task status by task_id
-            done_task_ids: list[int] = []
+            done_ids: list[int] = []
             for task, result in successes:
                 cache_db.cache_write_result(task.key, {
-                    "tm_score_query": result.tm_score_query,
-                    "tm_score_target": result.tm_score_target,
-                    "tm_score_max": result.max_tm_score,
-                    "rmsd": result.rmsd,
+                    "tm_score_query": result.tm_score_query, "tm_score_target": result.tm_score_target,
+                    "tm_score_max": result.max_tm_score, "rmsd": result.rmsd,
                     "aligned_length": result.aligned_length,
                     "shorter_length_coverage": result.shorter_length_coverage,
                     "resolved_length_coverage": result.resolved_length_coverage,
                 })
                 tid = task.context.get("task", {}).get("task_id")
-                if tid is not None:
-                    done_task_ids.append(int(tid))
+                if tid is not None: done_ids.append(int(tid))
             for task, exc in failures:
                 cache_db.cache_write_error(task.key, str(exc))
                 tid = task.context.get("task", {}).get("task_id")
-                if tid is not None:
-                    done_task_ids.append(int(tid))
+                if tid is not None: done_ids.append(int(tid))
+            if done_ids:
+                cache_db.task_status_batch_update(done_ids, "completed")
 
-            if done_task_ids:
-                cache_db.task_status_batch_update(done_task_ids, "completed")
-
-        LOGGER.info(
-            "Phase 2 complete: %d successes, %d failures",
-            len(all_successes), len(all_failures),
-        )
+        LOGGER.info("Phase 2 complete: %d tasks", len(pending_tasks))
 
     # ---- Phase 3: per-group greedy reconstruction --------------------------
     LOGGER.info("[checkpoint] Phase 3 start: %d groups, %d total members",
@@ -1791,13 +1759,7 @@ def _run_three_phase_clustering(
                     "alignment_coverage_shorter": "", "alignment_coverage_resolved": "",
                 })
 
-    # Cleanup
     cache_db.close()
-    import shutil as _shutil
-    try:
-        _shutil.rmtree(tmp_root, ignore_errors=True)
-    except Exception:
-        pass
 
     manifest = {
         "num_sequence_groups": len(sequence_groups),
