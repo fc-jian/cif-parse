@@ -1227,9 +1227,15 @@ def _process_one_group_worker(
     5. Returns task list, subcluster map, and extracted structures
     """
     (seq_cluster_id, member_ids, monomers_data, cases_root,
-     pdb_dir, min_cov) = payload
+     pdb_dir, min_cov) = payload[:6]
+    _quality_dict_ser = payload[6] if len(payload) > 6 else {}
     pdb_dir = Path(pdb_dir)
     pdb_dir.mkdir(parents=True, exist_ok=True)
+
+    # Reconstruct quality metadata
+    quality_by_source: dict[str, EntryQualityMetadata] = {}
+    for k, v in _quality_dict_ser.items():
+        quality_by_source[k] = EntryQualityMetadata(**v)
 
     # Reconstruct monomers from picklable data
     monomer_map: dict[str, MonomerSample] = {}
@@ -1244,6 +1250,7 @@ def _process_one_group_worker(
     # Extract chains for all monomers in this group
     extracted: dict[str, ExtractedMonomerStructure] = {}
     extracted_list: list[ExtractedMonomerStructure] = []
+    _chain_atoms_for_pdb: dict[str, Any] = {}
     for mid in member_ids:
         monomer = monomer_map.get(mid)
         if monomer is None:
@@ -1270,24 +1277,19 @@ def _process_one_group_worker(
         if resolved_count <= 2:
             continue
 
-        asm_tag = monomer.assembly_id or "na"
-        pdb_path = pdb_dir / f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}.pdb"
-        _coerced = chain_atoms.copy()
-        _coerced.chain_id[:] = "A"
-        pdb_file = PDBFile()
-        pdb_file.set_structure(_coerced)
-        pdb_file.write(pdb_path)
+        # Store chain atoms for later PDB write (only for subcluster reps).
+        _chain_atoms_for_pdb[mid] = chain_atoms.copy()
 
         ext = ExtractedMonomerStructure(
             monomer_id=monomer.monomer_id,
             pdb_id=monomer.pdb_id, label_asym_id=monomer.label_asym_id,
             auth_asym_id=monomer.auth_asym_id, source_path=monomer.source_path,
-            extracted_pdb_path=str(pdb_path), sequence_length=monomer.length,
+            extracted_pdb_path="", sequence_length=monomer.length,
             residue_count=monomer.residue_count, resolved_residue_count=resolved_count,
             resolved_fraction=resolved_count / max(1, monomer.residue_count),
             atom_count=int(chain_atoms.array_length()),
             filter_counts=atom_array_filter_counts(filter_counts),
-            quality=_default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
+            quality=quality_by_source.get(monomer.source_path) or _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
         )
         extracted[mid] = ext
         extracted_list.append(ext)
@@ -1313,6 +1315,17 @@ def _process_one_group_worker(
         candidates.append(rep)
         for m in members:
             subcluster_rep[m.monomer_id] = rep.monomer_id
+        # Write PDB only for the representative
+        chain_aa = _chain_atoms_for_pdb.get(rep.monomer_id)
+        if chain_aa is not None and not rep.extracted_pdb_path:
+            asm_tag = monomer_map[rep.monomer_id].assembly_id or "na"
+            pdb_path = pdb_dir / f"{rep.pdb_id}_{asm_tag}_{rep.label_asym_id}.pdb"
+            _coerced = chain_aa.copy()
+            _coerced.chain_id[:] = "A"
+            pdb_file = PDBFile()
+            pdb_file.set_structure(_coerced)
+            pdb_file.write(pdb_path)
+            rep.extracted_pdb_path = str(pdb_path)
 
     # Greedy round enumeration
     local_tasks = []
@@ -1434,7 +1447,8 @@ def _run_three_phase_clustering(
     _group_payloads = [
         (seq_id, member_ids,
          [asdict(monomer_index[mid]) for mid in member_ids if mid in monomer_index],
-         cases_root, str(pdb_dir), min_alignment_coverage_ratio)
+         cases_root, str(pdb_dir), min_alignment_coverage_ratio,
+         {k: asdict(v) for k, v in quality_by_source.items()})
         for seq_id, member_ids in sorted(sequence_groups.items())
     ]
 
