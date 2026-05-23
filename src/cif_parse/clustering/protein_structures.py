@@ -242,16 +242,26 @@ def extract_monomer_from_pkl(
     if resolved_count <= 2:
         return None
 
+    # Write PDB file (needed by USalign)
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+    asm_tag = monomer.assembly_id or "na"
+    pdb_path = outdir_path / f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}.pdb"
+    _coerced = chain_atoms.copy()
+    _coerced.chain_id[:] = "A"
+    pdb_file = PDBFile()
+    pdb_file.set_structure(_coerced)
+    pdb_file.write(pdb_path)
+
     quality = (quality_by_source or {}).get(
         monomer.source_path,
         _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
     )
 
-    # PDB file written lazily in Phase 1b (only for subcluster representatives)
     return ExtractedMonomerStructure(
         monomer_id=monomer.monomer_id,
         pdb_id=monomer.pdb_id, label_asym_id=monomer.label_asym_id, auth_asym_id=monomer.auth_asym_id,
-        source_path=monomer.source_path, extracted_pdb_path="",
+        source_path=monomer.source_path, extracted_pdb_path=str(pdb_path),
         sequence_length=monomer.length, residue_count=monomer.residue_count,
         resolved_residue_count=resolved_count,
         resolved_fraction=resolved_count / max(1, monomer.residue_count),
@@ -301,7 +311,8 @@ def extract_protein_monomer_structure(
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    pdb_path = outdir / f"{monomer.pdb_id}_{monomer.label_asym_id}.pdb"
+    asm_tag = monomer.assembly_id or "na"
+    pdb_path = outdir / f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}.pdb"
     pdb_file = PDBFile()
     pdb_file.set_structure(chain_atoms)
     pdb_file.write(pdb_path)
@@ -1203,32 +1214,93 @@ def greedy_cluster_protein_structures(
     }
 
 
-def _write_monomer_pdb(structure: ExtractedMonomerStructure, outdir: Path) -> str:
-    """Write a single-chain PDB and return the path."""
-    outdir.mkdir(parents=True, exist_ok=True)
-    pdb_path = outdir / f"{structure.pdb_id}_{structure.label_asym_id}.pdb"
-    pdb_file = PDBFile()
-    pdb_file.set_structure(structure)
-    pdb_file.write(pdb_path)
-    return str(pdb_path)
-
-
 def _process_one_group_worker(
     payload: tuple,
 ) -> dict[str, Any]:
-    """Module-level worker for ProcessPool: subcluster + task generation."""
-    seq_cluster_id, member_ids, structures, monomers, min_cov = payload if len(payload) > 4 else (*payload, 0.80)
-    if not structures:
-        return {"cluster_id": seq_cluster_id, "tasks": [], "subcluster": {}, "prefiltered": 0}
+    """Module-level ProcessPool worker: extract chains + subcluster + PDB + tasks.
 
-    candidates = sorted(structures, key=lambda item: item.quality_sort_key())
-    if not candidates:
-        return {"cluster_id": seq_cluster_id, "tasks": [], "subcluster": {}, "prefiltered": 0}
+    Each worker is fully self-contained for one sequence group:
+    1. Reads pkl files for monomers in the group
+    2. Extracts chains, writes PDBs for subcluster representatives
+    3. Subclusters by exact sequence
+    4. Enumerates greedy USalign tasks
+    5. Returns task list, subcluster map, and extracted structures
+    """
+    (seq_cluster_id, member_ids, monomers_data, cases_root,
+     pdb_dir, min_cov) = payload
+    pdb_dir = Path(pdb_dir)
+    pdb_dir.mkdir(parents=True, exist_ok=True)
 
-    monomer_map = {m.monomer_id: m for m in monomers}
+    # Reconstruct monomers from picklable data
+    monomer_map: dict[str, MonomerSample] = {}
+    for md in monomers_data:
+        m = MonomerSample(**md)
+        monomer_map[m.monomer_id] = m
+
+    # Build per-worker PklAtomReader
+    from cif_parse.clustering.atom_cache import PklAtomReader
+    reader = PklAtomReader(cases_root)
+
+    # Extract chains for all monomers in this group
+    extracted: dict[str, ExtractedMonomerStructure] = {}
+    extracted_list: list[ExtractedMonomerStructure] = []
+    for mid in member_ids:
+        monomer = monomer_map.get(mid)
+        if monomer is None:
+            continue
+        chain_atoms = None
+        for aid in (monomer.assembly_id, None):
+            if not aid:
+                continue
+            chain_atoms = reader.load_chain(monomer.source_path, monomer.label_asym_id, str(aid))
+            if chain_atoms is not None:
+                break
+        if chain_atoms is None:
+            chain_atoms = reader.load_chain(monomer.source_path, monomer.label_asym_id, None)
+        if chain_atoms is None or chain_atoms.array_length() == 0:
+            continue
+
+        chain_atoms, filter_counts = filter_atom_array_for_analysis(
+            chain_atoms, drop_hydrogens=True, drop_nonfinite=True,
+        )
+        if chain_atoms.array_length() == 0:
+            continue
+        _, residue_names = get_residues(chain_atoms)
+        resolved_count = int(len(residue_names))
+        if resolved_count <= 2:
+            continue
+
+        asm_tag = monomer.assembly_id or "na"
+        pdb_path = pdb_dir / f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}.pdb"
+        _coerced = chain_atoms.copy()
+        _coerced.chain_id[:] = "A"
+        pdb_file = PDBFile()
+        pdb_file.set_structure(_coerced)
+        pdb_file.write(pdb_path)
+
+        ext = ExtractedMonomerStructure(
+            monomer_id=monomer.monomer_id,
+            pdb_id=monomer.pdb_id, label_asym_id=monomer.label_asym_id,
+            auth_asym_id=monomer.auth_asym_id, source_path=monomer.source_path,
+            extracted_pdb_path=str(pdb_path), sequence_length=monomer.length,
+            residue_count=monomer.residue_count, resolved_residue_count=resolved_count,
+            resolved_fraction=resolved_count / max(1, monomer.residue_count),
+            atom_count=int(chain_atoms.array_length()),
+            filter_counts=atom_array_filter_counts(filter_counts),
+            quality=_default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
+        )
+        extracted[mid] = ext
+        extracted_list.append(ext)
+
+    if not extracted_list:
+        return {
+            "cluster_id": seq_cluster_id, "tasks": [], "subcluster": {},
+            "prefiltered": 0, "extracted": {},
+        }
+
+    candidates = sorted(extracted_list, key=lambda item: item.quality_sort_key())
 
     # Subcluster by exact sequence
-    pdb_dir = Path(payload[5]) if len(payload) > 5 else Path(".")
     subcluster_rep: dict[str, str] = {}
     from collections import defaultdict as _dd
     seq_groups: dict[str, list[Any]] = _dd(list)
@@ -1241,8 +1313,6 @@ def _process_one_group_worker(
         candidates.append(rep)
         for m in members:
             subcluster_rep[m.monomer_id] = rep.monomer_id
-        # Write PDB only for the representative (needed for USalign)
-        rep.extracted_pdb_path = rep.extracted_pdb_path or _write_monomer_pdb(rep, pdb_dir)
 
     # Greedy round enumeration
     local_tasks = []
@@ -1271,8 +1341,8 @@ def _process_one_group_worker(
                 source_target=candidate.source_path,
             )
 
-            qp = rep.extracted_pdb_path if hasattr(rep, 'extracted_pdb_path') and rep.extracted_pdb_path else ""
-            tp = candidate.extracted_pdb_path if hasattr(candidate, 'extracted_pdb_path') and candidate.extracted_pdb_path else ""
+            qp = rep.extracted_pdb_path or ""
+            tp = candidate.extracted_pdb_path or ""
             qsz = _Path(qp).stat().st_size if qp and _Path(qp).exists() else rep.residue_count * 100
             tsz = _Path(tp).stat().st_size if tp and _Path(tp).exists() else candidate.residue_count * 100
 
@@ -1295,6 +1365,7 @@ def _process_one_group_worker(
         "tasks": local_tasks,
         "subcluster": subcluster_rep,
         "prefiltered": local_prefiltered,
+        "extracted": extracted,
     }
 
 
@@ -1347,114 +1418,68 @@ def _run_three_phase_clustering(
     for member_ids in sequence_groups.values():
         to_extract.update(member_ids)
 
-    # ---- Phase 1: ProcessPool extraction from atoms pkl --------------------
-    ext_success = 0
-    ext_fail = 0
-    _monomers_to_extract = [
-        monomer_index[mid] for mid in sorted(to_extract)
-        if mid in monomer_index and mid not in extracted_structures
+    # ---- Phase 1: per-group ProcessPool (extract + subcluster + PDB + tasks) ---
+    # Each worker is fully self-contained for one sequence group.
+    from cif_parse.clustering.atom_cache import resolve_cases_root
+    cases_root: str = str(resolve_cases_root(prep_dir)) if prep_dir else ""
+    # Load entry quality metadata for representative ranking
+    quality_by_source: dict[str, EntryQualityMetadata] = {}
+    try:
+        quality_by_source = load_entry_quality_metadata_from_prep(prep_dir)
+    except Exception:
+        LOGGER.debug("[fallback] Failed to load entry quality metadata", exc_info=True)
+
+    # Build picklable payloads: (seq_id, member_ids, [monomer_dicts], cases_root, pdb_dir, min_cov)
+    _group_payloads = [
+        (seq_id, member_ids,
+         [asdict(monomer_index[mid]) for mid in member_ids if mid in monomer_index],
+         cases_root, str(pdb_dir), min_alignment_coverage_ratio)
+        for seq_id, member_ids in sorted(sequence_groups.items())
     ]
-    if _monomers_to_extract and prep_dir:
-        # Build direct pkl reader from parsed cases root
-        from cif_parse.clustering.atom_cache import resolve_cases_root
-        cases_root: str = str(resolve_cases_root(prep_dir))
-        # Load entry quality metadata for representative ranking
-        quality_by_source: dict[str, EntryQualityMetadata] = {}
-        try:
-            quality_by_source = load_entry_quality_metadata_from_prep(prep_dir)
-        except Exception:
-            LOGGER.debug("[fallback] Failed to load entry quality metadata", exc_info=True)
-        if cases_root:
-            n_workers = max(1, min(sequence_cluster_jobs, len(_monomers_to_extract)))
-            if n_workers > 1 and len(_monomers_to_extract) > 1:
-                from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
-                LOGGER.info("[checkpoint] %d workers for %d monomers", n_workers, len(_monomers_to_extract))
-                with _PPE(max_workers=n_workers) as _ex:
-                    futures = {
-                        _ex.submit(extract_monomer_from_pkl, m, cases_root, str(pdb_dir), quality_by_source): m.monomer_id
-                        for m in _monomers_to_extract
-                    }
-                    for f in _ac(futures):
-                        mid = futures[f]
-                        try:
-                            ext = f.result()
-                            if ext is not None:
-                                extracted_structures[mid] = ext
-                        except Exception:
-                            pass
-            else:
-                LOGGER.info("[checkpoint] %d monomers to extract on single worker", len(_monomers_to_extract))
-                for m in _monomers_to_extract:
-                    try:
-                        ext = extract_monomer_from_pkl(m, cases_root, str(pdb_dir), quality_by_source)
-                        if ext is not None:
-                            extracted_structures[m.monomer_id] = ext
-                    except Exception:
-                        pass
-        elif extract_fn is not None:
-            # Fallback to closure-based extraction
-            LOGGER.warning(
-                "[fallback] No parse atoms directories found for %d monomers; "
-                "using closure-based extraction (slower, may be GIL-bound)",
-                len(_monomers_to_extract),
-            )
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-            with _TPE(max_workers=max(1, min(sequence_cluster_jobs * 2, len(_monomers_to_extract)))) as _ex:
-                def _extract_one(m: Any) -> None:
-                    try:
-                        ext = extract_fn(m)
-                        if ext is not None:
-                            extracted_structures[m.monomer_id] = ext
-                    except Exception:
-                        pass
-                list(_ex.map(_extract_one, _monomers_to_extract))
 
-    ext_success = sum(1 for mid in to_extract if mid in extracted_structures)
-    ext_fail = len(to_extract) - ext_success
-    LOGGER.info("[checkpoint] Phase 1 extraction: %d/%d monomers (%d failures), source_to_atoms=%d entries",
-                ext_success, len(to_extract), ext_fail, len(quality_by_source) if quality_by_source else 0)
-
-    # ---- Phase 1b: group subcluster + task generation (ProcessPool, CPU) ---
     task_rows: list[dict[str, Any]] = []
     cluster_order: list[tuple[str, int]] = []
     all_subcluster: dict[str, dict[str, str]] = {}
     total_tasks = 0
     total_prefiltered = 0
-
-    # Build picklable payloads for ProcessPool
-    _group_payloads = [
-        (seq_id, member_ids, [extracted_structures[mid] for mid in member_ids if mid in extracted_structures],
-         [monomer_index[mid] for mid in member_ids if mid in extracted_structures],
-         min_alignment_coverage_ratio, str(pdb_dir))
-        for seq_id, member_ids in sorted(sequence_groups.items())
-    ]
+    ext_success = 0
+    ext_fail = 0
 
     n_workers = max(1, min(sequence_cluster_jobs, len(_group_payloads))) if sequence_cluster_jobs > 1 else 1
     if n_workers > 1 and len(_group_payloads) > 1:
         from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
         with _PPE(max_workers=n_workers) as _gex:
             futures = {_gex.submit(_process_one_group_worker, g): i for i, g in enumerate(_group_payloads)}
-            for f in _ac(futures):
+            for f in tqdm(_ac(futures), total=len(futures), desc="Phase 1 (extract+subcluster)", unit="group"):
                 r = f.result()
                 cluster_order.append((r["cluster_id"], len(cluster_order)))
                 all_subcluster[r["cluster_id"]] = r["subcluster"]
                 task_rows.extend(r["tasks"])
                 total_prefiltered += r.get("prefiltered", 0)
                 total_tasks += len(r["tasks"])
+                for mid, ext in r.get("extracted", {}).items():
+                    extracted_structures[mid] = ext
     else:
-        for g in _group_payloads:
+        for g in tqdm(_group_payloads, desc="Phase 1 (extract+subcluster)", unit="group"):
             r = _process_one_group_worker(g)
             cluster_order.append((r["cluster_id"], len(cluster_order)))
             all_subcluster[r["cluster_id"]] = r["subcluster"]
             task_rows.extend(r["tasks"])
             total_prefiltered += r.get("prefiltered", 0)
             total_tasks += len(r["tasks"])
+            for mid, ext in r.get("extracted", {}).items():
+                extracted_structures[mid] = ext
+
+    ext_success = sum(1 for mid in to_extract if mid in extracted_structures)
+    ext_fail = len(to_extract) - ext_success
+    LOGGER.info("[checkpoint] Phase 1: %d/%d monomers extracted (%d failures), %d tasks",
+                ext_success, len(to_extract), ext_fail, total_tasks)
 
     # Batch insert tasks into SQLite + upsert cache entries
     if task_rows:
         LOGGER.info("[checkpoint] Phase 1b: inserting %d tasks into SQLite", len(task_rows))
         cache_db.task_insert_many(task_rows)
-        for t in task_rows:
+        for t in tqdm(task_rows, desc="Phase 1b (cache upsert)", unit="task"):
             cache_db.cache_upsert_pending(
                 t["cache_key"],
                 seq_hash_query="",
@@ -1497,7 +1522,11 @@ def _run_three_phase_clustering(
         all_successes: list[tuple[Any, Any]] = []
         all_failures: list[tuple[Any, Exception]] = []
 
-        for i in range(0, len(pending_tasks), batch_size):
+        batch_count = (len(pending_tasks) + batch_size - 1) // batch_size
+        batch_iter = range(0, len(pending_tasks), batch_size)
+        if batch_count > 1:
+            batch_iter = tqdm(batch_iter, total=batch_count, desc="Phase 2 (USalign)", unit="batch")
+        for i in batch_iter:
             batch = pending_tasks[i:i + batch_size]
             align_tasks = [_build_alignment_task(t) for t in batch]
             successes, failures = run_alignment_tasks(
@@ -1553,7 +1582,7 @@ def _run_three_phase_clustering(
     total_sequence_fallback = 0
     total_all_failure_collapses = 0
 
-    for seq_cluster_id, group_idx in cluster_order:
+    for seq_cluster_id, group_idx in tqdm(cluster_order, desc="Phase 3 (reconstruct)", unit="group"):
         member_ids = sequence_groups[seq_cluster_id]
         subcluster_rep = all_subcluster.get(seq_cluster_id, {})
         db_tasks = cache_db.tasks_for_group(seq_cluster_id)
@@ -1676,6 +1705,13 @@ def _run_three_phase_clustering(
             cluster_states.append({"rep": rep, "assigned": assigned, "scid": scid})
             pending = remaining
 
+        # Build rep→cluster_id mapping for subcluster expansion
+        rep_to_cluster: dict[str, str] = {}
+        for state in cluster_states:
+            scid = state["scid"]
+            for member in state["assigned"]:
+                rep_to_cluster[member.monomer_id] = scid
+
         # Write membership + representative rows
         for state in cluster_states:
             rep = state["rep"]
@@ -1712,14 +1748,15 @@ def _run_three_phase_clustering(
                     "alignment_coverage_resolved": cov_resolved,
                 })
 
-            # Expand subcluster members
+            # Expand subcluster members: follow each rep's cluster assignment
             if subcluster_rep:
                 for mid, rid in subcluster_rep.items():
-                    if rid == rep.monomer_id and mid != rep.monomer_id:
+                    assigned_cluster = rep_to_cluster.get(rid)
+                    if assigned_cluster and mid != rid:
                         membership_rows.append({
                             "polymer_class": "protein", "sequence_cluster_id": seq_cluster_id,
-                            "structure_cluster_id": scid,
-                            "representative_monomer_id": rep.monomer_id,
+                            "structure_cluster_id": assigned_cluster,
+                            "representative_monomer_id": rid,
                             "member_monomer_id": mid,
                             "assignment_reason": "identical_sequence_subcluster",
                             "tm_score_min": "", "tm_score_max": "", "tm_score_for_clustering": "",
@@ -1727,7 +1764,7 @@ def _run_three_phase_clustering(
                         })
 
             sub_extra = sum(1 for mid, rid in subcluster_rep.items()
-                            if rid == rep.monomer_id and mid != rep.monomer_id) if subcluster_rep else 0
+                            if mid != rid) if subcluster_rep else 0
             representative_rows.append({
                 "sequence_cluster_id": seq_cluster_id,
                 "structure_cluster_id": scid,

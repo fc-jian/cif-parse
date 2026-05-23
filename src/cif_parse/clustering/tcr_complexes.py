@@ -654,21 +654,24 @@ def extract_tcr_complex_structures(
     sorted_observations = sorted(observations, key=lambda item: item.complex_observation_id)
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
-    _prep_tcr_idx: dict | None = None
+    _pkl_reader = None
     if prep_dir:
-        from cif_parse.clustering.prep import load_cif_coords_index, assemble_atom_array_from_chains
-        _prep_tcr_idx = load_cif_coords_index(prep_dir)
+        from cif_parse.clustering.atom_cache import resolve_cases_root, PklAtomReader
+        try:
+            _pkl_reader = PklAtomReader(resolve_cases_root(prep_dir))
+        except Exception:
+            pass
 
     def _try_assemble_tcr(obs: TcrComplexObservation) -> AtomArray | None:
-        if _prep_tcr_idx is None:
+        if _pkl_reader is None:
             return None
         chain_ids = _structure_chain_ids(obs)
         if not chain_ids:
             return None
-        return assemble_atom_array_from_chains(
-            prep_dir, obs.source_path,
+        return _pkl_reader.load_chains(
+            obs.source_path,
             [(cid, None) for cid in chain_ids],
-            assembly_id=obs.assembly_id, index=_prep_tcr_idx,
+            assembly_id=obs.assembly_id,
         )
 
     def _process_one(observation: TcrComplexObservation) -> ExtractedTcrComplexStructure | None:

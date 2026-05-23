@@ -426,19 +426,22 @@ def extract_dimer_structures(
     sorted_observations = sorted(observations, key=lambda item: item.dimer_observation_id)
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
-    # Fast path: assemble dimer from per-chain blobs
-    _prep_cif_idx: dict | None = None
+    # Direct pkl reader (no prep blob index needed)
+    _pkl_reader = None
     if prep_dir:
-        from cif_parse.clustering.prep import load_cif_coords_index, assemble_atom_array_from_chains
-        _prep_cif_idx = load_cif_coords_index(prep_dir)
+        from cif_parse.clustering.atom_cache import resolve_cases_root, PklAtomReader
+        try:
+            _pkl_reader = PklAtomReader(resolve_cases_root(prep_dir))
+        except Exception:
+            pass
 
     def _try_assemble_from_chains(obs: DimerObservation) -> AtomArray | None:
-        if _prep_cif_idx is None:
+        if _pkl_reader is None:
             return None
-        return assemble_atom_array_from_chains(
-            prep_dir, obs.source_path,
+        return _pkl_reader.load_chains(
+            obs.source_path,
             [(obs.label_asym_id_1, obs.sym_id_1), (obs.label_asym_id_2, obs.sym_id_2)],
-            assembly_id=obs.assembly_id, index=_prep_cif_idx,
+            assembly_id=obs.assembly_id,
         )
 
     if extraction_jobs <= 1 or len(sorted_observations) <= 1:

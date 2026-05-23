@@ -472,13 +472,16 @@ def extract_multimer_structures(
     sorted_observations = sorted(observations, key=lambda item: item.multimer_observation_id)
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
-    _prep_m_idx: dict | None = None
+    _pkl_reader = None
     if prep_dir:
-        from cif_parse.clustering.prep import load_cif_coords_index, assemble_atom_array_from_chains
-        _prep_m_idx = load_cif_coords_index(prep_dir)
+        from cif_parse.clustering.atom_cache import resolve_cases_root, PklAtomReader
+        try:
+            _pkl_reader = PklAtomReader(resolve_cases_root(prep_dir))
+        except Exception:
+            pass
 
     def _try_assemble_multimer(obs: MultimerObservation) -> AtomArray | None:
-        if _prep_m_idx is None:
+        if _pkl_reader is None:
             return None
         chain_specs = []
         for inst in obs.member_instances:
@@ -500,9 +503,9 @@ def extract_multimer_structures(
             chain_specs.append((lbl, sym_id))
         if not chain_specs:
             return None
-        return assemble_atom_array_from_chains(
-            prep_dir, obs.source_path, chain_specs,
-            assembly_id=obs.assembly_id, index=_prep_m_idx,
+        return _pkl_reader.load_chains(
+            obs.source_path, chain_specs,
+            assembly_id=obs.assembly_id,
         )
 
     def _load_chain_ops_only(observation: MultimerObservation) -> dict[str, list[str]]:
