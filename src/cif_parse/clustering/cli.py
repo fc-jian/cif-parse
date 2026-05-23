@@ -577,6 +577,29 @@ def _run_structure(
         args.sequence_cluster_jobs,
     )
 
+    # Build direct pkl reader from parse atoms (primary coordinate source).
+    pkl_reader = None
+    if prep_dir:
+        atoms_base = getattr(args, "atoms_dir", None)
+        if not atoms_base:
+            for cand in [
+                Path(prep_dir).parent / "parsed" / "cases",
+                Path(prep_dir).parent.parent / "parsed" / "cases",
+            ]:
+                if cand.is_dir():
+                    atoms_base = str(cand)
+                    break
+        if atoms_base:
+            try:
+                from cif_parse.clustering.atom_cache import build_source_to_atoms_map, PklAtomReader
+                s2a = build_source_to_atoms_map(
+                    [str(d) for d in Path(atoms_base).iterdir() if d.is_dir()]
+                )
+                if s2a:
+                    pkl_reader = PklAtomReader(s2a)
+            except Exception:
+                pass
+
     cif_idx_for_pipeline: dict | None = None
     if prep_dir:
         from cif_parse.clustering.prep import load_cif_coords_index
@@ -601,46 +624,50 @@ def _run_structure(
             need_atoms = atom_key not in atom_array_cache
             need_quality = monomer.source_path not in quality_cache
 
-        if need_atoms and cif_idx_for_pipeline is not None:
-            from cif_parse.clustering.prep import load_chain_atoms, load_cif_from_prep
-
+        if need_atoms:
             found = None
-            for aid in (monomer.assembly_id, None):
-                if not aid:
-                    continue
-                candidate = load_chain_atoms(
-                    prep_dir,
-                    monomer.source_path,
-                    monomer.label_asym_id,
-                    assembly_id=str(aid),
-                    index=cif_idx_for_pipeline,
-                )
-                if candidate is not None:
-                    found = candidate
-                    break
-            if found is None:
-                candidate = load_chain_atoms(
-                    prep_dir,
-                    monomer.source_path,
-                    monomer.label_asym_id,
-                    assembly_id=None,
-                    index=cif_idx_for_pipeline,
-                )
-                if candidate is not None:
-                    found = candidate
-            if found is None:
+            # Primary: direct pkl reader from parse atoms
+            if pkl_reader is not None:
                 for aid in (monomer.assembly_id, None):
                     if not aid:
                         continue
-                    candidate = load_cif_from_prep(
-                        prep_dir,
-                        monomer.source_path,
-                        str(aid),
-                        index=cif_idx_for_pipeline,
+                    found = pkl_reader.load_chain(
+                        monomer.source_path, monomer.label_asym_id, str(aid),
                     )
-                    if candidate is not None and candidate.get("atom_array") is not None:
-                        found = candidate["atom_array"]
+                    if found is not None:
                         break
+                if found is None:
+                    found = pkl_reader.load_chain(
+                        monomer.source_path, monomer.label_asym_id, None,
+                    )
+            # Fallback: prep cif_coords blob index
+            if found is None and cif_idx_for_pipeline is not None:
+                from cif_parse.clustering.prep import load_chain_atoms, load_cif_from_prep
+                for aid in (monomer.assembly_id, None):
+                    if not aid:
+                        continue
+                    found = load_chain_atoms(
+                        prep_dir, monomer.source_path, monomer.label_asym_id,
+                        assembly_id=str(aid), index=cif_idx_for_pipeline,
+                    )
+                    if found is not None:
+                        break
+                if found is None:
+                    found = load_chain_atoms(
+                        prep_dir, monomer.source_path, monomer.label_asym_id,
+                        assembly_id=None, index=cif_idx_for_pipeline,
+                    )
+                if found is None:
+                    for aid in (monomer.assembly_id, None):
+                        if not aid:
+                            continue
+                        ca = load_cif_from_prep(
+                            prep_dir, monomer.source_path, str(aid),
+                            index=cif_idx_for_pipeline,
+                        )
+                        if ca is not None and ca.get("atom_array") is not None:
+                            found = ca["atom_array"]
+                            break
             if found is not None:
                 with extract_lock:
                     atom_array_cache[atom_key] = found
@@ -684,6 +711,8 @@ def _run_structure(
         pairwise_alignment_jobs=args.usalign_jobs,
         extract_fn=_pipeline_extract,
         protein_subcluster_by_sequence=args.protein_subcluster_by_sequence,
+        prep_dir=prep_dir,
+        cif_idx=cif_idx_for_pipeline,
     )
     manifest = result.get("manifest", {})
     LOGGER.info(

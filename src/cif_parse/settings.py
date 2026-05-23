@@ -35,17 +35,14 @@ def _resolve_fast_temp_root() -> Path | None:
 
     Precedence:
     1. ``CIF_PARSE_TMPDIR`` environment variable (explicit user choice).
-    2. ``/dev/shm`` on Linux (RAM-backed tmpfs).
-    3. ``$TMPDIR`` or ``/tmp`` if no RAM-backed option is available.
+    2. ``$TMPDIR`` or ``/tmp``.
+    3. Current directory as fallback.
     """
     env = os.environ.get("CIF_PARSE_TMPDIR")
     if env:
         p = Path(env)
         if p.is_dir() and os.access(p, os.W_OK):
             return p
-    shm = Path("/dev/shm")
-    if shm.is_dir() and os.access(shm, os.W_OK):
-        return shm
     for candidate in (os.environ.get("TMPDIR"), "/tmp"):
         if candidate:
             p = Path(candidate)
