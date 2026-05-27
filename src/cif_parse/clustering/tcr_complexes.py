@@ -845,6 +845,7 @@ def refine_tcr_complex_signature_clusters(
         tm_score_threshold=tm_score_threshold,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
+            and a.assembly_id == b.assembly_id
             and sorted(a.tcr_chain_ids) == sorted(b.tcr_chain_ids)
             and sorted(a.mhc_chain_ids) == sorted(b.mhc_chain_ids)
             and sorted(a.peptide_chain_ids) == sorted(b.peptide_chain_ids)

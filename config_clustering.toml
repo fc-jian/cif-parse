@@ -130,7 +130,7 @@ keep_hydrogens = false
 tm_score_threshold = 0.50
 
 # Minimum aligned-length / shorter resolved-structure length ratio for protein
-# monomer structure clustering.
+# structure clustering.
 # Allowed values: float in [0, 1].
 min_alignment_coverage_ratio = 0.50
 

@@ -619,6 +619,9 @@ def refine_dimer_signature_clusters(
         tm_score_threshold=tm_score_threshold,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
+            and a.assembly_id == b.assembly_id
+            and a.sym_id_1 == b.sym_id_1
+            and a.sym_id_2 == b.sym_id_2
             and {a.label_asym_id_1, a.label_asym_id_2} == {b.label_asym_id_1, b.label_asym_id_2}
         ),
     )

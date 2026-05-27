@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS phase1_tasks (
     round_num       INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'pending',
     -- 'pending' | 'cached' | 'prefiltered' | 'completed' | 'failed'
-    created_at      REAL NOT NULL
+    created_at      REAL NOT NULL,
+    UNIQUE(cache_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON phase1_tasks(status);
@@ -302,14 +303,28 @@ class AlignmentCacheDB:
         self._get_conn().commit()
         return len(rows)
 
+    def cache_get_completed_keys(self) -> set[str]:
+        """Return all cache_keys that have a completed USalign result."""
+        rows = self._get_conn().execute(
+            "SELECT cache_key FROM alignment_cache WHERE tm_score_max IS NOT NULL"
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def task_get_all_keys(self) -> set[str]:
+        """Return all cache_keys currently present in phase1_tasks."""
+        rows = self._get_conn().execute(
+            "SELECT cache_key FROM phase1_tasks"
+        ).fetchall()
+        return {r[0] for r in rows}
+
     # ------------------------------------------------------------------
     # phase 1 task storage
     # ------------------------------------------------------------------
 
     def task_insert_many(self, rows: list[dict[str, Any]]) -> None:
-        """Batch-insert alignment tasks for Phase 2."""
+        """Batch-insert alignment tasks for Phase 2 (idempotent)."""
         self._get_conn().executemany(
-            """INSERT INTO phase1_tasks
+            """INSERT OR IGNORE INTO phase1_tasks
                (cache_key, query_monomer_id, target_monomer_id, query_pdb_path,
                 target_pdb_path, query_residue_count, target_residue_count,
                 query_pdb_size, target_pdb_size, sequence_cluster_id,

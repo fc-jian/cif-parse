@@ -915,6 +915,7 @@ def refine_antibody_complex_signature_clusters(
         tm_score_threshold=tm_score_threshold,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
+            and a.assembly_id == b.assembly_id
             and sorted(a.antibody_chain_ids) == sorted(b.antibody_chain_ids)
             and sorted(a.antigen_chain_ids) == sorted(b.antigen_chain_ids)
         ),

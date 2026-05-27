@@ -749,6 +749,7 @@ def refine_multimer_signature_clusters(
         tm_score_threshold=tm_score_threshold,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
+            and a.assembly_id == b.assembly_id
             and sorted(a.member_chain_ids) == sorted(b.member_chain_ids)
         ),
     )

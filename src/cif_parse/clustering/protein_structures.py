@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from difflib import SequenceMatcher
 import json
 import logging
 import math
@@ -454,7 +453,21 @@ def _sequence_similarity_ratio(sequence_a: str, sequence_b: str) -> float:
         return 1.0
     if not sequence_a or not sequence_b:
         return 0.0
-    return float(SequenceMatcher(a=sequence_a, b=sequence_b).ratio())
+    try:
+        from biotite.sequence import ProteinSequence
+        from biotite.sequence.align import align_optimal, get_pairwise_sequence_identity
+        from biotite.sequence.align import SubstitutionMatrix
+
+        seq_a = ProteinSequence(sequence_a)
+        seq_b = ProteinSequence(sequence_b)
+        matrix = SubstitutionMatrix.std_protein_matrix()
+        alignments = align_optimal(seq_a, seq_b, matrix, gap_penalty=(-10, -1))
+        if not alignments:
+            return 0.0
+        identity = get_pairwise_sequence_identity(alignments[0], mode="shortest")
+        return float(identity[0, 1])
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def _protein_structure_cluster_id(sequence_cluster_id: str, local_cluster_index: int) -> str:
@@ -1272,14 +1285,60 @@ def _process_one_group_worker(
     from cif_parse.clustering.atom_cache import PklAtomReader
     reader = PklAtomReader(cases_root)
 
-    # Extract chains for all monomers in this group
+    # Extract chains for all monomers in this group.
+    # If a PDB already exists on disk, reuse it to avoid redundant atom
+    # extraction from the original coordinate source.
     extracted_list: list[ExtractedMonomerStructure] = []
     _chain_atoms_for_pdb: dict[str, Any] = {}
     _extract_info: dict[str, tuple] = {}
+    group_dir = pdb_dir / seq_cluster_id
+    group_dir.mkdir(parents=True, exist_ok=True)
     for mid in member_ids:
         monomer = monomer_map.get(mid)
         if monomer is None:
             continue
+
+        # Early PDB-existence check: skip atom extraction if PDB is present.
+        asm_tag = monomer.assembly_id or "na"
+        pdb_path = group_dir / f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}.pdb"
+        if pdb_path.exists() and pdb_path.stat().st_size > 0:
+            try:
+                _pdb_file = PDBFile.read(pdb_path)
+                _pdb_atoms = _pdb_file.get_structure(model=1)
+                _, _residue_names = get_residues(_pdb_atoms)
+                _resolved_count = int(len(_residue_names))
+                if _resolved_count > 2:
+                    _ext = ExtractedMonomerStructure(
+                        monomer_id=monomer.monomer_id,
+                        pdb_id=monomer.pdb_id, label_asym_id=monomer.label_asym_id,
+                        auth_asym_id=monomer.auth_asym_id, source_path=monomer.source_path,
+                        extracted_pdb_path=str(pdb_path), sequence_length=monomer.length,
+                        residue_count=monomer.residue_count,
+                        resolved_residue_count=_resolved_count,
+                        resolved_fraction=_resolved_count / max(1, monomer.residue_count),
+                        atom_count=int(_pdb_atoms.array_length()),
+                        filter_counts={},
+                        quality=quality_by_source.get(monomer.source_path)
+                        or _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
+                    )
+                    _extract_info[mid] = (
+                        _ext.resolved_fraction,
+                        _ext.quality.method_priority if _ext.quality else 99,
+                        _ext.quality.resolution if _ext.quality else None,
+                        _ext.residue_count,
+                        _ext.source_path,
+                        _ext.extracted_pdb_path,
+                        _ext.pdb_id,
+                        _ext.label_asym_id,
+                        _ext.auth_asym_id or "",
+                        _ext.atom_count,
+                        _ext.quality.primary_method if _ext.quality else None,
+                    )
+                    extracted_list.append(_ext)
+                    continue
+            except (OSError, ValueError):
+                pass
+
         chain_atoms = None
         for aid in (monomer.assembly_id, None):
             if not aid:
@@ -1377,18 +1436,24 @@ def _process_one_group_worker(
             subcluster_rep[m.monomer_id] = rep.monomer_id
         # Write PDB only for the representative, in a group subdirectory
         chain_aa = _chain_atoms_for_pdb.get(rep.monomer_id)
-        if chain_aa is not None and not rep.extracted_pdb_path:
-            group_dir = pdb_dir / seq_cluster_id
-            group_dir.mkdir(parents=True, exist_ok=True)
-            asm_tag = monomer_map[rep.monomer_id].assembly_id or "na"
-            pdb_path = group_dir / f"{rep.pdb_id}_{asm_tag}_{rep.label_asym_id}.pdb"
+        group_dir = pdb_dir / seq_cluster_id
+        group_dir.mkdir(parents=True, exist_ok=True)
+        asm_tag = monomer_map[rep.monomer_id].assembly_id or "na"
+        pdb_path = group_dir / f"{rep.pdb_id}_{asm_tag}_{rep.label_asym_id}.pdb"
+        if pdb_path.exists() and pdb_path.stat().st_size > 0:
+            rep.extracted_pdb_path = str(pdb_path)
+            prev = _extract_info.get(rep.monomer_id)
+            if prev is not None:
+                _extract_info[rep.monomer_id] = (prev[0], prev[1], prev[2], prev[3], prev[4],
+                                                  str(pdb_path), prev[6], prev[7], prev[8], prev[9],
+                                                  prev[10])
+        elif chain_aa is not None and not rep.extracted_pdb_path:
             _coerced = chain_aa.copy()
             _coerced.chain_id[:] = "A"
             pdb_file = PDBFile()
             pdb_file.set_structure(_coerced)
             pdb_file.write(pdb_path)
             rep.extracted_pdb_path = str(pdb_path)
-            # Update compact info with the actual PDB path
             prev = _extract_info.get(rep.monomer_id)
             if prev is not None:
                 _extract_info[rep.monomer_id] = (prev[0], prev[1], prev[2], prev[3], prev[4],
@@ -1397,7 +1462,6 @@ def _process_one_group_worker(
 
     # Greedy round enumeration
     local_tasks = []
-    local_prefiltered = 0
     pending = sorted(candidates, key=lambda item: item.quality_sort_key())
     round_num = 0
     from pathlib import Path as _Path
@@ -1407,12 +1471,6 @@ def _process_one_group_worker(
         rep = pending[0]
         round_num += 1
         for candidate in pending[1:]:
-            shorter = min(rep.resolved_residue_count, candidate.resolved_residue_count)
-            longer = max(rep.resolved_residue_count, candidate.resolved_residue_count)
-            if longer > 0 and shorter / longer < min_cov:
-                local_prefiltered += 1
-                continue
-
             rep_mono = monomer_map.get(rep.monomer_id)
             cand_mono = monomer_map.get(candidate.monomer_id)
             ck = alignment_cache_key(
@@ -1445,7 +1503,7 @@ def _process_one_group_worker(
         "cluster_id": seq_cluster_id,
         "tasks": local_tasks,
         "subcluster": subcluster_rep,
-        "prefiltered": local_prefiltered,
+        "prefiltered": 0,
         "extracted_info": _extract_info,
     }
 
@@ -1506,7 +1564,7 @@ def _run_three_phase_clustering(
     quality_by_source: dict[str, EntryQualityMetadata] = {}
     try:
         quality_by_source = load_entry_quality_metadata_from_prep(prep_dir)
-    except Exception:
+    except (FileNotFoundError, OSError, ValueError):
         LOGGER.debug("[fallback] Failed to load entry quality metadata", exc_info=True)
 
     # ---- Phase 1: per-group ProcessPool (extract + subcluster + PDB + tasks) ---
@@ -1587,11 +1645,22 @@ def _run_three_phase_clustering(
     # Reopen SQLite after fork
     cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
 
+    existing_completed_keys = cache_db.cache_get_completed_keys()
+    existing_task_keys = cache_db.task_get_all_keys()
+    new_task_rows = [
+        t for t in task_rows
+        if t["cache_key"] not in existing_completed_keys
+        and t["cache_key"] not in existing_task_keys
+    ]
+    skipped_tasks = len(task_rows) - len(new_task_rows)
+    if skipped_tasks:
+        LOGGER.info("[checkpoint] Phase 1: Skipped %d tasks already present in DB", skipped_tasks)
+
     # Batch insert tasks into SQLite + upsert cache entries
-    LOGGER.info("[checkpoint] Phase 1: Start insert %d tasks into SQLite", total_tasks)
-    if task_rows:
-        cache_db.task_insert_many(task_rows)
-        all_keys = [t["cache_key"] for t in task_rows]
+    LOGGER.info("[checkpoint] Phase 1: Start insert %d tasks into SQLite", len(new_task_rows))
+    if new_task_rows:
+        cache_db.task_insert_many(new_task_rows)
+        all_keys = [t["cache_key"] for t in new_task_rows]
         cache_db.cache_upsert_pending_many(all_keys)
 
     # ---- Phase 2: execute all pending USalign tasks globally ---------------
@@ -1839,13 +1908,15 @@ def _run_three_phase_clustering(
                             "alignment_coverage_shorter": "", "alignment_coverage_resolved": "",
                         })
 
-            sub_extra = sum(1 for mid, rid in subcluster_rep.items()
-                            if mid != rid) if subcluster_rep else 0
+            sub_extra = sum(
+                1 for mid, rid in subcluster_rep.items()
+                if rid == rep.monomer_id and mid != rid
+            ) if subcluster_rep else 0
             representative_rows.append({
                 "sequence_cluster_id": seq_cluster_id,
                 "structure_cluster_id": scid,
                 "representative_monomer_id": rep.monomer_id,
-                "num_members": len(state["assigned"]) + sub_extra,
+                "num_members": len(state["assigned"]) + sub_extra + (len(missing_ids) if state == cluster_states[0] else 0),
                 "pdb_id": rep.pdb_id, "label_asym_id": rep.label_asym_id,
                 "auth_asym_id": rep.auth_asym_id or "",
                 "resolved_fraction": rep.resolved_fraction,
