@@ -5,7 +5,6 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -188,78 +187,63 @@ def _observation(
     )
 
 
-def _write_pymol_pml(
+def _save_pymol_session_with_cmd(
+    cmd: Any,
     *,
-    pml_path: Path,
     full_pdb: Path,
     interface_pdb: Path,
     pse_path: Path,
 ) -> None:
-    full_pdb_text = json.dumps(full_pdb.as_posix())
-    interface_pdb_text = json.dumps(interface_pdb.as_posix())
-    pse_path_text = json.dumps(pse_path.as_posix())
-    pml_path.write_text(
-        "\n".join(
-            [
-                "reinitialize",
-                f"load {full_pdb_text}, full_dimer",
-                f"load {interface_pdb_text}, interface_residues",
-                "hide everything",
-                "show cartoon, full_dimer",
-                "show sticks, interface_residues",
-                "color gray70, full_dimer",
-                "color orange, interface_residues and chain A",
-                "color marine, interface_residues and chain B",
-                "set transparency, 0.65, full_dimer",
-                "zoom interface_residues",
-                f"save {pse_path_text}",
-                "quit",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    cmd.reinitialize()
+    cmd.load(str(full_pdb), "full_dimer")
+    cmd.load(str(interface_pdb), "interface_residues")
+    cmd.hide("everything")
+    cmd.show("cartoon", "full_dimer")
+    cmd.show("sticks", "interface_residues")
+    cmd.color("gray70", "full_dimer")
+    cmd.color("orange", "interface_residues and chain A")
+    cmd.color("marine", "interface_residues and chain B")
+    cmd.set("transparency", 0.65, "full_dimer")
+    cmd.zoom("interface_residues")
+    cmd.save(str(pse_path))
 
 
 def _build_pymol_session(
-    pml_path: Path,
     pse_path: Path,
     *,
     full_pdb: Path,
     interface_pdb: Path,
-    require_pymol: bool,
-) -> bool:
-    pymol_exe = shutil.which("pymol")
-    if pymol_exe is not None:
-        try:
-            subprocess.run([pymol_exe, "-cq", str(pml_path)], check=True)
-            return pse_path.exists()
-        except Exception as subprocess_exc:
-            if require_pymol:
-                raise RuntimeError(f"PyMOL executable session generation failed: {subprocess_exc}") from subprocess_exc
-
+) -> None:
     try:
         import pymol2  # type: ignore[import-not-found]
 
         with pymol2.PyMOL() as pymol:
-            cmd = pymol.cmd
-            cmd.reinitialize()
-            cmd.load(str(full_pdb), "full_dimer")
-            cmd.load(str(interface_pdb), "interface_residues")
-            cmd.hide("everything")
-            cmd.show("cartoon", "full_dimer")
-            cmd.show("sticks", "interface_residues")
-            cmd.color("gray70", "full_dimer")
-            cmd.color("orange", "interface_residues and chain A")
-            cmd.color("marine", "interface_residues and chain B")
-            cmd.set("transparency", 0.65, "full_dimer")
-            cmd.zoom("interface_residues")
-            cmd.save(str(pse_path))
-        return pse_path.exists()
-    except Exception as pymol2_exc:
-        if require_pymol:
-            raise RuntimeError("PyMOL is not available as pymol2 or pymol executable") from pymol2_exc
-        return False
+            _save_pymol_session_with_cmd(
+                pymol.cmd,
+                full_pdb=full_pdb,
+                interface_pdb=interface_pdb,
+                pse_path=pse_path,
+            )
+    except ImportError:
+        try:
+            import pymol  # type: ignore[import-not-found]
+            from pymol import cmd  # type: ignore[import-not-found]
+        except ImportError as import_exc:
+            raise RuntimeError("PyMOL Python API is required to write the PSE session") from import_exc
+
+        pymol.finish_launching(["pymol", "-qc"])
+        try:
+            _save_pymol_session_with_cmd(
+                cmd,
+                full_pdb=full_pdb,
+                interface_pdb=interface_pdb,
+                pse_path=pse_path,
+            )
+        finally:
+            cmd.quit()
+
+    if not pse_path.exists():
+        raise RuntimeError(f"PyMOL did not create the expected PSE file: {pse_path}")
 
 
 def build_visual_check(args: argparse.Namespace) -> dict[str, Any]:
@@ -332,14 +316,10 @@ def build_visual_check(args: argparse.Namespace) -> dict[str, Any]:
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
 
     pse_path = outdir / "dimer_interface_visual_check.pse"
-    pml_path = outdir / "make_dimer_interface_visual_check.pml"
-    _write_pymol_pml(pml_path=pml_path, full_pdb=full_pdb, interface_pdb=interface_pdb, pse_path=pse_path)
-    pse_created = _build_pymol_session(
-        pml_path,
+    _build_pymol_session(
         pse_path,
         full_pdb=full_pdb,
         interface_pdb=interface_pdb,
-        require_pymol=args.require_pymol,
     )
 
     summary = {
@@ -355,9 +335,7 @@ def build_visual_check(args: argparse.Namespace) -> dict[str, Any]:
         "full_dimer_pdb": str(full_pdb),
         "interface_residue_pdb": str(interface_pdb),
         "metrics_json": str(metrics_path),
-        "pymol_pml": str(pml_path),
-        "pymol_pse": str(pse_path) if pse_created else "",
-        "pymol_pse_created": bool(pse_created),
+        "pymol_pse": str(pse_path),
     }
     (outdir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, default=_json_default),
@@ -370,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Validate interaction between two CIF chains, extract the full dimer "
-            "and interface-residue dimer PDBs, and build a PyMOL PSE when PyMOL is available."
+            "and interface-residue dimer PDBs, and build a PyMOL PSE with the PyMOL cmd API."
         )
     )
     parser.add_argument("cif", type=Path, help="Input .cif/.cif.gz/.bcif file")
@@ -387,11 +365,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-atom-contacts", type=int, default=20)
     parser.add_argument("--interface-residue-cutoff", type=float, default=8.0)
     parser.add_argument("--keep-hydrogens", action="store_true")
-    parser.add_argument(
-        "--require-pymol",
-        action="store_true",
-        help="Fail if PyMOL is unavailable; otherwise write PDB/JSON/PML and skip PSE",
-    )
     return parser
 
 
