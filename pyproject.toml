@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=2.3,<3",
     "biopython>=1.85,<2",
     "pyhmmer>=0.11,<1",
+    "tqdm>=4.67,<5",
 ]
 
 [project.optional-dependencies]

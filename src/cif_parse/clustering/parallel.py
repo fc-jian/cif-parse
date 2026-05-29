@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
+from tqdm import tqdm
+
 # Global semaphore to cap total USalign subprocesses across ALL stages
 # (monomer, dimer, multimer, antibody, TCR).
 _global_usalign_semaphore: threading.BoundedSemaphore | None = None
@@ -51,6 +53,9 @@ def run_alignment_tasks(
     runner: Callable[..., Any],
     *,
     max_workers: int = 1,
+    show_progress: bool = True,
+    progress_desc: str | None = None,
+    progress_unit: str = "alignment",
     **runner_kwargs: Any,
 ) -> tuple[list[tuple[AlignmentTask, Any]], list[tuple[AlignmentTask, Exception]]]:
     """Run alignment tasks concurrently while preserving caller-managed result ordering."""
@@ -63,7 +68,13 @@ def run_alignment_tasks(
     if max_workers <= 1:
         successes: list[tuple[AlignmentTask, Any]] = []
         failures: list[tuple[AlignmentTask, Exception]] = []
-        for task in task_list:
+        task_iter = tqdm(
+            task_list,
+            desc=progress_desc or "Running alignments",
+            unit=progress_unit,
+            disable=not show_progress or len(task_list) < 2,
+        )
+        for task in task_iter:
             try:
                 successes.append((task, _semaphored_runner(runner, task.query, task.target, **runner_kwargs)))
             except Exception as exc:
@@ -77,7 +88,15 @@ def run_alignment_tasks(
             executor.submit(_semaphored_runner, runner, task.query, task.target, **runner_kwargs): task
             for task in task_list
         }
-        for future in as_completed(future_to_task):
+        future_iter = as_completed(future_to_task)
+        future_iter = tqdm(
+            future_iter,
+            total=len(future_to_task),
+            desc=progress_desc or "Running alignments",
+            unit=progress_unit,
+            disable=not show_progress or len(task_list) < 2,
+        )
+        for future in future_iter:
             task = future_to_task[future]
             try:
                 successes.append((task, future.result()))

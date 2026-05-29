@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
+from tqdm import tqdm
+
 from cif_parse.clustering.parallel import AlignmentTask, run_alignment_tasks
 from cif_parse.clustering.protein_structures import USalignAlignmentResult
 
@@ -80,6 +82,7 @@ def refine_signature_groups_greedy(
     usalign_executable: str,
     tm_score_threshold: float,
     can_skip_alignment: Callable[[MemberT, MemberT], bool] | None = None,
+    show_progress: bool = True,
 ) -> GreedySignatureRefinementResult:
     """Refine signature buckets with a stage-wide USalign queue.
 
@@ -90,7 +93,12 @@ def refine_signature_groups_greedy(
     """
 
     states: list[dict[str, Any]] = []
-    for signature_cluster_id, members in signature_groups:
+    for signature_cluster_id, members in tqdm(
+        signature_groups,
+        desc="Preparing high-order refinement groups",
+        unit="sig-group",
+        disable=not show_progress or len(signature_groups) < 2,
+    ):
         extracted_members = [
             member for member in members if member_id(member) in extracted_structures
         ]
@@ -165,6 +173,8 @@ def refine_signature_groups_greedy(
             alignment_tasks,
             runner,
             max_workers=alignment_jobs,
+            show_progress=show_progress,
+            progress_desc="Running high-order USalign",
             usalign_executable=usalign_executable,
             tm_score_threshold=tm_score_threshold,
         )
@@ -207,7 +217,12 @@ def refine_signature_groups_greedy(
 
     cluster_members: list[tuple[str, str, list[Any], Any]] = []
     num_signature_clusters_split = 0
-    for state in states:
+    for state in tqdm(
+        states,
+        desc="Finalizing high-order refinement",
+        unit="sig-group",
+        disable=not show_progress or len(states) < 2,
+    ):
         signature_cluster_id = state["signature_cluster_id"]
         members = state["members"]
         extracted_members = state["extracted_members"]
@@ -258,6 +273,7 @@ def refine_signature_groups_three_phase(
     usalign_executable: str,
     tm_score_threshold: float,
     can_skip_alignment: Callable[[MemberT, MemberT], bool] | None = None,
+    show_progress: bool = True,
 ) -> GreedySignatureRefinementResult:
     """Three-phase refinement: enumerate all pairwise tasks upfront, execute in
     one globally-sorted batch, then greedily reconstruct clusters.
@@ -271,7 +287,12 @@ def refine_signature_groups_three_phase(
     group_states: list[dict[str, Any]] = []
     identical_pairs: dict[tuple[str, str], USalignAlignmentResult] = {}
 
-    for signature_cluster_id, members in signature_groups:
+    for signature_cluster_id, members in tqdm(
+        signature_groups,
+        desc="Preparing high-order USalign tasks",
+        unit="sig-group",
+        disable=not show_progress or len(signature_groups) < 2,
+    ):
         extracted = [m for m in members if member_id(m) in extracted_structures]
         unresolved = [m for m in members if member_id(m) not in extracted_structures]
         pending = sorted(extracted, key=structural_sort_key)
@@ -318,6 +339,8 @@ def refine_signature_groups_three_phase(
     successes, failures = run_alignment_tasks(
         alignment_tasks, runner,
         max_workers=alignment_jobs,
+        show_progress=show_progress,
+        progress_desc="Running high-order USalign",
         usalign_executable=usalign_executable,
         tm_score_threshold=tm_score_threshold,
     )
@@ -338,7 +361,12 @@ def refine_signature_groups_three_phase(
     num_alignment_failures = 0
     num_signature_clusters_split = 0
 
-    for state in group_states:
+    for state in tqdm(
+        group_states,
+        desc="Reconstructing high-order clusters",
+        unit="sig-group",
+        disable=not show_progress or len(group_states) < 2,
+    ):
         sig_id = state["signature_cluster_id"]
         members = state["members"]
         extracted = state["extracted_members"]

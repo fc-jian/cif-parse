@@ -913,6 +913,7 @@ def refine_antibody_complex_signature_clusters(
         alignment_jobs=alignment_jobs,
         usalign_executable=usalign_executable,
         tm_score_threshold=tm_score_threshold,
+        show_progress=show_progress,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
             and a.assembly_id == b.assembly_id
@@ -1086,7 +1087,7 @@ def build_antibody_complex_signature_clusters(
     )
 
     grouped: dict[str, list[AntibodyComplexObservation]] = {}
-    for observation in observations:
+    for observation in tqdm(observations, desc="Grouping antibody signatures", unit="complex"):
         grouped.setdefault(observation.signature_key, []).append(observation)
     signature_groups = [
         (_antibody_signature_cluster_id(index), members)
@@ -1168,7 +1169,13 @@ def build_antibody_complex_signature_clusters(
                         log_summary=False,
                     )
                     future_to_group[future] = (signature_cluster_id, members, group_outdir)
-                for future in as_completed(future_to_group):
+                future_iter = tqdm(
+                    as_completed(future_to_group),
+                    total=len(future_to_group),
+                    desc="Extracting antibody signature groups",
+                    unit="sig-group",
+                )
+                for future in future_iter:
                     signature_cluster_id, members, group_outdir = future_to_group[future]
                     structures, extract_manifest = future.result()
                     extracted_structures.update(structures)

@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 from cif_parse.clustering.antibody_complexes import build_antibody_complex_signature_clusters
 from cif_parse.clustering.common import discover_case_output_dirs
 from cif_parse.clustering.dimers import build_dimer_signature_clusters
@@ -328,13 +330,19 @@ def build_parser(
         "--dimer-structure-mode",
         choices=sorted(SUPPORTED_CLUSTERING_STRUCTURE_MODES),
         default=str(clustering_defaults.get("dimer_structure_mode", "greedy")),
-        help="How to refine signature-matched dimer/interface observations by overall dimer TM-score",
+        help="How to refine signature-matched dimer/interface observations by interface-residue TM-score",
     )
     parser.add_argument(
         "--dimer-tm-score-threshold",
         type=float,
         default=float(clustering_defaults.get("dimer_tm_score_threshold", 0.50)),
-        help="Minimum overall dimer max(TM(query,target), TM(target,query)) to keep two dimers together",
+        help="Minimum interface-residue max(TM(query,target), TM(target,query)) to keep two dimers together",
+    )
+    parser.add_argument(
+        "--dimer-interface-residue-cutoff",
+        type=float,
+        default=float(clustering_defaults.get("dimer_interface_residue_cutoff", 8.0)),
+        help="Distance cutoff in Angstroms for selecting dimer interface residues before USalign",
     )
     parser.add_argument(
         "--multimer-mode",
@@ -435,7 +443,7 @@ def build_parser(
     parser.add_argument(
         "--min-alignment-coverage-ratio",
         type=float,
-        default=float(clustering_defaults.get("min_alignment_coverage_ratio", 0.80)),
+        default=float(clustering_defaults.get("min_alignment_coverage_ratio", 0.50)),
         help="Minimum aligned-length / shorter resolved-structure length ratio for protein structure clustering",
     )
     parser.add_argument(
@@ -770,6 +778,7 @@ def _build_high_order_specs(args: argparse.Namespace, sequence_dataset: dict[str
             "outdir": args.outdir / "dimer_clusters",
             "structure_refinement_mode": args.dimer_structure_mode,
             "dimer_tm_score_threshold": args.dimer_tm_score_threshold,
+            "dimer_interface_residue_cutoff": args.dimer_interface_residue_cutoff,
         }))
     return specs
 
@@ -812,7 +821,13 @@ def _run_full(args: argparse.Namespace) -> int:
                 for stage in ("tcr", "abag", "multimer", "dimer")
                 if stage in enabled
             }
-            for future in as_completed(future_to_stage):
+            future_iter = tqdm(
+                as_completed(future_to_stage),
+                total=len(future_to_stage),
+                desc="Joining higher-order stages",
+                unit="stage",
+            )
+            for future in future_iter:
                 stage = future_to_stage[future]
                 future.result()
                 LOGGER.info("Higher-order stage %s joined", stage)
@@ -857,6 +872,8 @@ def main(argv: list[str] | None = None) -> int:
     for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
         if getattr(args, field_name) < 1:
             parser.error(f"--{field_name.replace('_', '-')} must be >= 1")
+    if args.dimer_interface_residue_cutoff <= 0:
+        parser.error("--dimer-interface-residue-cutoff must be > 0")
 
     from cif_parse.clustering.parallel import set_global_usalign_limit
 

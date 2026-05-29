@@ -34,10 +34,16 @@ dimer_mode = "signature"
 # - "greedy": run overall dimer USalign and split low-TM members.
 dimer_structure_mode = "greedy"
 
-# Minimum overall max(TM(query,target), TM(target,query)) for keeping two
-# dimers in the same refined cluster.
+# Minimum interface-residue max(TM(query,target), TM(target,query)) for keeping
+# two dimers in the same refined cluster.
 # Allowed values: float in [0, 1].
 dimer_tm_score_threshold = 0.50
+
+# Distance cutoff (in Angstroms) for selecting interface residues written to
+# dimer PDBs before USalign refinement. Only residues with at least one atom
+# within this distance of the partner chain are retained.
+# Allowed values: float > 0.
+dimer_interface_residue_cutoff = 8.0
 
 # Tight multimer clustering mode.
 # Options:

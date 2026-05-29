@@ -165,6 +165,7 @@ class ClusteringSettings:
     dimer_mode: str = "signature"
     dimer_structure_mode: str = "greedy"
     dimer_tm_score_threshold: float = 0.50
+    dimer_interface_residue_cutoff: float = 8.0
     multimer_mode: str = "signature"
     multimer_structure_mode: str = "greedy"
     multimer_tm_score_threshold: float = 0.50
@@ -215,6 +216,8 @@ class ClusteringSettings:
             raise ValueError("clustering.model must be >= 1")
         if self.dimer_tm_score_threshold < 0 or self.dimer_tm_score_threshold > 1:
             raise ValueError("clustering.dimer_tm_score_threshold must be in [0, 1]")
+        if self.dimer_interface_residue_cutoff <= 0:
+            raise ValueError("clustering.dimer_interface_residue_cutoff must be > 0")
         if self.multimer_tm_score_threshold < 0 or self.multimer_tm_score_threshold > 1:
             raise ValueError("clustering.multimer_tm_score_threshold must be in [0, 1]")
         if self.multimer_max_atoms_for_refinement < 1:
@@ -295,6 +298,7 @@ def default_cli_config() -> dict[str, Any]:
             "dimer_mode": "signature",
             "dimer_structure_mode": "greedy",
             "dimer_tm_score_threshold": 0.50,
+            "dimer_interface_residue_cutoff": 8.0,
             "multimer_mode": "signature",
             "multimer_structure_mode": "greedy",
             "multimer_tm_score_threshold": 0.50,
@@ -311,7 +315,7 @@ def default_cli_config() -> dict[str, Any]:
             "model": 1,
             "keep_hydrogens": False,
             "tm_score_threshold": 0.50,
-            "min_alignment_coverage_ratio": 0.80,
+            "min_alignment_coverage_ratio": 0.50,
             "usalign_executable": "USalign",
             "jobs": _DEFAULT_JOB_COUNT,
             "log_level": "DEBUG",
@@ -426,6 +430,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "dimer_mode",
             "dimer_structure_mode",
             "dimer_tm_score_threshold",
+            "dimer_interface_residue_cutoff",
             "multimer_mode",
             "multimer_structure_mode",
             "multimer_tm_score_threshold",
@@ -495,6 +500,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "dimer_mode": validated_clustering.dimer_mode,
         "dimer_structure_mode": validated_clustering.dimer_structure_mode,
         "dimer_tm_score_threshold": validated_clustering.dimer_tm_score_threshold,
+        "dimer_interface_residue_cutoff": validated_clustering.dimer_interface_residue_cutoff,
         "multimer_mode": validated_clustering.multimer_mode,
         "multimer_structure_mode": validated_clustering.multimer_structure_mode,
         "multimer_tm_score_threshold": validated_clustering.multimer_tm_score_threshold,

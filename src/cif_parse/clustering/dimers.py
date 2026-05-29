@@ -11,10 +11,12 @@ from typing import Any, Callable, Iterable
 
 from tqdm import tqdm
 
+import numpy as np
 import biotite.structure as struc
 from biotite.structure import AtomArray, get_residues
 from biotite.structure.io.pdb import PDBFile
 
+from cif_parse.constants import ATOM_CHUNK_SIZE, RESIDUE_CONTACT_CUTOFF
 from cif_parse.clustering.common import (
     canonical_monomer_id,
     load_monomer_cluster_assignments as _load_monomer_cluster_assignments,
@@ -179,9 +181,118 @@ class ExtractedDimerStructure:
     residue_count: int
     atom_count: int
     filter_counts: dict[str, int]
+    interface_residue_cutoff: float | None = None
+    interface_residue_count_1: int | None = None
+    interface_residue_count_2: int | None = None
+    interface_atom_contact_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class _InterfaceResidueSelection:
+    atom_array: AtomArray
+    residue_count_1: int
+    residue_count_2: int
+    atom_contact_count: int
+
+
+def _contact_atom_masks(
+    coords_1: np.ndarray,
+    coords_2: np.ndarray,
+    cutoff: float,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    mask_1 = np.zeros(coords_1.shape[0], dtype=bool)
+    mask_2 = np.zeros(coords_2.shape[0], dtype=bool)
+    if coords_1.size == 0 or coords_2.size == 0:
+        return mask_1, mask_2, 0
+
+    try:
+        from scipy.spatial import cKDTree  # type: ignore[import-not-found]
+
+        tree_1 = cKDTree(coords_1)
+        tree_2 = cKDTree(coords_2)
+        contact_matrix = tree_1.sparse_distance_matrix(
+            tree_2,
+            cutoff,
+            output_type="coo_matrix",
+        )
+        if contact_matrix.nnz:
+            mask_1[np.asarray(contact_matrix.row, dtype=int)] = True
+            mask_2[np.asarray(contact_matrix.col, dtype=int)] = True
+        return mask_1, mask_2, int(contact_matrix.nnz)
+    except ImportError:
+        pass
+
+    cutoff_sq = cutoff * cutoff
+    atom_contact_count = 0
+    block_1 = max(1, ATOM_CHUNK_SIZE)
+    target_pairs_per_block = max(block_1 * block_1, 1)
+    block_2 = max(1, target_pairs_per_block // block_1)
+    for start_1 in range(0, coords_1.shape[0], block_1):
+        chunk_1 = coords_1[start_1 : start_1 + block_1]
+        local_mask_1 = np.zeros(chunk_1.shape[0], dtype=bool)
+        for start_2 in range(0, coords_2.shape[0], block_2):
+            chunk_2 = coords_2[start_2 : start_2 + block_2]
+            deltas = chunk_1[:, None, :] - chunk_2[None, :, :]
+            distance_sq = np.sum(deltas * deltas, axis=2)
+            contacts = distance_sq <= cutoff_sq
+            if not bool(contacts.any()):
+                continue
+            atom_contact_count += int(np.count_nonzero(contacts))
+            local_mask_1 |= contacts.any(axis=1)
+            mask_2[start_2 : start_2 + chunk_2.shape[0]] |= contacts.any(axis=0)
+        mask_1[start_1 : start_1 + chunk_1.shape[0]] = local_mask_1
+    return mask_1, mask_2, atom_contact_count
+
+
+def _residue_mask_from_contact_atoms(atom_array: AtomArray, atom_contact_mask: np.ndarray) -> np.ndarray:
+    keep_mask = np.zeros(atom_array.array_length(), dtype=bool)
+    if atom_array.array_length() == 0 or not bool(atom_contact_mask.any()):
+        return keep_mask
+    residue_starts = struc.get_residue_starts(atom_array, add_exclusive_stop=True)
+    for start, stop in zip(residue_starts[:-1], residue_starts[1:], strict=False):
+        if bool(atom_contact_mask[start:stop].any()):
+            keep_mask[start:stop] = True
+    return keep_mask
+
+
+def _select_interface_residues(
+    dimer_atoms: AtomArray,
+    *,
+    cutoff: float,
+) -> _InterfaceResidueSelection:
+    if cutoff <= 0:
+        raise ValueError("dimer interface residue cutoff must be > 0")
+
+    chain_id_1 = _pdb_chain_id(0)
+    chain_id_2 = _pdb_chain_id(1)
+    chain_atoms_1 = dimer_atoms[dimer_atoms.chain_id == chain_id_1]
+    chain_atoms_2 = dimer_atoms[dimer_atoms.chain_id == chain_id_2]
+    if chain_atoms_1.array_length() == 0 or chain_atoms_2.array_length() == 0:
+        raise ValueError("Dimer interface residue selection requires two non-empty chains")
+
+    atom_mask_1, atom_mask_2, atom_contact_count = _contact_atom_masks(
+        np.asarray(chain_atoms_1.coord, dtype=np.float32),
+        np.asarray(chain_atoms_2.coord, dtype=np.float32),
+        cutoff,
+    )
+    residue_mask_1 = _residue_mask_from_contact_atoms(chain_atoms_1, atom_mask_1)
+    residue_mask_2 = _residue_mask_from_contact_atoms(chain_atoms_2, atom_mask_2)
+    if not bool(residue_mask_1.any()) or not bool(residue_mask_2.any()):
+        raise ValueError(f"No interface residues found within {cutoff:g} A")
+
+    interface_atoms_1 = chain_atoms_1[residue_mask_1]
+    interface_atoms_2 = chain_atoms_2[residue_mask_2]
+    _, residue_names_1 = get_residues(interface_atoms_1)
+    _, residue_names_2 = get_residues(interface_atoms_2)
+    return _InterfaceResidueSelection(
+        atom_array=struc.concatenate([interface_atoms_1, interface_atoms_2]),
+        residue_count_1=int(len(residue_names_1)),
+        residue_count_2=int(len(residue_names_2)),
+        atom_contact_count=atom_contact_count,
+    )
 
 
 def load_monomer_cluster_assignments(
@@ -276,7 +387,7 @@ def collect_dimer_observations(
     from cif_parse.clustering.prep import load_bundles_for_collect, load_case_bundles
     sorted_dirs = sorted(Path(path).resolve() for path in case_dirs)
     prep_bundles = load_bundles_for_collect(sorted_dirs, prep_db_path=prep_dir)
-    for case_dir in sorted_dirs:
+    for case_dir in tqdm(sorted_dirs, desc="Collecting dimers", unit="case"):
         payloads = load_case_bundles(case_dir, prep_bundles=prep_bundles)
         for payload in payloads:
             summary = payload.get("structure_summary", {})
@@ -347,6 +458,7 @@ def extract_dimer_structure(
     model: int = 1,
     drop_hydrogens: bool = True,
     atom_array: AtomArray | None = None,
+    interface_residue_cutoff: float | None = RESIDUE_CONTACT_CUTOFF,
 ) -> ExtractedDimerStructure:
     if not observation.source_path:
         raise ValueError(f"Missing source_path for dimer {observation.dimer_observation_id}")
@@ -380,6 +492,14 @@ def extract_dimer_structure(
     if dimer_atoms.array_length() == 0:
         raise ValueError(f"No analyzable atoms left for dimer {observation.dimer_observation_id}")
 
+    interface_selection: _InterfaceResidueSelection | None = None
+    if interface_residue_cutoff is not None:
+        interface_selection = _select_interface_residues(
+            dimer_atoms,
+            cutoff=float(interface_residue_cutoff),
+        )
+        dimer_atoms = interface_selection.atom_array
+
     _, residue_names = get_residues(dimer_atoms)
     residue_count = int(len(residue_names))
     if residue_count <= 2:
@@ -404,6 +524,18 @@ def extract_dimer_structure(
         residue_count=residue_count,
         atom_count=int(dimer_atoms.array_length()),
         filter_counts=atom_array_filter_counts(filter_counts),
+        interface_residue_cutoff=(
+            float(interface_residue_cutoff) if interface_residue_cutoff is not None else None
+        ),
+        interface_residue_count_1=(
+            interface_selection.residue_count_1 if interface_selection is not None else None
+        ),
+        interface_residue_count_2=(
+            interface_selection.residue_count_2 if interface_selection is not None else None
+        ),
+        interface_atom_contact_count=(
+            interface_selection.atom_contact_count if interface_selection is not None else None
+        ),
     )
 
 
@@ -413,6 +545,7 @@ def extract_dimer_structures(
     outdir: str | Path,
     model: int = 1,
     drop_hydrogens: bool = True,
+    interface_residue_cutoff: float | None = RESIDUE_CONTACT_CUTOFF,
     extraction_jobs: int = 1,
     prep_dir: str | Path | None = None,
     show_progress: bool = True,
@@ -463,6 +596,7 @@ def extract_dimer_structures(
                     model=model,
                     drop_hydrogens=drop_hydrogens,
                     atom_array=atom_array,
+                    interface_residue_cutoff=interface_residue_cutoff,
                 )
             except Exception as exc:
                 LOGGER.warning("Failed to extract dimer %s: %s", observation.dimer_observation_id, exc)
@@ -482,6 +616,7 @@ def extract_dimer_structures(
                 model=model,
                 drop_hydrogens=drop_hydrogens,
                 atom_array=atom_array,
+                interface_residue_cutoff=interface_residue_cutoff,
             )
 
         with ThreadPoolExecutor(max_workers=min(extraction_jobs, len(sorted_observations))) as executor:
@@ -516,6 +651,9 @@ def extract_dimer_structures(
         "num_extracted_dimer_structures": len(structures),
         "num_failed_dimer_structure_extractions": len(failures),
         "extraction_jobs": extraction_jobs,
+        "dimer_interface_residue_cutoff": (
+            float(interface_residue_cutoff) if interface_residue_cutoff is not None else None
+        ),
     }
     dump_json(outdir / "dimer_structure_manifest.json", manifest, indent=2)
     if log_summary:
@@ -617,6 +755,7 @@ def refine_dimer_signature_clusters(
         alignment_jobs=alignment_jobs,
         usalign_executable=usalign_executable,
         tm_score_threshold=tm_score_threshold,
+        show_progress=show_progress,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
             and a.assembly_id == b.assembly_id
@@ -766,6 +905,7 @@ def build_dimer_signature_clusters(
     outdir: str | Path,
     structure_refinement_mode: str = "greedy",
     dimer_tm_score_threshold: float = 0.50,
+    dimer_interface_residue_cutoff: float | None = RESIDUE_CONTACT_CUTOFF,
     model: int = 1,
     drop_hydrogens: bool = True,
     usalign_executable: str = "USalign",
@@ -793,7 +933,7 @@ def build_dimer_signature_clusters(
     dump_csv_rows(outdir / "dimer_inventory.csv", [item.to_record() for item in observations])
 
     grouped: dict[str, list[DimerObservation]] = {}
-    for observation in observations:
+    for observation in tqdm(observations, desc="Grouping dimer signatures", unit="dimer"):
         grouped.setdefault(observation.signature_key, []).append(observation)
     signature_groups = [
         (_dimer_signature_cluster_id(index), members)
@@ -869,13 +1009,20 @@ def build_dimer_signature_clusters(
                         outdir=group_outdir,
                         model=model,
                         drop_hydrogens=drop_hydrogens,
+                        interface_residue_cutoff=dimer_interface_residue_cutoff,
                         extraction_jobs=1,
                         prep_dir=prep_dir,
                         show_progress=False,
                         log_summary=False,
                     )
                     future_to_group[future] = (signature_cluster_id, members, group_outdir)
-                for future in as_completed(future_to_group):
+                future_iter = tqdm(
+                    as_completed(future_to_group),
+                    total=len(future_to_group),
+                    desc="Extracting dimer signature groups",
+                    unit="sig-group",
+                )
+                for future in future_iter:
                     signature_cluster_id, members, group_outdir = future_to_group[future]
                     structures, extract_manifest = future.result()
                     extracted_structures.update(structures)
@@ -918,6 +1065,11 @@ def build_dimer_signature_clusters(
                     "num_failed_dimer_structure_extractions"
                 ],
                 "extraction_jobs": normalize_worker_count(alignment_jobs),
+                "dimer_interface_residue_cutoff": (
+                    float(dimer_interface_residue_cutoff)
+                    if dimer_interface_residue_cutoff is not None
+                    else None
+                ),
                 "num_signature_groups_pipelined": len(multi_member_groups),
             },
             indent=2,
@@ -937,6 +1089,11 @@ def build_dimer_signature_clusters(
             "num_alignment_failures": refined_manifest["num_alignment_failures"],
             "num_signature_clusters_split": refined_manifest["num_signature_clusters_split"],
             "dimer_tm_score_threshold": dimer_tm_score_threshold,
+            "dimer_interface_residue_cutoff": (
+                float(dimer_interface_residue_cutoff)
+                if dimer_interface_residue_cutoff is not None
+                else None
+            ),
             "structure_refinement_mode": structure_refinement_mode,
             "alignment_jobs": refined_manifest["alignment_jobs"],
             **extraction_manifest,
@@ -1006,6 +1163,11 @@ def build_dimer_signature_clusters(
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
             "dimer_tm_score_threshold": dimer_tm_score_threshold,
+            "dimer_interface_residue_cutoff": (
+                float(dimer_interface_residue_cutoff)
+                if dimer_interface_residue_cutoff is not None
+                else None
+            ),
             "structure_refinement_mode": structure_refinement_mode,
             **extraction_manifest,
         }

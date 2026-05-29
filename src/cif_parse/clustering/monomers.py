@@ -300,16 +300,28 @@ def write_monomer_fastas(monomers: Iterable[MonomerSample], outdir: str | Path) 
     """Write per-polymer-class FASTA files and return created paths."""
 
     grouped: dict[str, list[MonomerSample]] = defaultdict(list)
-    for monomer in monomers:
+    monomer_list = list(monomers)
+    for monomer in tqdm(monomer_list, desc="Grouping monomers for FASTA", unit="monomer"):
         grouped[monomer.polymer_class].append(monomer)
 
     fasta_dir = Path(outdir) / "fasta"
     outputs: dict[str, Path] = {}
-    for polymer_class, members in sorted(grouped.items()):
+    for polymer_class, members in tqdm(
+        sorted(grouped.items()),
+        desc="Writing monomer FASTA files",
+        unit="class",
+        disable=len(grouped) < 2,
+    ):
         fasta_path = fasta_dir / f"{polymer_class}.fasta"
         fasta_path.parent.mkdir(parents=True, exist_ok=True)
         with fasta_path.open("w", encoding="utf-8") as handle:
-            for member in sorted(members, key=lambda item: item.monomer_id):
+            for member in tqdm(
+                sorted(members, key=lambda item: item.monomer_id),
+                desc=f"Writing {polymer_class} FASTA",
+                unit="sequence",
+                leave=False,
+                disable=len(members) < 2,
+            ):
                 header = "|".join(
                     [member.monomer_id]
                 )
@@ -331,7 +343,11 @@ def build_exact_sequence_membership(
     """Group monomers by exact sequence equality."""
 
     grouped: dict[str, list[MonomerSample]] = defaultdict(list)
-    for monomer in monomers:
+    for monomer in tqdm(
+        list(monomers),
+        desc=f"Grouping {polymer_class} exact sequences",
+        unit="monomer",
+    ):
         if monomer.polymer_class == polymer_class:
             grouped[monomer.sequence].append(monomer)
 
@@ -340,7 +356,10 @@ def build_exact_sequence_membership(
         grouped.items(),
         key=lambda item: (-len(item[0]), item[0], [member.monomer_id for member in item[1]]),
     )
-    for index, (_, members) in enumerate(sequences, start=1):
+    for index, (_, members) in enumerate(
+        tqdm(sequences, desc=f"Building {polymer_class} exact clusters", unit="cluster"),
+        start=1,
+    ):
         cluster_id = _format_cluster_id(cluster_prefix, index)
         representative = sorted(members, key=lambda item: item.monomer_id)[0]
         for member in sorted(members, key=lambda item: item.monomer_id):
@@ -370,7 +389,10 @@ def build_singleton_protein_membership(monomers: Iterable[MonomerSample]) -> lis
         (monomer for monomer in monomers if monomer.polymer_class == "protein"),
         key=lambda item: item.monomer_id,
     )
-    for index, member in enumerate(members, start=1):
+    for index, member in enumerate(
+        tqdm(members, desc="Building singleton protein clusters", unit="monomer"),
+        start=1,
+    ):
         rows.append(
             {
                 "cluster_stage": "sequence",
@@ -439,7 +461,7 @@ def parse_mmseqs_cluster_tsv(
 
     grouped: dict[str, list[str]] = defaultdict(list)
     with Path(cluster_tsv_path).open(encoding="utf-8") as handle:
-        for line in handle:
+        for line in tqdm(handle, desc="Parsing mmseqs clusters", unit="row"):
             text = line.strip()
             if not text:
                 continue
@@ -447,7 +469,10 @@ def parse_mmseqs_cluster_tsv(
             grouped[representative].append(member)
 
     rows: list[dict[str, Any]] = []
-    for index, representative_id in enumerate(sorted(grouped), start=1):
+    for index, representative_id in enumerate(
+        tqdm(sorted(grouped), desc="Normalizing mmseqs clusters", unit="cluster"),
+        start=1,
+    ):
         cluster_id = _format_cluster_id("prot", index)
         representative = monomer_index[representative_id]
         for member_id in sorted(grouped[representative_id]):

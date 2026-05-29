@@ -621,7 +621,13 @@ def extract_protein_monomer_structures(
                 executor.submit(_extract_one, monomer): monomer
                 for monomer in protein_monomers
             }
-            for future in as_completed(future_to_monomer):
+            future_iter = tqdm(
+                as_completed(future_to_monomer),
+                total=len(future_to_monomer),
+                desc="Extracting monomer structures",
+                unit="monomer",
+            )
+            for future in future_iter:
                 monomer = future_to_monomer[future]
                 try:
                     extracted = future.result()
@@ -650,7 +656,7 @@ def greedy_cluster_protein_structures(
     *,
     outdir: str | Path,
     tm_score_threshold: float = 0.50,
-    min_alignment_coverage_ratio: float = 0.80,
+    min_alignment_coverage_ratio: float = 0.50,
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     sequence_cluster_jobs: int = 1,
@@ -880,6 +886,7 @@ def greedy_cluster_protein_structures(
                 alignment_tasks,
                 runner,
                 max_workers=pairwise_alignment_jobs,
+                progress_desc=f"USalign {sequence_cluster_id}",
                 usalign_executable=usalign_executable,
                 tm_score_threshold=tm_score_threshold,
                 min_alignment_coverage_ratio=min_alignment_coverage_ratio,
@@ -1686,6 +1693,7 @@ def _run_three_phase_clustering(
             successes, failures = run_alignment_tasks(
                 align_tasks, runner,
                 max_workers=pairwise_alignment_jobs,
+                progress_desc="USalign batch",
                 usalign_executable=usalign_executable,
                 tm_score_threshold=tm_score_threshold,
                 min_alignment_coverage_ratio=min_alignment_coverage_ratio,

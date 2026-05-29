@@ -120,6 +120,10 @@ class PklAtomReader:
             mask = full.chain_id == lbl
             if filter_hetero and hasattr(full, "hetero"):
                 mask &= ~full.hetero
+            if _sym is not None and hasattr(full, "sym_id"):
+                sym_mask = mask & (full.sym_id == _sym)
+                if bool(sym_mask.any()):
+                    mask = sym_mask
             chain = full[mask]
             if chain.array_length() == 0:
                 return None

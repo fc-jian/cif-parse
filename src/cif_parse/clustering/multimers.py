@@ -747,6 +747,7 @@ def refine_multimer_signature_clusters(
         alignment_jobs=alignment_jobs,
         usalign_executable=usalign_executable,
         tm_score_threshold=tm_score_threshold,
+        show_progress=show_progress,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
             and a.assembly_id == b.assembly_id
@@ -910,7 +911,7 @@ def build_multimer_signature_clusters(
     dump_csv_rows(outdir / "multimer_inventory.csv", [item.to_record() for item in observations])
 
     grouped: dict[str, list[MultimerObservation]] = {}
-    for observation in observations:
+    for observation in tqdm(observations, desc="Grouping multimer signatures", unit="multimer"):
         grouped.setdefault(observation.signature_key, []).append(observation)
     signature_groups = [
         (_signature_cluster_id(index), members)
@@ -992,7 +993,13 @@ def build_multimer_signature_clusters(
                         log_summary=False,
                     )
                     future_to_group[future] = (signature_cluster_id, members, group_outdir)
-                for future in as_completed(future_to_group):
+                future_iter = tqdm(
+                    as_completed(future_to_group),
+                    total=len(future_to_group),
+                    desc="Extracting multimer signature groups",
+                    unit="sig-group",
+                )
+                for future in future_iter:
                     signature_cluster_id, members, group_outdir = future_to_group[future]
                     structures, extract_manifest = future.result()
                     extracted_structures.update(structures)
