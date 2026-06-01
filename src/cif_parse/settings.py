@@ -173,6 +173,7 @@ class ClusteringSettings:
     antibody_complex_mode: str = "signature"
     antibody_complex_structure_mode: str = "greedy"
     antibody_complex_tm_score_threshold: float = 0.50
+    antibody_complex_interface_residue_cutoff: float = 20.0
     tcr_complex_mode: str = "signature"
     tcr_complex_structure_mode: str = "greedy"
     tcr_complex_tm_score_threshold: float = 0.50
@@ -224,6 +225,8 @@ class ClusteringSettings:
             raise ValueError("clustering.multimer_max_atoms_for_refinement must be >= 1")
         if self.antibody_complex_tm_score_threshold < 0 or self.antibody_complex_tm_score_threshold > 1:
             raise ValueError("clustering.antibody_complex_tm_score_threshold must be in [0, 1]")
+        if self.antibody_complex_interface_residue_cutoff <= 0:
+            raise ValueError("clustering.antibody_complex_interface_residue_cutoff must be > 0")
         if self.tcr_complex_tm_score_threshold < 0 or self.tcr_complex_tm_score_threshold > 1:
             raise ValueError("clustering.tcr_complex_tm_score_threshold must be in [0, 1]")
         if self.protein_min_seq_id < 0 or self.protein_min_seq_id > 1:
@@ -306,6 +309,7 @@ def default_cli_config() -> dict[str, Any]:
             "antibody_complex_mode": "signature",
             "antibody_complex_structure_mode": "greedy",
             "antibody_complex_tm_score_threshold": 0.50,
+            "antibody_complex_interface_residue_cutoff": 20.0,
             "tcr_complex_mode": "signature",
             "tcr_complex_structure_mode": "greedy",
             "tcr_complex_tm_score_threshold": 0.50,
@@ -438,6 +442,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "antibody_complex_mode",
             "antibody_complex_structure_mode",
             "antibody_complex_tm_score_threshold",
+            "antibody_complex_interface_residue_cutoff",
             "tcr_complex_mode",
             "tcr_complex_structure_mode",
             "tcr_complex_tm_score_threshold",
@@ -508,6 +513,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "antibody_complex_mode": validated_clustering.antibody_complex_mode,
         "antibody_complex_structure_mode": validated_clustering.antibody_complex_structure_mode,
         "antibody_complex_tm_score_threshold": validated_clustering.antibody_complex_tm_score_threshold,
+        "antibody_complex_interface_residue_cutoff": validated_clustering.antibody_complex_interface_residue_cutoff,
         "tcr_complex_mode": validated_clustering.tcr_complex_mode,
         "tcr_complex_structure_mode": validated_clustering.tcr_complex_structure_mode,
         "tcr_complex_tm_score_threshold": validated_clustering.tcr_complex_tm_score_threshold,

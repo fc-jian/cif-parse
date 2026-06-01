@@ -26,6 +26,7 @@ from cif_parse.clustering.protein_structures import (
     parse_usalign_output,
 )
 from cif_parse.clustering.parallel import normalize_worker_count
+from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
@@ -920,6 +921,23 @@ def build_multimer_signature_clusters(
             start=1,
         )
     ]
+    write_signature_cluster_membership_csv(
+        outdir / "multimer_signature_cluster_membership.csv",
+        signature_groups,
+        observation_id_field="multimer_observation_id",
+        observation_id=lambda item: item.multimer_observation_id,
+        extra_fields=lambda item: {
+            "multimer_id": item.multimer_id,
+            "multimer_type": item.multimer_type,
+            "support_score": item.support_score,
+            "num_members": item.num_members,
+            "num_member_instances": item.num_member_instances,
+            "num_internal_edges": item.num_internal_edges,
+            "member_chain_ids": json.dumps(item.member_chain_ids, ensure_ascii=False),
+            "contains_antibody_unit": item.contains_antibody_unit,
+            "contains_tcr_pmhc_unit": item.contains_tcr_pmhc_unit,
+        },
+    )
 
     extraction_manifest = {
         "num_extracted_multimer_structures": 0,

@@ -28,6 +28,7 @@ from cif_parse.clustering.protein_structures import (
     parse_usalign_output,
 )
 from cif_parse.clustering.parallel import normalize_worker_count
+from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
@@ -35,6 +36,7 @@ from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_a
 
 LOGGER = logging.getLogger(__name__)
 PDB_CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+ChainSpec = tuple[str, int | None]
 
 
 def _dimer_member_descriptor(
@@ -90,6 +92,106 @@ def _coerce_dimer_chain_id(atom_array: AtomArray, chain_id: str) -> AtomArray:
     copied = atom_array.copy()
     copied.chain_id[:] = chain_id
     return copied
+
+
+def _chain_id_mask(atom_array: AtomArray, chain_ids: list[str]) -> np.ndarray:
+    return np.isin(atom_array.chain_id, np.asarray(chain_ids, dtype=atom_array.chain_id.dtype))
+
+
+def _chain_part_specs_from_observation(observation: DimerObservation) -> list[list[ChainSpec]]:
+    return [
+        [(observation.label_asym_id_1, observation.sym_id_1)],
+        [(observation.label_asym_id_2, observation.sym_id_2)],
+    ]
+
+
+def _normalize_chain_parts(
+    chain_parts: Iterable[Iterable[ChainSpec]],
+) -> list[list[ChainSpec]]:
+    normalized = [
+        [(str(chain_id), None if sym_id is None else int(sym_id)) for chain_id, sym_id in part]
+        for part in chain_parts
+    ]
+    if len(normalized) != 2:
+        raise ValueError("Dimer extraction requires exactly two chain parts")
+    for index, part in enumerate(normalized, start=1):
+        if not part:
+            raise ValueError(f"Dimer extraction part {index} has no chains")
+        for chain_id, sym_id in part:
+            if not chain_id:
+                raise ValueError(f"Dimer extraction part {index} contains an empty chain id")
+    return normalized
+
+
+def _sym_values_for_chain(atom_array: AtomArray, chain_id: str) -> list[int]:
+    if not hasattr(atom_array, "sym_id"):
+        return []
+    mask = atom_array.chain_id == chain_id
+    if not bool(mask.any()):
+        return []
+    return sorted({int(value) for value in atom_array.sym_id[mask].tolist()})
+
+
+def _common_unspecified_sym_id(
+    atom_array: AtomArray,
+    chain_parts: list[list[ChainSpec]],
+) -> int | None:
+    if not hasattr(atom_array, "sym_id"):
+        return None
+    sym_sets: list[set[int]] = []
+    for part in chain_parts:
+        for chain_id, requested_sym in part:
+            if requested_sym is not None:
+                continue
+            values = set(_sym_values_for_chain(atom_array, chain_id))
+            if values:
+                sym_sets.append(values)
+    if not sym_sets:
+        return None
+    common = set(sym_sets[0])
+    for values in sym_sets[1:]:
+        common &= values
+    return min(common) if common else None
+
+
+def _select_chain_parts(
+    atom_array: AtomArray,
+    chain_parts: list[list[ChainSpec]],
+) -> tuple[list[list[AtomArray]], list[list[str]]]:
+    common_sym = _common_unspecified_sym_id(atom_array, chain_parts)
+    selected_parts: list[list[AtomArray]] = []
+    pdb_chain_ids: list[list[str]] = []
+    pdb_chain_index = 0
+
+    for part_index, part in enumerate(chain_parts, start=1):
+        part_arrays: list[AtomArray] = []
+        part_pdb_chain_ids: list[str] = []
+        for label_asym_id, requested_sym in part:
+            sym_id = requested_sym
+            if sym_id is None and hasattr(atom_array, "sym_id"):
+                sym_values = _sym_values_for_chain(atom_array, label_asym_id)
+                if common_sym is not None and common_sym in sym_values:
+                    sym_id = common_sym
+                elif sym_values:
+                    sym_id = sym_values[0]
+
+            selected = _select_instance_atoms(atom_array, label_asym_id=label_asym_id, sym_id=sym_id)
+            if selected.array_length() == 0 and sym_id is not None:
+                selected = _select_instance_atoms(atom_array, label_asym_id=label_asym_id, sym_id=None)
+            if selected.array_length() == 0:
+                continue
+
+            pdb_chain_id = _pdb_chain_id(pdb_chain_index)
+            pdb_chain_index += 1
+            part_arrays.append(_coerce_dimer_chain_id(selected, pdb_chain_id))
+            part_pdb_chain_ids.append(pdb_chain_id)
+
+        if not part_arrays:
+            raise ValueError(f"No polymer atoms found for dimer part {part_index}")
+        selected_parts.append(part_arrays)
+        pdb_chain_ids.append(part_pdb_chain_ids)
+
+    return selected_parts, pdb_chain_ids
 
 
 @dataclass(slots=True)
@@ -185,6 +287,8 @@ class ExtractedDimerStructure:
     interface_residue_count_1: int | None = None
     interface_residue_count_2: int | None = None
     interface_atom_contact_count: int | None = None
+    part_1_pdb_chain_ids: list[str] | None = None
+    part_2_pdb_chain_ids: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -259,32 +363,29 @@ def _residue_mask_from_contact_atoms(atom_array: AtomArray, atom_contact_mask: n
 
 
 def _select_interface_residues(
-    dimer_atoms: AtomArray,
+    part_atoms_1: AtomArray,
+    part_atoms_2: AtomArray,
     *,
     cutoff: float,
 ) -> _InterfaceResidueSelection:
     if cutoff <= 0:
         raise ValueError("dimer interface residue cutoff must be > 0")
 
-    chain_id_1 = _pdb_chain_id(0)
-    chain_id_2 = _pdb_chain_id(1)
-    chain_atoms_1 = dimer_atoms[dimer_atoms.chain_id == chain_id_1]
-    chain_atoms_2 = dimer_atoms[dimer_atoms.chain_id == chain_id_2]
-    if chain_atoms_1.array_length() == 0 or chain_atoms_2.array_length() == 0:
-        raise ValueError("Dimer interface residue selection requires two non-empty chains")
+    if part_atoms_1.array_length() == 0 or part_atoms_2.array_length() == 0:
+        raise ValueError("Dimer interface residue selection requires two non-empty parts")
 
     atom_mask_1, atom_mask_2, atom_contact_count = _contact_atom_masks(
-        np.asarray(chain_atoms_1.coord, dtype=np.float32),
-        np.asarray(chain_atoms_2.coord, dtype=np.float32),
+        np.asarray(part_atoms_1.coord, dtype=np.float32),
+        np.asarray(part_atoms_2.coord, dtype=np.float32),
         cutoff,
     )
-    residue_mask_1 = _residue_mask_from_contact_atoms(chain_atoms_1, atom_mask_1)
-    residue_mask_2 = _residue_mask_from_contact_atoms(chain_atoms_2, atom_mask_2)
+    residue_mask_1 = _residue_mask_from_contact_atoms(part_atoms_1, atom_mask_1)
+    residue_mask_2 = _residue_mask_from_contact_atoms(part_atoms_2, atom_mask_2)
     if not bool(residue_mask_1.any()) or not bool(residue_mask_2.any()):
         raise ValueError(f"No interface residues found within {cutoff:g} A")
 
-    interface_atoms_1 = chain_atoms_1[residue_mask_1]
-    interface_atoms_2 = chain_atoms_2[residue_mask_2]
+    interface_atoms_1 = part_atoms_1[residue_mask_1]
+    interface_atoms_2 = part_atoms_2[residue_mask_2]
     _, residue_names_1 = get_residues(interface_atoms_1)
     _, residue_names_2 = get_residues(interface_atoms_2)
     return _InterfaceResidueSelection(
@@ -459,6 +560,7 @@ def extract_dimer_structure(
     drop_hydrogens: bool = True,
     atom_array: AtomArray | None = None,
     interface_residue_cutoff: float | None = RESIDUE_CONTACT_CUTOFF,
+    chain_parts: Iterable[Iterable[ChainSpec]] | None = None,
 ) -> ExtractedDimerStructure:
     if not observation.source_path:
         raise ValueError(f"Missing source_path for dimer {observation.dimer_observation_id}")
@@ -466,22 +568,11 @@ def extract_dimer_structure(
     if atom_array is None:
         raise ValueError(f"Cached coordinates are required for dimer {observation.dimer_observation_id}")
 
-    chain_arrays: list[AtomArray] = []
-    for chain_index, (label_asym_id, sym_id) in enumerate(
-        (
-            (observation.label_asym_id_1, observation.sym_id_1),
-            (observation.label_asym_id_2, observation.sym_id_2),
-        )
-    ):
-        selected = _select_instance_atoms(atom_array, label_asym_id=label_asym_id, sym_id=sym_id)
-        if selected.array_length() == 0 and sym_id is not None:
-            selected = _select_instance_atoms(atom_array, label_asym_id=label_asym_id, sym_id=None)
-        if selected.array_length() == 0:
-            continue
-        chain_arrays.append(_coerce_dimer_chain_id(selected, _pdb_chain_id(chain_index)))
-
-    if not chain_arrays:
-        raise ValueError(f"No polymer atoms found for dimer {observation.dimer_observation_id}")
+    normalized_chain_parts = _normalize_chain_parts(
+        chain_parts if chain_parts is not None else _chain_part_specs_from_observation(observation)
+    )
+    selected_parts, part_pdb_chain_ids = _select_chain_parts(atom_array, normalized_chain_parts)
+    chain_arrays = [chain_array for part_arrays in selected_parts for chain_array in part_arrays]
 
     dimer_atoms = struc.concatenate(chain_arrays)
     dimer_atoms, filter_counts = filter_atom_array_for_analysis(
@@ -494,8 +585,11 @@ def extract_dimer_structure(
 
     interface_selection: _InterfaceResidueSelection | None = None
     if interface_residue_cutoff is not None:
+        part_atoms_1 = dimer_atoms[_chain_id_mask(dimer_atoms, part_pdb_chain_ids[0])]
+        part_atoms_2 = dimer_atoms[_chain_id_mask(dimer_atoms, part_pdb_chain_ids[1])]
         interface_selection = _select_interface_residues(
-            dimer_atoms,
+            part_atoms_1,
+            part_atoms_2,
             cutoff=float(interface_residue_cutoff),
         )
         dimer_atoms = interface_selection.atom_array
@@ -536,6 +630,8 @@ def extract_dimer_structure(
         interface_atom_contact_count=(
             interface_selection.atom_contact_count if interface_selection is not None else None
         ),
+        part_1_pdb_chain_ids=list(part_pdb_chain_ids[0]),
+        part_2_pdb_chain_ids=list(part_pdb_chain_ids[1]),
     )
 
 
@@ -942,6 +1038,22 @@ def build_dimer_signature_clusters(
             start=1,
         )
     ]
+    write_signature_cluster_membership_csv(
+        outdir / "dimer_signature_cluster_membership.csv",
+        signature_groups,
+        observation_id_field="dimer_observation_id",
+        observation_id=lambda item: item.dimer_observation_id,
+        extra_fields=lambda item: {
+            "label_asym_id_1": item.label_asym_id_1,
+            "label_asym_id_2": item.label_asym_id_2,
+            "interface_label": item.interface_label,
+            "buried_area": item.buried_area,
+            "num_atom_contacts": item.num_atom_contacts,
+            "num_residue_contacts": item.num_residue_contacts,
+            "contains_antibody_unit": item.contains_antibody_unit,
+            "contains_tcr_pmhc_unit": item.contains_tcr_pmhc_unit,
+        },
+    )
 
     extraction_manifest = {
         "num_extracted_dimer_structures": 0,

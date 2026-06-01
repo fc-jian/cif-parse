@@ -27,6 +27,7 @@ from cif_parse.clustering.protein_structures import (
     parse_usalign_output,
 )
 from cif_parse.clustering.parallel import normalize_worker_count
+from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
@@ -1026,6 +1027,25 @@ def build_tcr_complex_signature_clusters(
             start=1,
         )
     ]
+    write_signature_cluster_membership_csv(
+        outdir / "tcr_complex_signature_cluster_membership.csv",
+        signature_groups,
+        observation_id_field="complex_observation_id",
+        observation_id=lambda item: item.complex_observation_id,
+        extra_fields=lambda item: {
+            "complex_id": item.complex_id,
+            "tcr_type": item.tcr_type,
+            "mhc_class": item.mhc_class,
+            "tcr_chain_ids": json.dumps(item.tcr_chain_ids, ensure_ascii=False),
+            "mhc_chain_ids": json.dumps(item.mhc_chain_ids, ensure_ascii=False),
+            "peptide_chain_ids": json.dumps(item.peptide_chain_ids, ensure_ascii=False),
+            "num_tcr_chains": item.num_tcr_chains,
+            "num_peptide_chains": item.num_peptide_chains,
+            "num_tcr_pmhc_interfaces": item.num_tcr_pmhc_interfaces,
+            "contact_score": item.contact_score,
+            "num_unclustered_monomer_members": item.num_unclustered_monomer_members,
+        },
+    )
 
     extraction_manifest = {
         "num_extracted_tcr_complex_structures": 0,

@@ -81,10 +81,17 @@ antibody_complex_mode = "signature"
 # - "greedy": run overall complex USalign and split low-TM members.
 antibody_complex_structure_mode = "greedy"
 
-# Minimum overall max(TM(query,target), TM(target,query)) for keeping two
+# Minimum interface-residue max(TM(query,target), TM(target,query)) for keeping two
 # antibody-antigen complexes in the same refined cluster.
 # Allowed values: float in [0, 1].
 antibody_complex_tm_score_threshold = 0.50
+
+# Distance cutoff (in Angstroms) for selecting antibody-antigen interface
+# residues written to PDBs before USalign refinement. This default is
+# intentionally broader than dimer_interface_residue_cutoff because antibody
+# chains are one part and all antigen chains together are the other part.
+# Allowed values: float > 0.
+antibody_complex_interface_residue_cutoff = 20.0
 
 # TCR-pMHC complex clustering mode.
 # Options:

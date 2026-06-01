@@ -21,7 +21,7 @@ from biotite.structure.io.pdbx import get_assembly, get_structure
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from cif_parse.clustering.dimers import DimerObservation, extract_dimer_structure  # noqa: E402
+from cif_parse.clustering.dimers import ChainSpec, DimerObservation, extract_dimer_structure  # noqa: E402
 from cif_parse.interact.contacts import (  # noqa: E402
     build_chain_geometries,
     build_instance_geometries,
@@ -53,6 +53,25 @@ def _chain_record(chain_map: dict[str, Any], chain_id: str) -> Any:
     )
 
 
+def _parse_chain_ids(text: str, arg_name: str) -> list[str]:
+    chain_ids = [item.strip() for item in text.replace("+", ",").split(",") if item.strip()]
+    if not chain_ids:
+        raise ValueError(f"{arg_name} must contain at least one chain id")
+    return chain_ids
+
+
+def _parse_sym_ids(text: str | None, expected_count: int, arg_name: str) -> list[int | None]:
+    if text is None or text == "":
+        return [None] * expected_count
+    values: list[int | None] = []
+    for item in text.split(","):
+        stripped = item.strip()
+        values.append(None if stripped in {"", "none", "None", "null", "NULL"} else int(stripped))
+    if len(values) != expected_count:
+        raise ValueError(f"{arg_name} must provide {expected_count} comma-separated value(s)")
+    return values
+
+
 def _resolve_sym_id(atom_array: Any, chain_id: str, requested: int | None, arg_name: str) -> int | None:
     if not hasattr(atom_array, "sym_id"):
         if requested is not None:
@@ -72,6 +91,18 @@ def _resolve_sym_id(atom_array: Any, chain_id: str, requested: int | None, arg_n
     raise ValueError(
         f"Chain {chain_id!r} has multiple sym_id values {values}; pass {arg_name} to choose one instance"
     )
+
+
+def _resolve_part_specs(
+    atom_array: Any,
+    chain_ids: list[str],
+    requested_sym_ids: list[int | None],
+    arg_name: str,
+) -> list[ChainSpec]:
+    return [
+        (chain_id, _resolve_sym_id(atom_array, chain_id, sym_id, f"{arg_name}[{index}]"))
+        for index, (chain_id, sym_id) in enumerate(zip(chain_ids, requested_sym_ids, strict=True), start=1)
+    ]
 
 
 def _select_instance(atom_array: Any, chain_id: str, sym_id: int | None) -> Any:
@@ -104,14 +135,16 @@ def _load_coordinates(cif_path: Path, *, assembly_id: str | None, model: int) ->
     return cif_file, atom_array
 
 
+def _geometry_key(chain_id: str, sym_id: int | None, has_sym_id: bool) -> str:
+    return f"{chain_id}@{int(sym_id or 0) + 1}" if has_sym_id else chain_id
+
+
 def _compute_pair_metrics(
     pair_atoms: Any,
     chain_records: list[Any],
     *,
-    chain_id_1: str,
-    chain_id_2: str,
-    sym_id_1: int | None,
-    sym_id_2: int | None,
+    part_1: list[ChainSpec],
+    part_2: list[ChainSpec],
     residue_contact_cutoff: float,
     atom_contact_cutoff: float,
     min_residue_contacts: int,
@@ -119,25 +152,51 @@ def _compute_pair_metrics(
 ) -> dict[str, Any] | None:
     if hasattr(pair_atoms, "sym_id"):
         geometries = build_instance_geometries(pair_atoms, chain_records)
-        key_1 = f"{chain_id_1}@{int(sym_id_1 or 0) + 1}"
-        key_2 = f"{chain_id_2}@{int(sym_id_2 or 0) + 1}"
+        has_sym_id = True
     else:
-        if chain_id_1 == chain_id_2:
-            raise ValueError("Same-chain dimer instances require sym_id annotation")
         geometries = build_chain_geometries(pair_atoms, chain_records)
-        key_1 = chain_id_1
-        key_2 = chain_id_2
+        has_sym_id = False
 
-    if key_1 not in geometries or key_2 not in geometries:
-        raise ValueError(f"Could not build geometries for {key_1!r} and {key_2!r}")
-    return compute_interface_metrics(
-        geometries[key_1],
-        geometries[key_2],
-        residue_contact_cutoff=residue_contact_cutoff,
-        atom_contact_cutoff=atom_contact_cutoff,
-        min_residue_contacts=min_residue_contacts,
-        min_atom_contacts=min_atom_contacts,
-    )
+    part_1_keys = [_geometry_key(chain_id, sym_id, has_sym_id) for chain_id, sym_id in part_1]
+    part_2_keys = [_geometry_key(chain_id, sym_id, has_sym_id) for chain_id, sym_id in part_2]
+    missing = [key for key in [*part_1_keys, *part_2_keys] if key not in geometries]
+    if missing:
+        raise ValueError(f"Could not build geometries for {missing!r}")
+
+    metrics_list: list[dict[str, Any]] = []
+    for key_1 in part_1_keys:
+        for key_2 in part_2_keys:
+            metrics = compute_interface_metrics(
+                geometries[key_1],
+                geometries[key_2],
+                residue_contact_cutoff=residue_contact_cutoff,
+                atom_contact_cutoff=atom_contact_cutoff,
+                min_residue_contacts=0,
+                min_atom_contacts=0,
+            )
+            if metrics is not None:
+                metrics_list.append(metrics)
+
+    if not metrics_list:
+        return None
+
+    summary = {
+        "num_residue_contacts": sum(int(item.get("num_residue_contacts", 0) or 0) for item in metrics_list),
+        "num_atom_contacts": sum(int(item.get("num_atom_contacts", 0) or 0) for item in metrics_list),
+        "buried_area": sum(float(item.get("buried_area", 0.0) or 0.0) for item in metrics_list),
+        "interface_residue_count_1": sum(
+            int(item.get("interface_residue_count_1", 0) or 0) for item in metrics_list
+        ),
+        "interface_residue_count_2": sum(
+            int(item.get("interface_residue_count_2", 0) or 0) for item in metrics_list
+        ),
+        "chain_pair_metrics": metrics_list,
+    }
+    if summary["num_residue_contacts"] < min_residue_contacts:
+        return None
+    if summary["num_atom_contacts"] < min_atom_contacts:
+        return None
+    return summary
 
 
 def _observation(
@@ -145,36 +204,46 @@ def _observation(
     cif_path: Path,
     pdb_id: str,
     assembly_id: str | None,
-    chain_1: Any,
-    chain_2: Any,
-    chain_id_1: str,
-    chain_id_2: str,
-    sym_id_1: int | None,
-    sym_id_2: int | None,
+    part_1_records: list[Any],
+    part_2_records: list[Any],
+    part_1: list[ChainSpec],
+    part_2: list[ChainSpec],
     metrics: dict[str, Any],
 ) -> DimerObservation:
+    chain_ids_1 = [chain_id for chain_id, _ in part_1]
+    chain_ids_2 = [chain_id for chain_id, _ in part_2]
+    sym_ids_1 = [sym_id for _, sym_id in part_1]
+    sym_ids_2 = [sym_id for _, sym_id in part_2]
     return DimerObservation(
-        dimer_observation_id=f"{pdb_id}:{assembly_id or 'na'}:{chain_id_1}:{sym_id_1 or 0}:{chain_id_2}:{sym_id_2 or 0}",
+        dimer_observation_id=(
+            f"{pdb_id}:{assembly_id or 'na'}:"
+            f"{'+'.join(chain_ids_1)}:{'+'.join(str(sym_id or 0) for sym_id in sym_ids_1)}:"
+            f"{'+'.join(chain_ids_2)}:{'+'.join(str(sym_id or 0) for sym_id in sym_ids_2)}"
+        ),
         pdb_id=pdb_id,
         source_path=str(cif_path),
         assembly_id=assembly_id,
         assembly_mode="assembly" if assembly_id else "asymmetric_unit",
-        sym_id_1=sym_id_1,
-        label_asym_id_1=chain_id_1,
-        auth_asym_id_1=getattr(chain_1, "auth_asym_id", None),
-        chain_type_1=getattr(chain_1, "chain_type", "other protein chain"),
-        monomer_id_1=f"{pdb_id}:{assembly_id or 'na'}:{chain_id_1}",
+        sym_id_1=sym_ids_1[0] if len(sym_ids_1) == 1 else None,
+        label_asym_id_1="+".join(chain_ids_1),
+        auth_asym_id_1="+".join(str(getattr(record, "auth_asym_id", "") or "") for record in part_1_records) or None,
+        chain_type_1="chain part 1",
+        monomer_id_1=f"{pdb_id}:{assembly_id or 'na'}:{'+'.join(chain_ids_1)}",
         monomer_sequence_cluster_id_1=None,
         monomer_structure_cluster_id_1=None,
-        sym_id_2=sym_id_2,
-        label_asym_id_2=chain_id_2,
-        auth_asym_id_2=getattr(chain_2, "auth_asym_id", None),
-        chain_type_2=getattr(chain_2, "chain_type", "other protein chain"),
-        monomer_id_2=f"{pdb_id}:{assembly_id or 'na'}:{chain_id_2}",
+        sym_id_2=sym_ids_2[0] if len(sym_ids_2) == 1 else None,
+        label_asym_id_2="+".join(chain_ids_2),
+        auth_asym_id_2="+".join(str(getattr(record, "auth_asym_id", "") or "") for record in part_2_records) or None,
+        chain_type_2="chain part 2",
+        monomer_id_2=f"{pdb_id}:{assembly_id or 'na'}:{'+'.join(chain_ids_2)}",
         monomer_sequence_cluster_id_2=None,
         monomer_structure_cluster_id_2=None,
-        interface_label=f"{getattr(chain_1, 'chain_type', 'chain')}__{getattr(chain_2, 'chain_type', 'chain')}",
-        is_same_entity=getattr(chain_1, "entity_id", "") == getattr(chain_2, "entity_id", ""),
+        interface_label="chain_part_1__chain_part_2",
+        is_same_entity=(
+            len(part_1_records) == 1
+            and len(part_2_records) == 1
+            and getattr(part_1_records[0], "entity_id", "") == getattr(part_2_records[0], "entity_id", "")
+        ),
         contains_antibody_unit=False,
         contains_tcr_pmhc_unit=False,
         buried_area=float(metrics.get("buried_area", 0.0) or 0.0),
@@ -193,7 +262,11 @@ def _save_pymol_session_with_cmd(
     full_pdb: Path,
     interface_pdb: Path,
     pse_path: Path,
+    part_1_pdb_chain_ids: list[str],
+    part_2_pdb_chain_ids: list[str],
 ) -> None:
+    part_1_selection = f"interface_residues and chain {'+'.join(part_1_pdb_chain_ids)}"
+    part_2_selection = f"interface_residues and chain {'+'.join(part_2_pdb_chain_ids)}"
     cmd.reinitialize()
     cmd.load(str(full_pdb), "full_dimer")
     cmd.load(str(interface_pdb), "interface_residues")
@@ -201,8 +274,8 @@ def _save_pymol_session_with_cmd(
     cmd.show("cartoon", "full_dimer")
     cmd.show("sticks", "interface_residues")
     cmd.color("gray70", "full_dimer")
-    cmd.color("orange", "interface_residues and chain A")
-    cmd.color("marine", "interface_residues and chain B")
+    cmd.color("orange", part_1_selection)
+    cmd.color("marine", part_2_selection)
     cmd.set("transparency", 0.65, "full_dimer")
     cmd.zoom("interface_residues")
     cmd.save(str(pse_path))
@@ -213,6 +286,8 @@ def _build_pymol_session(
     *,
     full_pdb: Path,
     interface_pdb: Path,
+    part_1_pdb_chain_ids: list[str],
+    part_2_pdb_chain_ids: list[str],
 ) -> None:
     try:
         import pymol2  # type: ignore[import-not-found]
@@ -223,6 +298,8 @@ def _build_pymol_session(
                 full_pdb=full_pdb,
                 interface_pdb=interface_pdb,
                 pse_path=pse_path,
+                part_1_pdb_chain_ids=part_1_pdb_chain_ids,
+                part_2_pdb_chain_ids=part_2_pdb_chain_ids,
             )
     except ImportError:
         try:
@@ -238,6 +315,8 @@ def _build_pymol_session(
                 full_pdb=full_pdb,
                 interface_pdb=interface_pdb,
                 pse_path=pse_path,
+                part_1_pdb_chain_ids=part_1_pdb_chain_ids,
+                part_2_pdb_chain_ids=part_2_pdb_chain_ids,
             )
         finally:
             cmd.quit()
@@ -254,41 +333,62 @@ def build_visual_check(args: argparse.Namespace) -> dict[str, Any]:
     cif_file, atom_array = _load_coordinates(cif_path, assembly_id=args.assembly_id, model=args.model)
     chains = read_chain_inventory(cif_path, model=args.model, cif_file=cif_file)
     chain_map = {chain.label_asym_id: chain for chain in chains}
-    chain_1 = _chain_record(chain_map, args.chain_id_1)
-    chain_2 = _chain_record(chain_map, args.chain_id_2)
+    part_1_chain_ids = _parse_chain_ids(args.part_1_chain_ids, "part_1_chain_ids")
+    part_2_chain_ids = _parse_chain_ids(args.part_2_chain_ids, "part_2_chain_ids")
+    part_1_sym_text = args.part_1_sym_ids
+    part_2_sym_text = args.part_2_sym_ids
+    if args.sym_id_1 is not None:
+        if len(part_1_chain_ids) != 1:
+            raise ValueError("--sym-id-1 can only be used when part 1 has one chain")
+        part_1_sym_text = str(args.sym_id_1)
+    if args.sym_id_2 is not None:
+        if len(part_2_chain_ids) != 1:
+            raise ValueError("--sym-id-2 can only be used when part 2 has one chain")
+        part_2_sym_text = str(args.sym_id_2)
 
-    sym_id_1 = _resolve_sym_id(atom_array, args.chain_id_1, args.sym_id_1, "--sym-id-1")
-    sym_id_2 = _resolve_sym_id(atom_array, args.chain_id_2, args.sym_id_2, "--sym-id-2")
-    atoms_1 = _select_instance(atom_array, args.chain_id_1, sym_id_1)
-    atoms_2 = _select_instance(atom_array, args.chain_id_2, sym_id_2)
-    pair_atoms = struc.concatenate([atoms_1, atoms_2])
+    part_1 = _resolve_part_specs(
+        atom_array,
+        part_1_chain_ids,
+        _parse_sym_ids(part_1_sym_text, len(part_1_chain_ids), "--part-1-sym-ids"),
+        "--part-1-sym-ids",
+    )
+    part_2 = _resolve_part_specs(
+        atom_array,
+        part_2_chain_ids,
+        _parse_sym_ids(part_2_sym_text, len(part_2_chain_ids), "--part-2-sym-ids"),
+        "--part-2-sym-ids",
+    )
+    part_1_records = [_chain_record(chain_map, chain_id) for chain_id in part_1_chain_ids]
+    part_2_records = [_chain_record(chain_map, chain_id) for chain_id in part_2_chain_ids]
+
+    part_atoms = [
+        _select_instance(atom_array, chain_id, sym_id)
+        for chain_id, sym_id in [*part_1, *part_2]
+    ]
+    pair_atoms = struc.concatenate(part_atoms)
 
     metrics = _compute_pair_metrics(
         pair_atoms,
-        [chain_1, chain_2],
-        chain_id_1=args.chain_id_1,
-        chain_id_2=args.chain_id_2,
-        sym_id_1=sym_id_1,
-        sym_id_2=sym_id_2,
+        [*part_1_records, *part_2_records],
+        part_1=part_1,
+        part_2=part_2,
         residue_contact_cutoff=args.residue_contact_cutoff,
         atom_contact_cutoff=args.atom_contact_cutoff,
         min_residue_contacts=args.min_residue_contacts,
         min_atom_contacts=args.min_atom_contacts,
     )
     if metrics is None:
-        raise ValueError("No qualifying interaction found for the requested chain pair")
+        raise ValueError("No qualifying interaction found for the requested chain parts")
 
-    pdb_id = getattr(chain_1, "pdb_id", None) or cif_path.stem.split(".")[0]
+    pdb_id = getattr(part_1_records[0], "pdb_id", None) or cif_path.stem.split(".")[0]
     observation = _observation(
         cif_path=cif_path,
         pdb_id=str(pdb_id),
         assembly_id=args.assembly_id,
-        chain_1=chain_1,
-        chain_2=chain_2,
-        chain_id_1=args.chain_id_1,
-        chain_id_2=args.chain_id_2,
-        sym_id_1=sym_id_1,
-        sym_id_2=sym_id_2,
+        part_1_records=part_1_records,
+        part_2_records=part_2_records,
+        part_1=part_1,
+        part_2=part_2,
         metrics=metrics,
     )
 
@@ -298,6 +398,7 @@ def build_visual_check(args: argparse.Namespace) -> dict[str, Any]:
         atom_array=pair_atoms,
         drop_hydrogens=not args.keep_hydrogens,
         interface_residue_cutoff=None,
+        chain_parts=[part_1, part_2],
     )
     interface = extract_dimer_structure(
         observation,
@@ -305,6 +406,7 @@ def build_visual_check(args: argparse.Namespace) -> dict[str, Any]:
         atom_array=pair_atoms,
         drop_hydrogens=not args.keep_hydrogens,
         interface_residue_cutoff=args.interface_residue_cutoff,
+        chain_parts=[part_1, part_2],
     )
 
     full_pdb = outdir / "full_dimer.pdb"
@@ -320,20 +422,24 @@ def build_visual_check(args: argparse.Namespace) -> dict[str, Any]:
         pse_path,
         full_pdb=full_pdb,
         interface_pdb=interface_pdb,
+        part_1_pdb_chain_ids=interface.part_1_pdb_chain_ids or [],
+        part_2_pdb_chain_ids=interface.part_2_pdb_chain_ids or [],
     )
 
     summary = {
         "cif": str(cif_path),
-        "chain_id_1": args.chain_id_1,
-        "chain_id_2": args.chain_id_2,
+        "part_1_chain_ids": part_1_chain_ids,
+        "part_2_chain_ids": part_2_chain_ids,
         "assembly_id": args.assembly_id,
-        "sym_id_1": sym_id_1,
-        "sym_id_2": sym_id_2,
+        "part_1_sym_ids": [sym_id for _, sym_id in part_1],
+        "part_2_sym_ids": [sym_id for _, sym_id in part_2],
         "num_residue_contacts": int(metrics.get("num_residue_contacts", 0) or 0),
         "num_atom_contacts": int(metrics.get("num_atom_contacts", 0) or 0),
         "buried_area": float(metrics.get("buried_area", 0.0) or 0.0),
         "full_dimer_pdb": str(full_pdb),
         "interface_residue_pdb": str(interface_pdb),
+        "part_1_pdb_chain_ids": interface.part_1_pdb_chain_ids or [],
+        "part_2_pdb_chain_ids": interface.part_2_pdb_chain_ids or [],
         "metrics_json": str(metrics_path),
         "pymol_pse": str(pse_path),
     }
@@ -347,16 +453,18 @@ def build_visual_check(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate interaction between two CIF chains, extract the full dimer "
+            "Validate interaction between two CIF chain parts, extract the full dimer "
             "and interface-residue dimer PDBs, and build a PyMOL PSE with the PyMOL cmd API."
         )
     )
     parser.add_argument("cif", type=Path, help="Input .cif/.cif.gz/.bcif file")
-    parser.add_argument("chain_id_1", help="First label_asym_id")
-    parser.add_argument("chain_id_2", help="Second label_asym_id")
+    parser.add_argument("part_1_chain_ids", help="First chain part as comma-separated label_asym_id values")
+    parser.add_argument("part_2_chain_ids", help="Second chain part as comma-separated label_asym_id values")
     parser.add_argument("--assembly-id", default=None, help="Optional biological assembly id")
-    parser.add_argument("--sym-id-1", type=int, default=None, help="Optional sym_id for chain 1")
-    parser.add_argument("--sym-id-2", type=int, default=None, help="Optional sym_id for chain 2")
+    parser.add_argument("--part-1-sym-ids", default=None, help="Optional comma-separated sym_id values for part 1")
+    parser.add_argument("--part-2-sym-ids", default=None, help="Optional comma-separated sym_id values for part 2")
+    parser.add_argument("--sym-id-1", type=int, default=None, help="Alias for --part-1-sym-ids with one chain")
+    parser.add_argument("--sym-id-2", type=int, default=None, help="Alias for --part-2-sym-ids with one chain")
     parser.add_argument("--outdir", type=Path, default=Path("dimer_interface_visual_check"))
     parser.add_argument("--model", type=int, default=1)
     parser.add_argument("--residue-contact-cutoff", type=float, default=8.0)

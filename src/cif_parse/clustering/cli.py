@@ -378,13 +378,22 @@ def build_parser(
         "--antibody-complex-structure-mode",
         choices=sorted(SUPPORTED_CLUSTERING_STRUCTURE_MODES),
         default=str(clustering_defaults.get("antibody_complex_structure_mode", "greedy")),
-        help="How to refine signature-matched antibody-antigen complexes by overall complex TM-score",
+        help="How to refine signature-matched antibody-antigen complexes by interface-residue TM-score",
     )
     parser.add_argument(
         "--antibody-complex-tm-score-threshold",
         type=float,
         default=float(clustering_defaults.get("antibody_complex_tm_score_threshold", 0.50)),
-        help="Minimum overall antibody-complex max(TM(query,target), TM(target,query)) to keep two complexes together",
+        help="Minimum antibody-antigen interface-residue max(TM(query,target), TM(target,query)) to keep two complexes together",
+    )
+    parser.add_argument(
+        "--antibody-complex-interface-residue-cutoff",
+        type=float,
+        default=float(clustering_defaults.get("antibody_complex_interface_residue_cutoff", 20.0)),
+        help=(
+            "Distance cutoff in Angstroms for selecting antibody-antigen interface residues "
+            "before USalign"
+        ),
     )
     parser.add_argument(
         "--tcr-complex-mode",
@@ -763,6 +772,7 @@ def _build_high_order_specs(args: argparse.Namespace, sequence_dataset: dict[str
             "outdir": args.outdir / "antibody_complex_clusters",
             "structure_refinement_mode": args.antibody_complex_structure_mode,
             "antibody_complex_tm_score_threshold": args.antibody_complex_tm_score_threshold,
+            "antibody_complex_interface_residue_cutoff": args.antibody_complex_interface_residue_cutoff,
         }))
     if args.multimer_mode == "signature":
         specs.append(("multimer", {
@@ -874,6 +884,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--{field_name.replace('_', '-')} must be >= 1")
     if args.dimer_interface_residue_cutoff <= 0:
         parser.error("--dimer-interface-residue-cutoff must be > 0")
+    if args.antibody_complex_interface_residue_cutoff <= 0:
+        parser.error("--antibody-complex-interface-residue-cutoff must be > 0")
 
     from cif_parse.clustering.parallel import set_global_usalign_limit
 

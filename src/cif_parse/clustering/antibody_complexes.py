@@ -11,9 +11,7 @@ from typing import Any, Callable, Iterable
 
 from tqdm import tqdm
 
-import biotite.structure as struc
-from biotite.structure import AtomArray, get_residues
-from biotite.structure.io.pdb import PDBFile
+from biotite.structure import AtomArray
 
 from cif_parse.clustering.common import (
     canonical_monomer_id,
@@ -21,20 +19,19 @@ from cif_parse.clustering.common import (
     load_monomer_inventory,
     resolve_monomer_cluster,
 )
+from cif_parse.clustering.dimers import DimerObservation, extract_dimer_structure
 from cif_parse.clustering.high_order_refinement import refine_signature_groups_three_phase
 from cif_parse.clustering.protein_structures import (
     USalignAlignmentResult,
     parse_usalign_output,
 )
 from cif_parse.clustering.parallel import normalize_worker_count
+from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
-from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
 
 
 LOGGER = logging.getLogger(__name__)
-
-PDB_CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
 def _signature_index(signature_cluster_id: str) -> str:
@@ -164,46 +161,83 @@ class ExtractedAntibodyComplexStructure:
     residue_count: int
     atom_count: int
     filter_counts: dict[str, int]
+    interface_residue_cutoff: float | None = None
+    interface_residue_count_1: int | None = None
+    interface_residue_count_2: int | None = None
+    interface_atom_contact_count: int | None = None
+    antibody_pdb_chain_ids: list[str] | None = None
+    antigen_pdb_chain_ids: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def _pdb_chain_id(index: int) -> str:
-    if index >= len(PDB_CHAIN_IDS):
-        raise ValueError(f"Too many antibody-complex chains for PDB export: {index + 1}")
-    return PDB_CHAIN_IDS[index]
-
-
-def _select_chain_atoms(atom_array: AtomArray, chain_id: str, sym_id: int | None = None) -> AtomArray:
-    mask = atom_array.chain_id == chain_id
-    if hasattr(atom_array, "hetero"):
-        mask &= ~atom_array.hetero
-    if sym_id is not None and hasattr(atom_array, "sym_id"):
-        mask &= atom_array.sym_id == sym_id
-    return atom_array[mask]
-
-
-def _coerce_chain_id(atom_array: AtomArray, chain_id: str) -> AtomArray:
-    copied = atom_array.copy()
-    copied.chain_id[:] = chain_id
-    return copied
-
-
-def _structure_chain_ids(
-    observation: AntibodyComplexObservation,
-) -> list[str]:
-    chain_ids: list[str] = []
+def _ordered_unique_chain_ids(chain_ids: Iterable[str]) -> list[str]:
+    ordered: list[str] = []
     seen: set[str] = set()
-    for chain_id in [
-        *observation.antibody_chain_ids,
-        *observation.antigen_chain_ids,
-        *observation.structural_auxiliary_chain_ids,
-    ]:
+    for chain_id in chain_ids:
         if chain_id and chain_id not in seen:
             seen.add(chain_id)
-            chain_ids.append(chain_id)
-    return chain_ids
+            ordered.append(chain_id)
+    return ordered
+
+
+def _antibody_antigen_chain_parts(
+    observation: AntibodyComplexObservation,
+) -> tuple[list[str], list[str]]:
+    antibody_chain_ids = _ordered_unique_chain_ids(observation.antibody_chain_ids)
+    antigen_chain_ids = _ordered_unique_chain_ids(observation.antigen_chain_ids)
+    if not antibody_chain_ids:
+        raise ValueError(
+            f"Antibody complex {observation.complex_observation_id} has no antibody chains"
+        )
+    if not antigen_chain_ids:
+        raise ValueError(
+            f"Antibody complex {observation.complex_observation_id} has no antigen chains"
+        )
+    return antibody_chain_ids, antigen_chain_ids
+
+
+def _dimer_observation_for_antibody_complex(
+    observation: AntibodyComplexObservation,
+    antibody_chain_ids: list[str],
+    antigen_chain_ids: list[str],
+) -> DimerObservation:
+    return DimerObservation(
+        dimer_observation_id=observation.complex_observation_id,
+        pdb_id=observation.pdb_id,
+        source_path=observation.source_path,
+        assembly_id=observation.assembly_id,
+        assembly_mode=observation.assembly_mode,
+        sym_id_1=None,
+        label_asym_id_1="+".join(antibody_chain_ids),
+        auth_asym_id_1="+".join(observation.antibody_auth_asym_ids) or None,
+        chain_type_1="antibody chain set",
+        monomer_id_1=f"{observation.complex_observation_id}:antibody",
+        monomer_sequence_cluster_id_1=None,
+        monomer_structure_cluster_id_1=None,
+        sym_id_2=None,
+        label_asym_id_2="+".join(antigen_chain_ids),
+        auth_asym_id_2="+".join(observation.antigen_auth_asym_ids) or None,
+        chain_type_2="antigen chain set",
+        monomer_id_2=f"{observation.complex_observation_id}:antigen",
+        monomer_sequence_cluster_id_2=None,
+        monomer_structure_cluster_id_2=None,
+        interface_label="antibody_chain_set__antigen_chain_set",
+        is_same_entity=False,
+        contains_antibody_unit=True,
+        contains_tcr_pmhc_unit=False,
+        buried_area=float(observation.contact_score),
+        num_residue_contacts=int(observation.num_antibody_antigen_interfaces),
+        num_atom_contacts=0,
+        signature_key=observation.signature_key,
+        signature_members=[
+            *observation.antibody_member_descriptors,
+            *observation.antigen_member_descriptors,
+        ],
+        cluster_source_1="antibody_complex",
+        cluster_source_2="antibody_complex",
+    )
 
 
 def _build_antibody_observation(
@@ -605,6 +639,7 @@ def extract_antibody_complex_structure(
     model: int = 1,
     drop_hydrogens: bool = True,
     atom_array: AtomArray | None = None,
+    interface_residue_cutoff: float | None = 20.0,
 ) -> ExtractedAntibodyComplexStructure:
     if not observation.source_path:
         raise ValueError(
@@ -615,87 +650,39 @@ def extract_antibody_complex_structure(
             f"Cached coordinates are required for antibody complex {observation.complex_observation_id}"
         )
 
-    chain_ids = _structure_chain_ids(observation)
-    # In assembly mode, sym copies of the same chain exist. Pick one
-    # representative sym_id per chain so the extracted PDB only contains
-    # the complex members, not 60x copies of every chain.
-    chain_sym: dict[str, int | None] = {}
-    _has_sym = hasattr(atom_array, "sym_id")
-    for chain_id in chain_ids:
-        chain_mask = atom_array.chain_id == chain_id
-        if not chain_mask.any():
-            continue
-        if _has_sym:
-            chain_syms = frozenset(atom_array.sym_id[chain_mask])
-            if chain_syms:
-                chain_sym[chain_id] = min(chain_syms)
-            else:
-                chain_sym[chain_id] = None
-        else:
-            chain_sym[chain_id] = None
-
-    # Try to pick a common sym_id across all chains to keep the complex
-    # geometrically consistent.
-    sym_sets = [frozenset(atom_array.sym_id[atom_array.chain_id == cid])
-                for cid in chain_ids
-                if _has_sym and (atom_array.chain_id == cid).any()
-                and frozenset(atom_array.sym_id[atom_array.chain_id == cid])]
-    common_sym: int | None = None
-    if sym_sets:
-        common = sym_sets[0]
-        for s in sym_sets[1:]:
-            common = common & s
-        if common:
-            common_sym = min(common)
-
-    chain_arrays: list[AtomArray] = []
-    for chain_index, chain_id in enumerate(chain_ids):
-        sym = common_sym if common_sym is not None else chain_sym.get(chain_id)
-        selected = _select_chain_atoms(atom_array, chain_id, sym_id=sym)
-        if selected.array_length() == 0:
-            continue
-        chain_arrays.append(_coerce_chain_id(selected, _pdb_chain_id(chain_index)))
-    if not chain_arrays:
-        raise ValueError(
-            f"No polymer atoms found for antibody complex {observation.complex_observation_id}"
-        )
-
-    complex_atoms = struc.concatenate(chain_arrays)
-    complex_atoms, filter_counts = filter_atom_array_for_analysis(
-        complex_atoms,
+    antibody_chain_ids, antigen_chain_ids = _antibody_antigen_chain_parts(observation)
+    extracted = extract_dimer_structure(
+        _dimer_observation_for_antibody_complex(
+            observation,
+            antibody_chain_ids,
+            antigen_chain_ids,
+        ),
+        outdir=outdir,
+        model=model,
         drop_hydrogens=drop_hydrogens,
-        drop_nonfinite=True,
+        atom_array=atom_array,
+        interface_residue_cutoff=interface_residue_cutoff,
+        chain_parts=[
+            [(chain_id, None) for chain_id in antibody_chain_ids],
+            [(chain_id, None) for chain_id in antigen_chain_ids],
+        ],
     )
-    if complex_atoms.array_length() == 0:
-        raise ValueError(
-            f"No analyzable atoms left for antibody complex {observation.complex_observation_id}"
-        )
-    _, residue_names = get_residues(complex_atoms)
-    residue_count = int(len(residue_names))
-    if residue_count <= 2:
-        raise ValueError(
-            f"Resolved residue count {residue_count} is too short for antibody complex USalign: "
-            f"{observation.complex_observation_id}"
-        )
-
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    pdb_path = outdir / (
-        f"{observation.pdb_id}_{observation.assembly_id or 'asu'}_{observation.complex_id}.pdb"
-    )
-    pdb_file = PDBFile()
-    pdb_file.set_structure(complex_atoms)
-    pdb_file.write(pdb_path)
     return ExtractedAntibodyComplexStructure(
         complex_observation_id=observation.complex_observation_id,
         pdb_id=observation.pdb_id,
         source_path=observation.source_path,
         assembly_id=observation.assembly_id,
         complex_id=observation.complex_id,
-        extracted_pdb_path=str(pdb_path),
-        residue_count=residue_count,
-        atom_count=int(complex_atoms.array_length()),
-        filter_counts=atom_array_filter_counts(filter_counts),
+        extracted_pdb_path=extracted.extracted_pdb_path,
+        residue_count=extracted.residue_count,
+        atom_count=extracted.atom_count,
+        filter_counts=extracted.filter_counts,
+        interface_residue_cutoff=extracted.interface_residue_cutoff,
+        interface_residue_count_1=extracted.interface_residue_count_1,
+        interface_residue_count_2=extracted.interface_residue_count_2,
+        interface_atom_contact_count=extracted.interface_atom_contact_count,
+        antibody_pdb_chain_ids=extracted.part_1_pdb_chain_ids,
+        antigen_pdb_chain_ids=extracted.part_2_pdb_chain_ids,
     )
 
 
@@ -705,6 +692,7 @@ def extract_antibody_complex_structures(
     outdir: str | Path,
     model: int = 1,
     drop_hydrogens: bool = True,
+    interface_residue_cutoff: float | None = 20.0,
     extraction_jobs: int = 1,
     prep_dir: str | Path | None = None,
     show_progress: bool = True,
@@ -729,7 +717,8 @@ def extract_antibody_complex_structures(
     def _try_assemble_ab(obs: AntibodyComplexObservation) -> AtomArray | None:
         if _pkl_reader is None:
             return None
-        chain_ids = _structure_chain_ids(obs)
+        antibody_chain_ids, antigen_chain_ids = _antibody_antigen_chain_parts(obs)
+        chain_ids = _ordered_unique_chain_ids([*antibody_chain_ids, *antigen_chain_ids])
         if not chain_ids:
             return None
         return _pkl_reader.load_chains(
@@ -750,6 +739,7 @@ def extract_antibody_complex_structures(
             model=model,
             drop_hydrogens=drop_hydrogens,
             atom_array=atom_array,
+            interface_residue_cutoff=interface_residue_cutoff,
         )
 
     if extraction_jobs <= 1 or len(sorted_observations) <= 1:
@@ -813,6 +803,9 @@ def extract_antibody_complex_structures(
         "num_extracted_antibody_complex_structures": len(structures),
         "num_failed_antibody_complex_structure_extractions": len(failures),
         "extraction_jobs": extraction_jobs,
+        "antibody_complex_interface_residue_cutoff": (
+            float(interface_residue_cutoff) if interface_residue_cutoff is not None else None
+        ),
     }
     dump_json(outdir / "antibody_complex_structure_manifest.json", manifest, indent=2)
     if log_summary:
@@ -1053,6 +1046,7 @@ def build_antibody_complex_signature_clusters(
     outdir: str | Path,
     structure_refinement_mode: str = "greedy",
     antibody_complex_tm_score_threshold: float = 0.50,
+    antibody_complex_interface_residue_cutoff: float | None = 20.0,
     model: int = 1,
     drop_hydrogens: bool = True,
     usalign_executable: str = "USalign",
@@ -1096,6 +1090,22 @@ def build_antibody_complex_signature_clusters(
             start=1,
         )
     ]
+    write_signature_cluster_membership_csv(
+        outdir / "antibody_complex_signature_cluster_membership.csv",
+        signature_groups,
+        observation_id_field="complex_observation_id",
+        observation_id=lambda item: item.complex_observation_id,
+        extra_fields=lambda item: {
+            "complex_id": item.complex_id,
+            "antibody_unit_type": item.antibody_unit_type,
+            "antibody_chain_ids": json.dumps(item.antibody_chain_ids, ensure_ascii=False),
+            "antigen_chain_ids": json.dumps(item.antigen_chain_ids, ensure_ascii=False),
+            "num_antigen_chains": item.num_antigen_chains,
+            "num_antibody_antigen_interfaces": item.num_antibody_antigen_interfaces,
+            "contact_score": item.contact_score,
+            "num_unclustered_monomer_members": item.num_unclustered_monomer_members,
+        },
+    )
 
     extraction_manifest = {
         "num_extracted_antibody_complex_structures": 0,
@@ -1163,6 +1173,7 @@ def build_antibody_complex_signature_clusters(
                         outdir=group_outdir,
                         model=model,
                         drop_hydrogens=drop_hydrogens,
+                        interface_residue_cutoff=antibody_complex_interface_residue_cutoff,
                         extraction_jobs=1,
                         prep_dir=prep_dir,
                         show_progress=False,
@@ -1233,6 +1244,11 @@ def build_antibody_complex_signature_clusters(
                 ],
                 "extraction_jobs": normalize_worker_count(alignment_jobs),
                 "num_signature_groups_pipelined": len(multi_member_groups),
+                "antibody_complex_interface_residue_cutoff": (
+                    float(antibody_complex_interface_residue_cutoff)
+                    if antibody_complex_interface_residue_cutoff is not None
+                    else None
+                ),
             },
             indent=2,
         )
@@ -1249,6 +1265,11 @@ def build_antibody_complex_signature_clusters(
             "num_alignment_failures": refined_manifest["num_alignment_failures"],
             "num_signature_clusters_split": refined_manifest["num_signature_clusters_split"],
             "antibody_complex_tm_score_threshold": antibody_complex_tm_score_threshold,
+            "antibody_complex_interface_residue_cutoff": (
+                float(antibody_complex_interface_residue_cutoff)
+                if antibody_complex_interface_residue_cutoff is not None
+                else None
+            ),
             "structure_refinement_mode": structure_refinement_mode,
             "alignment_jobs": refined_manifest["alignment_jobs"],
             **extraction_manifest,
@@ -1349,6 +1370,11 @@ def build_antibody_complex_signature_clusters(
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
             "antibody_complex_tm_score_threshold": antibody_complex_tm_score_threshold,
+            "antibody_complex_interface_residue_cutoff": (
+                float(antibody_complex_interface_residue_cutoff)
+                if antibody_complex_interface_residue_cutoff is not None
+                else None
+            ),
             "structure_refinement_mode": structure_refinement_mode,
             **extraction_manifest,
         }
