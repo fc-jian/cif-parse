@@ -467,11 +467,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sym-id-2", type=int, default=None, help="Alias for --part-2-sym-ids with one chain")
     parser.add_argument("--outdir", type=Path, default=Path("dimer_interface_visual_check"))
     parser.add_argument("--model", type=int, default=1)
-    parser.add_argument("--residue-contact-cutoff", type=float, default=8.0)
-    parser.add_argument("--atom-contact-cutoff", type=float, default=5.0)
-    parser.add_argument("--min-residue-contacts", type=int, default=3)
-    parser.add_argument("--min-atom-contacts", type=int, default=20)
-    parser.add_argument("--interface-residue-cutoff", type=float, default=8.0)
+    parser.add_argument("--residue-contact-cutoff", type=float, default=50)
+    parser.add_argument("--atom-contact-cutoff", type=float, default=50)
+    parser.add_argument("--min-residue-contacts", type=int, default=0)
+    parser.add_argument("--min-atom-contacts", type=int, default=0)
+    parser.add_argument("--interface-residue-cutoff", type=float, default=20.0)
     parser.add_argument("--keep-hydrogens", action="store_true")
     return parser
 
