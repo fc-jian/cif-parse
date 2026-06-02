@@ -22,6 +22,12 @@ protein_structure_mode = "greedy"
 # Options: true, false.
 protein_subcluster_by_sequence = true
 
+# Optional metadata release-date cutoff for sequence clustering. When set, only
+# source files with release_date strictly earlier than this day are included;
+# files without release_date metadata are excluded.
+# Format: "YYYY-MM-DD".
+# cutoff_date = "2021-09-30"
+
 # Dimer/interface clustering mode.
 # Options:
 # - "skip": do not cluster dimer/interface observations.

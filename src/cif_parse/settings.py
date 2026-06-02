@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,25 @@ _DEFAULT_JOB_COUNT = max(1, os.cpu_count() or 1)
 
 # Resolved once at import time so every module sees the same directory.
 _FAST_TEMP_ROOT: Path | None = None
+
+
+def normalize_cutoff_date(value: Any) -> str | None:
+    """Normalize optional clustering cutoff dates to strict ``YYYY-MM-DD`` strings."""
+
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value.isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        raise ValueError("clustering.cutoff_date must use YYYY-MM-DD format")
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("clustering.cutoff_date must use YYYY-MM-DD format") from exc
+    return parsed.isoformat()
 
 
 def _resolve_fast_temp_root() -> Path | None:
@@ -162,6 +182,7 @@ class ClusteringSettings:
     protein_sequence_mode: str = "mmseqs2"
     protein_structure_mode: str = "greedy"
     protein_subcluster_by_sequence: bool = True
+    cutoff_date: str | None = None
     dimer_mode: str = "signature"
     dimer_structure_mode: str = "greedy"
     dimer_tm_score_threshold: float = 0.50
@@ -197,6 +218,7 @@ class ClusteringSettings:
             raise ValueError(f"Unsupported protein_sequence_mode: {self.protein_sequence_mode}")
         if self.protein_structure_mode not in SUPPORTED_CLUSTERING_STRUCTURE_MODES:
             raise ValueError(f"Unsupported protein_structure_mode: {self.protein_structure_mode}")
+        self.cutoff_date = normalize_cutoff_date(self.cutoff_date)
         for field_name in (
             "dimer_structure_mode",
             "multimer_structure_mode",
@@ -298,6 +320,7 @@ def default_cli_config() -> dict[str, Any]:
             "protein_sequence_mode": "mmseqs2",
             "protein_structure_mode": "greedy",
             "protein_subcluster_by_sequence": True,
+            "cutoff_date": None,
             "dimer_mode": "signature",
             "dimer_structure_mode": "greedy",
             "dimer_tm_score_threshold": 0.50,
@@ -431,6 +454,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "protein_sequence_mode",
             "protein_structure_mode",
             "protein_subcluster_by_sequence",
+            "cutoff_date",
             "dimer_mode",
             "dimer_structure_mode",
             "dimer_tm_score_threshold",
@@ -502,6 +526,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "protein_sequence_mode": validated_clustering.protein_sequence_mode,
         "protein_structure_mode": validated_clustering.protein_structure_mode,
         "protein_subcluster_by_sequence": validated_clustering.protein_subcluster_by_sequence,
+        "cutoff_date": validated_clustering.cutoff_date,
         "dimer_mode": validated_clustering.dimer_mode,
         "dimer_structure_mode": validated_clustering.dimer_structure_mode,
         "dimer_tm_score_threshold": validated_clustering.dimer_tm_score_threshold,

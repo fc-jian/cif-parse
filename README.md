@@ -118,6 +118,8 @@ cif-parse-cluster abag      --prep-dir clustering_prep --outdir cluster_outputs
 
 Pass `--ignore-structure` to a high-order stage only when you intentionally want signatures based on sequence cluster ids alone.
 
+Pass `--cutoff-date YYYY-MM-DD` to `seq` or the full clustering command to include only source files whose metadata `release_date` is strictly earlier than that day. Files without release-date metadata are excluded when the cutoff is set. The cutoff is written to sequence `manifest.json.gz`; `structure` and high-order subcommands refuse to consume sequence clusters whose recorded cutoff differs from the current `--cutoff-date`.
+
 Run sequence-only clustering directly from case JSON:
 
 ```bash
@@ -159,6 +161,7 @@ Key clustering defaults:
 9. `--jobs N` automatically propagates to all subtask workers (`--mmseqs-threads`, `--sequence-cluster-jobs`, `--usalign-jobs`). Individual subtask counts can still be overridden explicitly.
 10. `--cif-files-directory` is deprecated and ignored by clustering.
 11. Use `--prep-dir` as the full clustering input source for Parquet rows and per-chain cached AtomArrays. Without it, `seq` can run from case JSON; the legacy full command auto-builds temporary prep before any coordinate-consuming stage.
+12. Optional `--cutoff-date YYYY-MM-DD` filters sequence clustering by metadata `release_date < cutoff_date` and is part of the sequence clustering provenance.
 
 ## Configuration
 

@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -16,7 +17,7 @@ from cif_parse.constants import POLYMER_CHAIN_TYPES, PROTEIN_CHAIN_TYPES
 from cif_parse.clustering.common import discover_case_output_dirs
 from cif_parse.clustering.prep import iter_parquet_rows, open_prep_parquet
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
-from cif_parse.settings import resolve_source_path
+from cif_parse.settings import normalize_cutoff_date, resolve_source_path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -42,6 +43,71 @@ def _format_cluster_id(prefix: str, index: int) -> str:
 
 def _normalize_sequence(value: Any) -> str:
     return "".join(str(value or "").split()).upper()
+
+
+def _parse_release_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if not text or len(text) != 10 or text[4] != "-" or text[7] != "-":
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _new_release_filter_stats(cutoff_date: str | None) -> dict[str, Any]:
+    return {
+        "enabled": cutoff_date is not None,
+        "cutoff_date": cutoff_date or "",
+        "comparison": "release_date < cutoff_date" if cutoff_date is not None else "",
+        "num_source_files_seen": 0,
+        "num_source_files_included": 0,
+        "num_source_files_excluded_missing_release_date": 0,
+        "num_source_files_excluded_invalid_release_date": 0,
+        "num_source_files_excluded_on_or_after_cutoff_date": 0,
+    }
+
+
+def _record_release_filter_decision(stats: dict[str, Any], *, include: bool, reason: str) -> None:
+    stats["num_source_files_seen"] += 1
+    if include:
+        stats["num_source_files_included"] += 1
+    elif reason == "missing":
+        stats["num_source_files_excluded_missing_release_date"] += 1
+    elif reason == "invalid":
+        stats["num_source_files_excluded_invalid_release_date"] += 1
+    elif reason == "on_or_after_cutoff":
+        stats["num_source_files_excluded_on_or_after_cutoff_date"] += 1
+
+
+def _release_filter_allows_source(
+    *,
+    source_key: str,
+    release_date_value: Any,
+    cutoff_date_value: date | None,
+    decisions: dict[str, tuple[bool, str]],
+    stats: dict[str, Any],
+) -> bool:
+    if cutoff_date_value is None:
+        return True
+    if source_key in decisions:
+        return decisions[source_key][0]
+    release_date = _parse_release_date(release_date_value)
+    if release_date is None:
+        text = str(release_date_value or "").strip()
+        reason = "missing" if not text else "invalid"
+        decisions[source_key] = (False, reason)
+        _record_release_filter_decision(stats, include=False, reason=reason)
+        return False
+    include = release_date < cutoff_date_value
+    reason = "included" if include else "on_or_after_cutoff"
+    decisions[source_key] = (include, reason)
+    _record_release_filter_decision(stats, include=include, reason=reason)
+    return include
 
 
 def _is_polymer_chain(chain_payload: dict[str, Any]) -> bool:
@@ -136,9 +202,14 @@ def collect_canonical_monomers(
     case_dirs: Iterable[str | Path],
     cif_files_directory: str | None = None,
     prep_dir: str | Path | None = None,
+    cutoff_date: str | None = None,
 ) -> MonomerInventoryResult:
     """Collect canonical monomer samples, deduplicated by `(pdb_id, label_asym_id)`."""
 
+    cutoff_date_text = normalize_cutoff_date(cutoff_date)
+    cutoff_date_value = date.fromisoformat(cutoff_date_text) if cutoff_date_text else None
+    release_filter_stats = _new_release_filter_stats(cutoff_date_text)
+    release_filter_decisions: dict[str, tuple[bool, str]] = {}
     case_paths = [Path(path).resolve() for path in case_dirs]
     prep_case_ids: set[str] = set()
     canonical: dict[tuple[str, str], MonomerSample] = {}
@@ -153,6 +224,20 @@ def collect_canonical_monomers(
     # Fast path: read pre-parsed Parquet
     pf = open_prep_parquet(prep_dir, "monomers", required=True) if prep_dir else None
     if pf is not None:
+        pf.close()
+        release_dates_by_source: dict[str, Any] = {}
+        if cutoff_date_value is not None:
+            for quality_row in iter_parquet_rows(
+                prep_dir,
+                "entry_quality",
+                columns=["source_path", "release_date"],
+                required=False,
+            ):
+                source_path = resolve_source_path(
+                    str(quality_row.get("source_path", "") or ""),
+                    cif_files_directory,
+                )
+                release_dates_by_source.setdefault(source_path, quality_row.get("release_date"))
         for row in tqdm(
             iter_parquet_rows(prep_dir, "monomers", required=True),
             desc="Collecting canonical monomers",
@@ -164,8 +249,17 @@ def collect_canonical_monomers(
             if not pdb_id or not label_asym_id:
                 skipped_missing_identity += 1
                 continue
-            eligible_observations += 1
             source_path = resolve_source_path(str(row.get("source_path", "") or ""), cif_files_directory)
+            source_key = source_path or f"prep:{pdb_id}:{row.get('source_case_dir', '')}"
+            if not _release_filter_allows_source(
+                source_key=source_key,
+                release_date_value=release_dates_by_source.get(source_path, ""),
+                cutoff_date_value=cutoff_date_value,
+                decisions=release_filter_decisions,
+                stats=release_filter_stats,
+            ):
+                continue
+            eligible_observations += 1
             assembly_id = str(row.get("assembly_id", "") or "")
             key = (source_path, assembly_id, pdb_id, label_asym_id)
             if key not in canonical:
@@ -213,6 +307,18 @@ def collect_canonical_monomers(
                 assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
                 source_path = resolve_source_path(str(summary.get("source_path", "") or ""), cif_files_directory)
                 bundle_pdb_id = str(summary.get("pdb_id", "") or "")
+                metadata = summary.get("entry_metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                source_key = source_path or f"{case_path}:{bundle_pdb_id}"
+                if not _release_filter_allows_source(
+                    source_key=source_key,
+                    release_date_value=metadata.get("release_date"),
+                    cutoff_date_value=cutoff_date_value,
+                    decisions=release_filter_decisions,
+                    stats=release_filter_stats,
+                ):
+                    continue
                 for chain_payload in chain_inventory:
                     if not isinstance(chain_payload, dict) or not _is_polymer_chain(chain_payload):
                         continue
@@ -285,6 +391,8 @@ def collect_canonical_monomers(
         "num_skipped_missing_identity": skipped_missing_identity,
         "counts_by_polymer_class": dict(sorted(counts_by_polymer_class.items())),
         "input_case_dirs": [str(path) for path in case_paths],
+        "cutoff_date": cutoff_date_text or "",
+        "release_date_filter": release_filter_stats,
     }
     LOGGER.info(
         "Collected %d canonical monomers from %d case bundles (%d polymer observations, %d duplicates removed)",
@@ -506,14 +614,17 @@ def build_monomer_sequence_dataset(
     mmseqs_threads: int = 1,
     cif_files_directory: str | None = None,
     prep_dir: str | Path | None = None,
+    cutoff_date: str | None = None,
 ) -> dict[str, Any]:
     """Build canonical monomer inventory and sequence-level grouping artifacts."""
 
+    cutoff_date_text = normalize_cutoff_date(cutoff_date)
     case_dirs = [] if prep_dir else discover_case_output_dirs(inputs)
     inventory = collect_canonical_monomers(
         case_dirs,
         cif_files_directory=cif_files_directory,
         prep_dir=prep_dir,
+        cutoff_date=cutoff_date_text,
     )
     monomers = inventory.monomers
     outdir = Path(outdir)
@@ -581,6 +692,7 @@ def build_monomer_sequence_dataset(
             "cov_mode": protein_cov_mode,
             "threads": max(1, int(mmseqs_threads)),
         },
+        "cutoff_date": cutoff_date_text or "",
         "output_dir": str(outdir.resolve()),
         "fasta_paths": {key: str(path.resolve()) for key, path in sorted(fasta_paths.items())},
         "num_sequence_membership_rows": len(membership_rows),

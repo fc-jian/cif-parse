@@ -20,6 +20,7 @@ from cif_parse.clustering.monomers import MonomerSample, build_monomer_sequence_
 from cif_parse.clustering.multimers import build_multimer_signature_clusters
 from cif_parse.clustering.protein_structures import greedy_cluster_protein_structures
 from cif_parse.clustering.tcr_complexes import build_tcr_complex_signature_clusters
+from cif_parse.export import load_json
 from cif_parse.settings import (
     DEFAULT_CLUSTERING_OUTDIR,
     SUPPORTED_CLUSTERING_OBJECT_MODES,
@@ -28,10 +29,15 @@ from cif_parse.settings import (
     SUPPORTED_LOG_LEVELS,
     get_fast_temp_dir,
     load_clustering_cli_config,
+    normalize_cutoff_date,
 )
 from cif_parse.utils.logging_utils import configure_logging
 
 LOGGER = logging.getLogger(__name__)
+
+
+class SequenceCutoffMismatchError(ValueError):
+    """Raised when downstream clustering uses sequence outputs from a different cutoff."""
 
 CLUSTER_STAGE_SUBCOMMANDS = {"seq", "structure", "dimer", "multimer", "tcr", "abag"}
 STAGE_HELP_TEXT: dict[str, str] = {
@@ -107,6 +113,16 @@ def _load_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _load_sequence_manifest(outdir: Path) -> dict[str, Any]:
+    manifest_path = outdir / "manifest.json.gz"
+    if not manifest_path.exists():
+        manifest_path = outdir / "manifest.json"
+    if not manifest_path.exists():
+        return {}
+    manifest = load_json(manifest_path)
+    return manifest if isinstance(manifest, dict) else {}
+
+
 def _load_sequence_dataset_from_outdir(outdir: Path, *, inputs: list[Path], prep_dir: str | None) -> dict[str, Any]:
     inventory_path = outdir / "monomer_inventory.jsonl"
     membership_path = outdir / "sequence_clusters" / "membership.csv"
@@ -121,8 +137,35 @@ def _load_sequence_dataset_from_outdir(outdir: Path, *, inputs: list[Path], prep
         "case_dirs": case_dirs,
         "monomers": monomers,
         "membership_rows": _load_csv_rows(membership_path),
-        "manifest": {},
+        "manifest": _load_sequence_manifest(outdir),
     }
+
+
+def _sequence_dataset_cutoff_date(sequence_dataset: dict[str, Any]) -> str | None:
+    manifest = sequence_dataset.get("manifest", {})
+    if not isinstance(manifest, dict):
+        return None
+    try:
+        return normalize_cutoff_date(manifest.get("cutoff_date") or None)
+    except ValueError as exc:
+        raise SequenceCutoffMismatchError(
+            "Refusing to use sequence clustering artifacts with invalid cutoff_date "
+            "in sequence manifest. Re-run `cif-parse-cluster seq`."
+        ) from exc
+
+
+def _validate_sequence_dataset_cutoff(args: argparse.Namespace, sequence_dataset: dict[str, Any]) -> None:
+    expected = normalize_cutoff_date(getattr(args, "cutoff_date", None))
+    actual = _sequence_dataset_cutoff_date(sequence_dataset)
+    if actual == expected:
+        return
+    expected_text = expected or "<none>"
+    actual_text = actual or "<none>"
+    raise SequenceCutoffMismatchError(
+        "Refusing to use sequence clustering artifacts with non-identical cutoff-date: "
+        f"sequence manifest has {actual_text}, current command has {expected_text}. "
+        "Re-run `cif-parse-cluster seq` with the same --cutoff-date or use a matching --outdir."
+    )
 
 
 def _resolve_worker_counts(args: argparse.Namespace, config_defaults: dict[str, Any]) -> None:
@@ -308,6 +351,14 @@ def build_parser(
         action=argparse.BooleanOptionalAction,
         default=bool(clustering_defaults.get("protein_subcluster_by_sequence", True)),
         help="Pre-group monomers with identical sequences before pairwise USalign (reduces alignments by ~70%%)",
+    )
+    parser.add_argument(
+        "--cutoff-date",
+        default=clustering_defaults.get("cutoff_date"),
+        help=(
+            "Only include source files whose metadata release_date is earlier than "
+            "this YYYY-MM-DD date. Files without release_date metadata are excluded."
+        ),
     )
     parser.add_argument(
         "--ignore-structure",
@@ -543,6 +594,7 @@ def _run_seq(args: argparse.Namespace) -> dict[str, Any]:
         mmseqs_threads=args.mmseqs_threads,
         cif_files_directory=_cif_files_directory(args),
         prep_dir=prep_dir,
+        cutoff_date=args.cutoff_date,
     )
     manifest = sequence_dataset.get("manifest", {})
     LOGGER.info(
@@ -560,12 +612,15 @@ def _load_or_use_sequence_dataset(
     sequence_dataset: dict[str, Any] | None,
 ) -> dict[str, Any]:
     if sequence_dataset is not None:
+        _validate_sequence_dataset_cutoff(args, sequence_dataset)
         return sequence_dataset
-    return _load_sequence_dataset_from_outdir(
+    loaded = _load_sequence_dataset_from_outdir(
         args.outdir,
         inputs=args.inputs or [],
         prep_dir=_prep_dir(args),
     )
+    _validate_sequence_dataset_cutoff(args, loaded)
+    return loaded
 
 
 def _run_structure(
@@ -865,6 +920,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     args = parser.parse_args(parse_argv)
     configure_logging(getattr(args, "log_level", "INFO"))
+    if hasattr(args, "cutoff_date"):
+        try:
+            args.cutoff_date = normalize_cutoff_date(args.cutoff_date)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if getattr(args, "subcommand", None) == "prep":
         return _run_prep(args)
@@ -895,16 +955,19 @@ def main(argv: list[str] | None = None) -> int:
         prep_dir = _ensure_prep_for_full_command(args)
     _set_shared_prep_index(prep_dir)
     try:
-        if stage_subcommand == "seq":
-            _run_seq(args)
-            return 0
-        if stage_subcommand == "structure":
-            _run_structure(args)
-            return 0
-        if stage_subcommand in {"dimer", "multimer", "tcr", "abag"}:
-            _run_high_order_stage(args, stage_subcommand)
-            return 0
-        return _run_full(args)
+        try:
+            if stage_subcommand == "seq":
+                _run_seq(args)
+                return 0
+            if stage_subcommand == "structure":
+                _run_structure(args)
+                return 0
+            if stage_subcommand in {"dimer", "multimer", "tcr", "abag"}:
+                _run_high_order_stage(args, stage_subcommand)
+                return 0
+            return _run_full(args)
+        except SequenceCutoffMismatchError as exc:
+            parser.error(str(exc))
     finally:
         _close_prep_handles(prep_dir)
 
