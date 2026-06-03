@@ -147,6 +147,10 @@ def collect_case_review_metrics(
         confidence = analysis.get("annotation_confidence")
         if isinstance(confidence, (int, float)):
             return float(confidence)
+        if isinstance(confidence, str):
+            mapped = {"high": 0.95, "medium": 0.85, "low": 0.70}.get(confidence.lower())
+            if mapped is not None:
+                return mapped
         raw_confidence = chain.get("annotation_confidence")
         if isinstance(raw_confidence, (int, float)):
             return float(raw_confidence)

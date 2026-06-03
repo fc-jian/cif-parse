@@ -338,7 +338,7 @@ def collect_multimer_observations(
                         signature_members=signature_members,
                     )
                 )
-    LOGGER.info("Collected %d multimer observations from %d case dir(s)", len(observations), len(list(case_dirs)))
+    LOGGER.info("Collected %d multimer observations from %d case dir(s)", len(observations), len(sorted_dirs))
     return observations
 
 

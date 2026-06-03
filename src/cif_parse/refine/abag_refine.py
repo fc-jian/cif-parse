@@ -100,6 +100,116 @@ def _crop_atom_array(
     return atom_array[mask].copy()
 
 
+def _crop_atom_array_to_intervals(
+    atom_array: Any,
+    intervals: list[tuple[int, int | None]],
+) -> Any:
+    if not intervals:
+        return atom_array.copy()
+    mask = np.zeros(atom_array.array_length(), dtype=bool)
+    for start, end in intervals:
+        if end is None:
+            mask |= atom_array.res_id >= start
+        else:
+            mask |= (atom_array.res_id >= start) & (atom_array.res_id <= end)
+    if not mask.any():
+        return atom_array.copy()
+    return atom_array[mask].copy()
+
+
+def _domain_interval(domain: dict[str, Any]) -> tuple[int, int | None] | None:
+    try:
+        start = int(domain.get("fv_seq_start") or domain.get("seq_start") or 1)
+    except (TypeError, ValueError):
+        return None
+    try:
+        end_value = domain.get("fv_seq_end") or domain.get("seq_end") or 0
+        end = int(end_value) or None
+    except (TypeError, ValueError):
+        end = None
+    return (start, end)
+
+
+def _domain_chain_code(domain: dict[str, Any]) -> str:
+    return str(domain.get("chain_code", "") or "")
+
+
+def _domain_id(domain: dict[str, Any], index: int) -> str:
+    value = domain.get("domain_id")
+    return str(value) if value else f"legacy_vd_{index + 1:02d}_{_domain_chain_code(domain)}"
+
+
+def _domain_records_for_cropping(
+    *,
+    features: dict[str, Any],
+    ab_analysis: dict[str, Any],
+    antibody_unit_type: str,
+    chain_type: str,
+) -> list[dict[str, Any]]:
+    domains = ab_analysis.get("antibody_domains") or features.get("antibody_domains")
+    if not isinstance(domains, list) or not domains:
+        domains = ab_analysis.get("variable_domains", []) or []
+    domain_records = [dict(domain) for domain in domains if isinstance(domain, dict)]
+    if not domain_records:
+        return []
+
+    units = ab_analysis.get("antibody_units") or features.get("antibody_units") or []
+    if isinstance(units, list):
+        primary_unit_id = (
+            ab_analysis.get("primary_antibody_unit_id")
+            or features.get("primary_antibody_unit_id")
+            or ""
+        )
+        selected_unit = None
+        preferred_unit_types: list[str] = []
+        if antibody_unit_type:
+            preferred_unit_types.append(antibody_unit_type)
+        if chain_type == "antibody heavy chain":
+            preferred_unit_types.append("single_heavy_variable_domain")
+        elif chain_type == "antibody light chain":
+            preferred_unit_types.append("single_light_variable_domain")
+
+        for preferred_unit_type in preferred_unit_types:
+            for unit in units:
+                if isinstance(unit, dict) and unit.get("unit_type") == preferred_unit_type:
+                    selected_unit = unit
+                    break
+            if selected_unit is not None:
+                break
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            if selected_unit is None and primary_unit_id and unit.get("unit_id") == primary_unit_id:
+                selected_unit = unit
+                break
+        if selected_unit is not None:
+            selected_ids = {str(item) for item in selected_unit.get("domain_ids", [])}
+            matched = [
+                domain
+                for index, domain in enumerate(domain_records)
+                if _domain_id(domain, index) in selected_ids
+            ]
+            if matched:
+                return matched
+
+    if antibody_unit_type == "scFv":
+        return [
+            domain
+            for domain in domain_records
+            if _domain_chain_code(domain) in {"H", "K", "L"}
+        ]
+    if antibody_unit_type == "VHH":
+        heavy_domains = [domain for domain in domain_records if _domain_chain_code(domain) == "H"]
+        return heavy_domains or domain_records[:1]
+    if chain_type == "antibody heavy chain":
+        heavy_domains = [domain for domain in domain_records if _domain_chain_code(domain) == "H"]
+        return heavy_domains[:1] or domain_records[:1]
+    if chain_type == "antibody light chain":
+        light_domains = [domain for domain in domain_records if _domain_chain_code(domain) in {"K", "L"}]
+        return light_domains[:1] or domain_records[:1]
+    return domain_records[:1]
+
+
 # ---------------------------------------------------------------------------
 # Antigen contact graph + domain detection
 # ---------------------------------------------------------------------------
@@ -314,17 +424,47 @@ def refine_antibody_complex(
         ab_analysis = features.get("antibody_analysis", {}) or {}
         variable_domains = ab_analysis.get("variable_domains", []) or []
         chain_type = ann.get("chain_type", "")
+        selected_domains = _domain_records_for_cropping(
+            features=features,
+            ab_analysis=ab_analysis,
+            antibody_unit_type=antibody_unit_type,
+            chain_type=chain_type,
+        )
+        selected_intervals = [
+            interval
+            for domain in selected_domains
+            if (interval := _domain_interval(domain)) is not None
+        ]
 
-        if antibody_unit_type in ("VHH", "scFv"):
-            start, end = (int(aa.res_id.min()), None)
+        if selected_intervals:
+            cropped = _crop_atom_array_to_intervals(aa, selected_intervals)
+            for warning in _fv_boundary_warnings(selected_domains):
+                warning_text = f"chain {cid}: {warning}"
+                if warning_text not in warnings:
+                    warnings.append(warning_text)
+            fv_boundary_source = ",".join(
+                sorted({str(domain.get("boundary_source") or "sadie") for domain in selected_domains})
+            )
+            fv_boundary_confidence = ",".join(
+                sorted({str(domain.get("boundary_confidence") or "high") for domain in selected_domains})
+            )
         else:
             start, end = _find_fv_boundaries(aa, variable_domains, chain_type)
             for warning in _fv_boundary_warnings(variable_domains):
                 warning_text = f"chain {cid}: {warning}"
                 if warning_text not in warnings:
                     warnings.append(warning_text)
-
-        cropped = _crop_atom_array(aa, start, end)
+            cropped = _crop_atom_array(aa, start, end)
+            fv_boundary_source = (
+                str(variable_domains[0].get("boundary_source") or "sadie")
+                if variable_domains
+                else "fallback_first_120_residues"
+            )
+            fv_boundary_confidence = (
+                str(variable_domains[0].get("boundary_confidence") or "high")
+                if variable_domains
+                else "low"
+            )
         pdb_chain = _pdb_chain_ids[_chain_idx % len(_pdb_chain_ids)]
         ab_cropped.append(cropped)
         ab_res_ca.update(_ca_coords(cropped, chain_id=cid))
@@ -333,16 +473,11 @@ def refine_antibody_complex(
             "pdb_chain_id": pdb_chain,
             "chain_type": chain_type,
             "role": "antibody",
-            "fv_boundary_source": (
-                str(variable_domains[0].get("boundary_source") or "sadie")
-                if variable_domains
-                else "fallback_first_120_residues"
-            ),
-            "fv_boundary_confidence": (
-                str(variable_domains[0].get("boundary_confidence") or "high")
-                if variable_domains
-                else "low"
-            ),
+            "fv_boundary_source": fv_boundary_source,
+            "fv_boundary_confidence": fv_boundary_confidence,
+            "retained_antibody_domain_ids": [
+                _domain_id(domain, index) for index, domain in enumerate(selected_domains)
+            ],
             "retained_residue_intervals": _residue_intervals(cropped.res_id),
         })
         _chain_idx += 1

@@ -977,6 +977,18 @@ def _build_special_component_details(
     return details
 
 
+def _confidence_label_to_score(confidence: object) -> float:
+    if isinstance(confidence, (int, float)):
+        return float(confidence)
+    if isinstance(confidence, str):
+        return {
+            "high": 0.95,
+            "medium": 0.85,
+            "low": 0.70,
+        }.get(confidence.lower(), 0.0)
+    return 0.0
+
+
 def _classify_chain(
     entity: dict[str, Any],
     sequence: str | None,
@@ -1026,7 +1038,7 @@ def _classify_chain(
                 annotation_sources.append("sadie_sequence_analysis")
                 annotation_confidence = max(
                     annotation_confidence,
-                    float(immune_annotation.annotation_confidence),
+                    _confidence_label_to_score(immune_annotation.annotation_confidence),
                 )
                 features["variable_domains"] = [
                     domain.to_dict() for domain in immune_annotation.variable_domains
@@ -1047,6 +1059,16 @@ def _classify_chain(
                         domain_limit=sadie_domain_limit,
                     )
                     features["antibody_analysis"] = antibody_annotation.to_feature_dict()
+                    if antibody_annotation.antibody_domains:
+                        features["antibody_domains"] = [
+                            dict(domain) for domain in antibody_annotation.antibody_domains
+                        ]
+                    if antibody_annotation.antibody_units:
+                        features["antibody_units"] = [
+                            dict(unit) for unit in antibody_annotation.antibody_units
+                        ]
+                    if antibody_annotation.primary_antibody_unit_id:
+                        features["primary_antibody_unit_id"] = antibody_annotation.primary_antibody_unit_id
                     if antibody_annotation.unit_type:
                         features["antibody_unit_type"] = antibody_annotation.unit_type
                     if antibody_annotation.contains_fused_heavy_fv:

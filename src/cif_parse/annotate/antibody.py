@@ -10,7 +10,7 @@ from .immune import ImmuneSequenceAnnotation, analyze_immune_sequence
 class AntibodyAnnotation:
     chain_type: str | None = None
     subtype: str | None = None
-    annotation_confidence: float = 0.0
+    annotation_confidence: str = ""
     description_hits: list[str] = field(default_factory=list)
     sequence_hits: list[str] = field(default_factory=list)
     heavy_score: float = 0.0
@@ -21,6 +21,9 @@ class AntibodyAnnotation:
     linker_motif: str | None = None
     variable_domain_end_motif: str | None = None
     variable_domains: list[dict[str, Any]] = field(default_factory=list)
+    antibody_domains: list[dict[str, Any]] = field(default_factory=list)
+    antibody_units: list[dict[str, Any]] = field(default_factory=list)
+    primary_antibody_unit_id: str | None = None
     vhh_evidence: dict[str, Any] = field(default_factory=dict)
     heavy_only_evidence: dict[str, Any] = field(default_factory=dict)
     tool: str = ""
@@ -41,6 +44,8 @@ class AntibodyAnnotation:
             payload["linker_motif"] = ""
         if self.variable_domain_end_motif is None:
             payload["variable_domain_end_motif"] = ""
+        if self.primary_antibody_unit_id is None:
+            payload["primary_antibody_unit_id"] = ""
         if not self.tool:
             payload["tool"] = ""
         if not self.numbering_scheme:
@@ -93,6 +98,9 @@ def analyze_antibody_sequence(
         contains_fused_light_fv=immune_annotation.contains_fused_light_fv,
         linker_motif=immune_annotation.linker_motif,
         variable_domains=[domain.to_dict() for domain in immune_annotation.variable_domains],
+        antibody_domains=[dict(domain) for domain in immune_annotation.antibody_domains],
+        antibody_units=[dict(unit) for unit in immune_annotation.antibody_units],
+        primary_antibody_unit_id=immune_annotation.primary_antibody_unit_id,
         vhh_evidence=dict(immune_annotation.vhh_evidence),
         heavy_only_evidence=dict(immune_annotation.heavy_only_evidence),
         tool=immune_annotation.tool,
@@ -103,6 +111,20 @@ def analyze_antibody_sequence(
     )
 
 
+def _chain_antibody_unit_type(chain: Any) -> str:
+    features = chain.features if isinstance(getattr(chain, "features", None), dict) else {}
+    analysis = features.get("antibody_analysis")
+    if isinstance(analysis, dict):
+        unit_type = analysis.get("unit_type")
+        if isinstance(unit_type, str) and unit_type:
+            return unit_type
+    unit_type = features.get("antibody_unit_type")
+    if isinstance(unit_type, str) and unit_type:
+        return unit_type
+    subtype = getattr(chain, "subtype", None)
+    return str(subtype or "")
+
+
 def apply_antibody_pairing(chain_records: list[Any], dimer_interfaces: list[Any]) -> None:
     chain_map = {record.label_asym_id: record for record in chain_records}
     pair_candidates: list[tuple[float, Any, Any, Any]] = []
@@ -110,6 +132,10 @@ def apply_antibody_pairing(chain_records: list[Any], dimer_interfaces: list[Any]
         chain_1 = chain_map.get(dimer.label_asym_id_1)
         chain_2 = chain_map.get(dimer.label_asym_id_2)
         if chain_1 is None or chain_2 is None:
+            continue
+        if _chain_antibody_unit_type(chain_1) in {"VHH", "scFv"}:
+            continue
+        if _chain_antibody_unit_type(chain_2) in {"VHH", "scFv"}:
             continue
 
         if chain_1.chain_type == "antibody heavy chain" and chain_2.chain_type == "antibody light chain":

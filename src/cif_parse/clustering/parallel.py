@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -58,7 +58,7 @@ def run_alignment_tasks(
     progress_unit: str = "alignment",
     **runner_kwargs: Any,
 ) -> tuple[list[tuple[AlignmentTask, Any]], list[tuple[AlignmentTask, Exception]]]:
-    """Run alignment tasks concurrently while preserving caller-managed result ordering."""
+    """Run alignment tasks concurrently without materializing all futures at once."""
 
     task_list = list(tasks)
     if not task_list:
@@ -84,22 +84,41 @@ def run_alignment_tasks(
     successes = []
     failures = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_task = {
-            executor.submit(_semaphored_runner, runner, task.query, task.target, **runner_kwargs): task
-            for task in task_list
-        }
-        future_iter = as_completed(future_to_task)
-        future_iter = tqdm(
-            future_iter,
-            total=len(future_to_task),
+        task_iter = iter(task_list)
+        future_to_task = {}
+        max_pending = min(len(task_list), max(max_workers * 4, max_workers))
+
+        def _submit_next() -> bool:
+            try:
+                task = next(task_iter)
+            except StopIteration:
+                return False
+            future_to_task[
+                executor.submit(_semaphored_runner, runner, task.query, task.target, **runner_kwargs)
+            ] = task
+            return True
+
+        for _ in range(max_pending):
+            if not _submit_next():
+                break
+
+        progress = tqdm(
+            total=len(task_list),
             desc=progress_desc or "Running alignments",
             unit=progress_unit,
             disable=not show_progress or len(task_list) < 2,
         )
-        for future in future_iter:
-            task = future_to_task[future]
-            try:
-                successes.append((task, future.result()))
-            except Exception as exc:
-                failures.append((task, exc))
+        try:
+            while future_to_task:
+                done, _ = wait(future_to_task, return_when=FIRST_COMPLETED)
+                for future in done:
+                    task = future_to_task.pop(future)
+                    try:
+                        successes.append((task, future.result()))
+                    except Exception as exc:
+                        failures.append((task, exc))
+                    progress.update(1)
+                    _submit_next()
+        finally:
+            progress.close()
     return successes, failures

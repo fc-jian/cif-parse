@@ -548,7 +548,7 @@ def collect_dimer_observations(
                     signature_key=sig_key, signature_members=sm,
                     cluster_source_1=cs1, cluster_source_2=cs2,
                 ))
-    LOGGER.info("Collected %d dimer observations from %d case dir(s)", len(observations), len(list(case_dirs)))
+    LOGGER.info("Collected %d dimer observations from %d case dir(s)", len(observations), len(sorted_dirs))
     return observations
 
 

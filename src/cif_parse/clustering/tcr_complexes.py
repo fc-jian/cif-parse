@@ -543,7 +543,7 @@ def collect_tcr_complex_observations(
                         num_unclustered_monomer_members=num_unclustered,
                     )
                 )
-    LOGGER.info("Collected %d TCR complex observations from %d case dir(s)", len(observations), len(list(case_dirs)))
+    LOGGER.info("Collected %d TCR complex observations from %d case dir(s)", len(observations), len(sorted_dirs))
     return observations
 
 

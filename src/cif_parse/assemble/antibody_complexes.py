@@ -157,6 +157,10 @@ def identify_antibody_antigen_complexes(
                 light_chain = partner
                 unit_type = "paired_heavy_light"
         antibody_chains = [chain] + ([light_chain] if light_chain is not None else [])
+        unit_features = chain.features if isinstance(getattr(chain, "features", None), dict) else {}
+        primary_unit_id = unit_features.get("primary_antibody_unit_id")
+        if not isinstance(primary_unit_id, str):
+            primary_unit_id = ""
         unit_key = tuple(sorted(member.label_asym_id for member in antibody_chains))
         if unit_key in seen_units:
             continue
@@ -167,6 +171,7 @@ def identify_antibody_antigen_complexes(
                 "heavy_chain": chain,
                 "light_chain": light_chain,
                 "antibody_chains": antibody_chains,
+                "primary_antibody_unit_id": primary_unit_id,
             }
         )
 
@@ -325,6 +330,7 @@ def identify_antibody_antigen_complexes(
                         "collapse_same_entity_antigen_copies_to_representative_chain_for_top_level_fields"
                     ),
                     "supporting_multimer_ids": supporting_multimers,
+                    "primary_antibody_unit_id": unit.get("primary_antibody_unit_id", ""),
                     "antigen_interface_summaries": antigen_interface_summaries,
                 },
                 warnings=warnings,

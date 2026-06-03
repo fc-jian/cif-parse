@@ -47,6 +47,8 @@ class VariableDomainAnnotation:
     boundary_warnings: list[str] = field(default_factory=list)
     boundary_evidence: dict[str, Any] = field(default_factory=dict)
     cdr_regions: list[dict[str, Any]] = field(default_factory=list)
+    cdr_warnings: list[str] = field(default_factory=list)
+    cdr_evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -69,7 +71,7 @@ class VariableDomainAnnotation:
 class ImmuneSequenceAnnotation:
     chain_type: str | None = None
     subtype: str | None = None
-    annotation_confidence: float = 0.0
+    annotation_confidence: str = ""
     description_hits: list[str] = field(default_factory=list)
     sequence_hits: list[str] = field(default_factory=list)
     unit_type: str | None = None
@@ -82,6 +84,9 @@ class ImmuneSequenceAnnotation:
     selected_chain_codes: list[str] = field(default_factory=list)
     top_bitscore: float = 0.0
     variable_domains: list[VariableDomainAnnotation] = field(default_factory=list)
+    antibody_domains: list[dict[str, Any]] = field(default_factory=list)
+    antibody_units: list[dict[str, Any]] = field(default_factory=list)
+    primary_antibody_unit_id: str | None = None
     vhh_evidence: dict[str, Any] = field(default_factory=dict)
     heavy_only_evidence: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
@@ -98,6 +103,8 @@ class ImmuneSequenceAnnotation:
             payload["unit_type"] = ""
         if self.linker_motif is None:
             payload["linker_motif"] = ""
+        if self.primary_antibody_unit_id is None:
+            payload["primary_antibody_unit_id"] = ""
         return payload
 
 
@@ -118,6 +125,41 @@ def _find_first(sequence: str, motifs: tuple[str, ...]) -> str | None:
         if motif in sequence:
             return motif
     return None
+
+
+_ANTIBODY_DOMAIN_CODES = frozenset({"H", "K", "L"})
+_LIGHT_DOMAIN_CODES = frozenset({"K", "L"})
+_SCFV_LINKER_MIN_LENGTH = 5
+_SCFV_LINKER_MAX_LENGTH = 80
+
+
+def _domain_id(domain: VariableDomainAnnotation) -> str:
+    return f"vd_{domain.domain_no + 1:02d}_{domain.chain_code}"
+
+
+def _antibody_domain_role(chain_code: str) -> str:
+    if chain_code == "H":
+        return "heavy_variable_domain"
+    if chain_code == "K":
+        return "kappa_light_variable_domain"
+    if chain_code == "L":
+        return "lambda_light_variable_domain"
+    return "unknown"
+
+
+def _antibody_domain_record(domain: VariableDomainAnnotation) -> dict[str, Any]:
+    record = domain.to_dict()
+    record["domain_id"] = _domain_id(domain)
+    record["domain_role"] = _antibody_domain_role(domain.chain_code)
+    return record
+
+
+def _domain_fv_start(domain: VariableDomainAnnotation) -> int:
+    return int(domain.fv_seq_start or domain.seq_start)
+
+
+def _domain_fv_end(domain: VariableDomainAnnotation) -> int:
+    return int(domain.fv_seq_end or domain.seq_end)
 
 
 def _description_suggests_vhh(description_lower: str) -> bool:
@@ -166,16 +208,12 @@ def _sadie_chain_type(chain_code: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _annotation_confidence(bitscore: float, domain_bitscore_threshold: float = 80.0) -> float:
-    if bitscore >= 170.0:
-        return 0.98
+def _annotation_confidence(bitscore: float, domain_bitscore_threshold: float = 80.0) -> str:
     if bitscore >= 140.0:
-        return 0.95
-    if bitscore >= 110.0:
-        return 0.9
+        return "high"
     if bitscore >= domain_bitscore_threshold:
-        return 0.82
-    return 0.7
+        return "medium"
+    return "low"
 
 
 @lru_cache(maxsize=1)
@@ -287,6 +325,36 @@ def _select_variable_domains(
     return sorted(selected, key=lambda item: (int(item["query_start"]), -float(item["bitscore"])))
 
 
+def _overlap_1based(start_1: int, end_1: int, start_2: int, end_2: int) -> int:
+    return max(0, min(end_1, end_2) - max(start_1, start_2) + 1)
+
+
+def _match_numbered_domain_hit(
+    item: dict[str, Any],
+    remaining_hits: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    chain_code = str(item["chain_type"])
+    try:
+        item_start = int(item["seqstart_index"]) + 1
+        item_end = int(item["seqend_index"]) + 1
+    except (TypeError, ValueError):
+        item_start = 0
+        item_end = 0
+
+    candidates: list[tuple[int, float, int, dict[str, Any]]] = []
+    for index, hit in enumerate(remaining_hits):
+        if str(hit.get("chain_type", "")) != chain_code:
+            continue
+        hit_start = int(hit.get("query_start", 0)) + 1
+        hit_end = int(hit.get("query_end", 0))
+        overlap = _overlap_1based(item_start, item_end, hit_start, hit_end)
+        candidates.append((overlap, float(hit.get("bitscore", 0.0)), index, hit))
+    if not candidates:
+        return None
+    _, _, index, _ = max(candidates, key=lambda entry: (entry[0], entry[1], -entry[2]))
+    return remaining_hits.pop(index)
+
+
 def _number_selected_domains(
     sequence: str,
     selected_hits: list[dict[str, Any]],
@@ -326,15 +394,9 @@ def _number_selected_domains(
         chain_type, subtype = _sadie_chain_type(chain_code)
         if chain_type is None:
             continue
-        matched_hit_index = next(
-            (
-                index
-                for index, hit in enumerate(remaining_hits)
-                if str(hit["chain_type"]) == chain_code
-            ),
-            None,
-        )
-        matched_hit = remaining_hits.pop(matched_hit_index) if matched_hit_index is not None else None
+        matched_hit = _match_numbered_domain_hit(item, remaining_hits)
+        cdr_regions = _cdr_regions_from_numbering(item, int(item["seqstart_index"]))
+        cdr_warnings, cdr_evidence = _cdr_warnings_from_regions(cdr_regions)
         domains.append(
             VariableDomainAnnotation(
                 domain_no=domain_no,
@@ -351,7 +413,9 @@ def _number_selected_domains(
                 sadie_seq_end=int(item["seqend_index"]) + 1,
                 fv_seq_start=int(item["seqstart_index"]) + 1,
                 fv_seq_end=int(item["seqend_index"]) + 1,
-                cdr_regions=_cdr_regions_from_numbering(item, int(item["seqstart_index"])),
+                cdr_regions=cdr_regions,
+                cdr_warnings=cdr_warnings,
+                cdr_evidence=cdr_evidence,
             )
         )
     return domains
@@ -380,11 +444,13 @@ def _cdr3_numbering_end(domain: VariableDomainAnnotation) -> int:
     """Return the highest IMGT numbering_end among CDR3 regions, or 0."""
     for cdr in domain.cdr_regions:
         if cdr.get("name") == "cdr3":
-            try:
-                return int(cdr["numbering_end"])
-            except (ValueError, KeyError):
-                pass
+            return _numbering_label_to_int(cdr.get("numbering_end"))
     return 0
+
+
+def _numbering_label_to_int(label: Any) -> int:
+    match = re.match(r"^(\d+)", str(label or ""))
+    return int(match.group(1)) if match else 0
 
 
 def _extend_fv_by_end_motif(
@@ -468,6 +534,8 @@ def _extend_fv_by_end_motif(
                 boundary_warnings=boundary_warnings,
                 boundary_evidence=boundary_evidence,
                 cdr_regions=[dict(cdr) for cdr in domain.cdr_regions],
+                cdr_warnings=list(domain.cdr_warnings),
+                cdr_evidence=dict(domain.cdr_evidence),
             )
         )
         warnings.append({
@@ -530,6 +598,115 @@ def _cdr_regions_from_numbering(item: dict[str, Any], domain_seq_start: int) -> 
     return regions
 
 
+def _cdr_warnings_from_regions(cdr_regions: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
+    present = {str(region.get("name", "")) for region in cdr_regions}
+    expected = {"cdr1", "cdr2", "cdr3"}
+    missing = sorted(expected - present)
+    warnings = [f"missing_{name}" for name in missing]
+    for region in cdr_regions:
+        try:
+            length = int(region.get("length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            warnings.append(f"invalid_{region.get('name', 'cdr')}_length")
+        if not _numbering_label_to_int(region.get("numbering_start")):
+            warnings.append(f"invalid_{region.get('name', 'cdr')}_numbering_start")
+        if not _numbering_label_to_int(region.get("numbering_end")):
+            warnings.append(f"invalid_{region.get('name', 'cdr')}_numbering_end")
+    return sorted(set(warnings)), {
+        "present_cdr_regions": sorted(present & expected),
+        "missing_cdr_regions": missing,
+    }
+
+
+def _linker_between(left: VariableDomainAnnotation, right: VariableDomainAnnotation, sequence: str) -> dict[str, Any]:
+    linker_start = _domain_fv_end(left) + 1
+    linker_end = _domain_fv_start(right) - 1
+    linker_length = max(0, linker_end - linker_start + 1)
+    linker_sequence = sequence[linker_start - 1:linker_end] if linker_length > 0 else ""
+    return {
+        "linker_seq_start": linker_start if linker_length > 0 else "",
+        "linker_seq_end": linker_end if linker_length > 0 else "",
+        "linker_length": linker_length,
+        "linker_length_min": _SCFV_LINKER_MIN_LENGTH,
+        "linker_length_max": _SCFV_LINKER_MAX_LENGTH,
+        "linker_length_valid": _SCFV_LINKER_MIN_LENGTH <= linker_length <= _SCFV_LINKER_MAX_LENGTH,
+        "linker_sequence": linker_sequence,
+    }
+
+
+def _build_antibody_unit_records(
+    variable_domains: list[VariableDomainAnnotation],
+    sequence: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, list[str], dict[str, Any]]:
+    antibody_domains = [
+        domain
+        for domain in sorted(variable_domains, key=lambda item: (_domain_fv_start(item), -item.bitscore))
+        if domain.chain_code in _ANTIBODY_DOMAIN_CODES
+    ]
+    antibody_domain_records = [_antibody_domain_record(domain) for domain in antibody_domains]
+    units: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    warning_details: dict[str, Any] = {}
+    used_domain_ids: set[str] = set()
+    rejected_scfv_candidates: list[dict[str, Any]] = []
+
+    for left, right in zip(antibody_domains, antibody_domains[1:], strict=False):
+        if _domain_id(left) in used_domain_ids or _domain_id(right) in used_domain_ids:
+            continue
+        codes = {left.chain_code, right.chain_code}
+        if "H" not in codes or not (codes & _LIGHT_DOMAIN_CODES):
+            continue
+        linker = _linker_between(left, right, sequence)
+        unit_record = {
+            "unit_id": f"ab_unit_{len(units) + 1:02d}",
+            "unit_type": "scFv",
+            "domain_ids": [_domain_id(left), _domain_id(right)],
+            "chain_codes": [left.chain_code, right.chain_code],
+            "orientation": f"{left.chain_code}-{right.chain_code}",
+            **linker,
+            "evidence": {
+                "rule": "adjacent_heavy_light_variable_domains_with_valid_linker_length",
+            },
+        }
+        if linker["linker_length_valid"]:
+            units.append(unit_record)
+            used_domain_ids.update(unit_record["domain_ids"])
+        else:
+            rejected_scfv_candidates.append(unit_record)
+
+    remaining_domains = [domain for domain in antibody_domains if _domain_id(domain) not in used_domain_ids]
+    for domain in remaining_domains:
+        if domain.chain_code == "H":
+            unit_type = "single_heavy_variable_domain"
+        else:
+            unit_type = "single_light_variable_domain"
+        units.append(
+            {
+                "unit_id": f"ab_unit_{len(units) + 1:02d}",
+                "unit_type": unit_type,
+                "domain_ids": [_domain_id(domain)],
+                "chain_codes": [domain.chain_code],
+                "orientation": domain.chain_code,
+                "evidence": {"rule": "unpaired_variable_domain_on_chain"},
+            }
+        )
+
+    if rejected_scfv_candidates:
+        warnings.append("heavy_light_domains_without_valid_scfv_linker_length")
+        warning_details["rejected_scfv_candidates"] = rejected_scfv_candidates
+    scfv_units = [unit for unit in units if unit.get("unit_type") == "scFv"]
+    if len(scfv_units) > 1:
+        warnings.append("multiple_scfv_units_on_single_chain")
+        warning_details["multiple_scfv_units"] = scfv_units
+    if len(units) > 1:
+        warnings.append("multiple_antibody_units_on_single_chain")
+
+    primary_unit_id = units[0]["unit_id"] if units else None
+    return antibody_domain_records, units, primary_unit_id, warnings, warning_details
+
+
 def analyze_immune_sequence(
     description: str | None,
     sequence: str | None,
@@ -590,9 +767,38 @@ def analyze_immune_sequence(
     if not annotation.variable_domains:
         return annotation
 
+    cdr_warning_details: list[dict[str, Any]] = []
+    for domain in annotation.variable_domains:
+        if domain.cdr_warnings:
+            for warning in domain.cdr_warnings:
+                if warning not in annotation.warnings:
+                    annotation.warnings.append(warning)
+            cdr_warning_details.append(
+                {
+                    "domain_id": _domain_id(domain),
+                    "chain_code": domain.chain_code,
+                    "cdr_warnings": list(domain.cdr_warnings),
+                    "cdr_evidence": dict(domain.cdr_evidence),
+                }
+            )
+    if cdr_warning_details:
+        annotation.warning_details["cdr_annotation"] = cdr_warning_details
+
     chain_codes = [domain.chain_code for domain in annotation.variable_domains]
     annotation.selected_chain_codes = chain_codes
     annotation.top_bitscore = max(domain.bitscore for domain in annotation.variable_domains)
+    (
+        annotation.antibody_domains,
+        annotation.antibody_units,
+        annotation.primary_antibody_unit_id,
+        unit_warnings,
+        unit_warning_details,
+    ) = _build_antibody_unit_records(annotation.variable_domains, sequence_clean)
+    for warning in unit_warnings:
+        if warning not in annotation.warnings:
+            annotation.warnings.append(warning)
+    if unit_warning_details:
+        annotation.warning_details["antibody_units"] = unit_warning_details
 
     linker_motif = _find_first(sequence_clean, SCFV_LINKER_MOTIFS)
     if linker_motif:
@@ -600,6 +806,7 @@ def analyze_immune_sequence(
 
     has_heavy = any(code == "H" for code in chain_codes)
     has_light = any(code in {"K", "L"} for code in chain_codes)
+    scfv_units = [unit for unit in annotation.antibody_units if unit.get("unit_type") == "scFv"]
     camelid_species = {
         domain.species.lower()
         for domain in annotation.variable_domains
@@ -630,12 +837,15 @@ def analyze_immune_sequence(
         "inferred_by_sequence_context": False,
         "paired_light_found": False,
     }
-    if has_heavy and has_light:
+    if scfv_units:
         annotation.chain_type = "antibody heavy chain"
         annotation.subtype = "scFv"
         annotation.unit_type = "scFv"
         annotation.contains_fused_heavy_fv = True
         annotation.contains_fused_light_fv = True
+    elif has_heavy and has_light:
+        annotation.chain_type = "antibody heavy chain"
+        annotation.subtype = "heavy"
     elif has_heavy:
         looks_like_vhh = description_suggests_vhh or (
             bool(description_lower)
