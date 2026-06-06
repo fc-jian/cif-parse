@@ -191,6 +191,41 @@ def _entry_quality_row(summary: dict[str, Any], case_id: str) -> dict[str, Any]:
     }
 
 
+def _bundle_assembly_id(bundle: dict[str, Any]) -> str:
+    """Infer the concrete assembly represented by one parse output bundle."""
+
+    summary = bundle.get("structure_summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    summary_assembly_id = str(summary.get("assembly_id", "") or "")
+    if summary_assembly_id:
+        return summary_assembly_id
+
+    observed: set[str] = set()
+    for table_name in (
+        "dimer_interfaces",
+        "tight_multimers",
+        "antibody_antigen_complexes",
+        "tcr_pmhc_complexes",
+    ):
+        records = bundle.get(table_name, [])
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            assembly_id = str(record.get("assembly_id", "") or "")
+            if assembly_id:
+                observed.add(assembly_id)
+    if len(observed) == 1:
+        return next(iter(observed))
+
+    assembly_ids = [str(a) for a in summary.get("assembly_ids", []) if str(a)]
+    if len(assembly_ids) == 1:
+        return assembly_ids[0]
+    return ""
+
+
 def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list[dict[str, Any]]]:
     """Parse one case bundle dict and return rows for each Parquet table.
 
@@ -199,10 +234,7 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
     summary = bundle.get("structure_summary", {})
     source_path = str(summary.get("source_path", "") or "")
     pdb_id = str(summary.get("pdb_id", "") or "")
-    assembly_ids = [str(a) for a in summary.get("assembly_ids", []) if str(a)]
-    if not assembly_ids:
-        assembly_ids = [""]
-    assembly_id = assembly_ids[0]
+    assembly_id = _bundle_assembly_id(bundle)
     assembly_mode = str(summary.get("assembly_mode", "") or "")
 
     rows: dict[str, list[dict[str, Any]]] = {t: [] for t in PARQUET_TABLES}
@@ -257,6 +289,7 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
             rows["dimers"].append({
                 "pdb_id": pdb_id,
                 "source_path": source_path,
+                "source_case_dir": case_id,
                 "assembly_id": str(dimer.get("assembly_id", assembly_id) or assembly_id),
                 "assembly_mode": str(dimer.get("assembly_mode", assembly_mode) or assembly_mode),
                 "label_asym_id_1": str(dimer.get("label_asym_id_1", "") or ""),
@@ -286,6 +319,7 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
             rows["multimers"].append({
                 "pdb_id": pdb_id,
                 "source_path": source_path,
+                "source_case_dir": case_id,
                 "assembly_id": str(multimer.get("assembly_id", assembly_id) or assembly_id),
                 "assembly_mode": str(multimer.get("assembly_mode", assembly_mode) or assembly_mode),
                 "multimer_id": str(multimer.get("multimer_id", "") or ""),
@@ -315,6 +349,7 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
             rows["antibody_complexes"].append({
                 "pdb_id": pdb_id,
                 "source_path": source_path,
+                "source_case_dir": case_id,
                 "assembly_id": str(complex_data.get("assembly_id", assembly_id) or assembly_id),
                 "assembly_mode": str(complex_data.get("assembly_mode", assembly_mode) or assembly_mode),
                 "complex_id": str(complex_data.get("complex_id", "") or ""),
@@ -347,6 +382,7 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
             rows["tcr_complexes"].append({
                 "pdb_id": pdb_id,
                 "source_path": source_path,
+                "source_case_dir": case_id,
                 "assembly_id": str(complex_data.get("assembly_id", assembly_id) or assembly_id),
                 "assembly_mode": str(complex_data.get("assembly_mode", assembly_mode) or assembly_mode),
                 "complex_id": str(complex_data.get("complex_id", "") or ""),
@@ -424,6 +460,19 @@ def _ingest_cases_to_parquet(
                         source_paths.add(sp)
                         if has_atoms and sp not in atom_cache_map:
                             atom_cache_map[sp] = str(atoms_dir)
+                for table_name in (
+                    "dimers",
+                    "multimers",
+                    "antibody_complexes",
+                    "tcr_complexes",
+                    "entry_quality",
+                ):
+                    for row in rows[table_name]:
+                        sp = row.get("source_path", "")
+                        if sp:
+                            source_paths.add(sp)
+                            if has_atoms and sp not in atom_cache_map:
+                                atom_cache_map[sp] = str(atoms_dir)
             stats["ingested"] += 1
         except Exception:
             LOGGER.warning("Failed to ingest case %s", case_dir, exc_info=True)
@@ -1044,6 +1093,8 @@ def iter_parquet_rows(
 # reuse the same in-memory dict instead of each loading their own copy.
 _shared_coord_index: dict[str, tuple[Path, int, int]] | None = None
 _shared_coord_index_prep_dir: Path | None = None
+_shared_pkl_reader: Any = None
+_shared_pkl_reader_prep_dir: Path | None = None
 
 
 def set_shared_coord_index(
@@ -1053,6 +1104,31 @@ def set_shared_coord_index(
     global _shared_coord_index, _shared_coord_index_prep_dir
     _shared_coord_index = index
     _shared_coord_index_prep_dir = Path(prep_dir).resolve() if prep_dir is not None else None
+
+
+def _get_pkl_reader(prep_dir: str | Path) -> Any | None:
+    global _shared_pkl_reader, _shared_pkl_reader_prep_dir
+    resolved = Path(prep_dir).resolve()
+    if _shared_pkl_reader is not None and _shared_pkl_reader_prep_dir == resolved:
+        return _shared_pkl_reader
+    try:
+        from cif_parse.clustering.atom_cache import (
+            PklAtomReader,
+            load_source_case_dir_map,
+            resolve_cases_root,
+        )
+
+        _shared_pkl_reader = PklAtomReader(
+            resolve_cases_root(resolved),
+            load_source_case_dir_map(resolved),
+        )
+        _shared_pkl_reader_prep_dir = resolved
+        return _shared_pkl_reader
+    except Exception:
+        LOGGER.debug("Failed to initialize direct parse atom reader", exc_info=True)
+        _shared_pkl_reader = None
+        _shared_pkl_reader_prep_dir = None
+        return None
 
 
 def load_cif_coords_index(prep_dir: str | Path) -> dict[str, tuple[Path, int, int]] | None:
@@ -1210,6 +1286,7 @@ def _read_blob(entry: tuple[Path, int, int]) -> dict[str, Any] | None:
 
 def close_blob_handles() -> None:
     """Close all cached chunk file descriptors (call after extraction finishes)."""
+    global _shared_pkl_reader, _shared_pkl_reader_prep_dir
     clear_chain_atom_cache()
     with _blob_fd_cache_lock:
         for fd in _blob_fd_cache.values():
@@ -1218,6 +1295,8 @@ def close_blob_handles() -> None:
             except Exception:
                 pass
         _blob_fd_cache.clear()
+    _shared_pkl_reader = None
+    _shared_pkl_reader_prep_dir = None
 
 
 def load_chain_atoms(
@@ -1271,6 +1350,10 @@ def assemble_atom_array_from_chains(
     arrays: list[Any] = []
     for lbl, sym in chain_specs:
         aa = load_chain_atoms(prep_dir, source_path, lbl, assembly_id=assembly_id, index=idx)
+        if aa is None:
+            reader = _get_pkl_reader(prep_dir)
+            if reader is not None:
+                aa = reader.load_chain(source_path, lbl, assembly_id=assembly_id)
         if aa is None or len(aa) == 0:
             return None
         if sym is not None and hasattr(aa, "sym_id"):

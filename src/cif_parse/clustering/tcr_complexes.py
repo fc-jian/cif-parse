@@ -348,7 +348,8 @@ def collect_tcr_complex_observations(
             if allowed_source_paths is not None and source_path not in allowed_source_paths:
                 continue
             assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
-            default_assembly_id = assembly_ids[0] if len(assembly_ids) == 1 else None
+            summary_assembly_id = str(summary.get("assembly_id", "") or "")
+            default_assembly_id = summary_assembly_id or (assembly_ids[0] if len(assembly_ids) == 1 else None)
             complexes = payload.get("tcr_pmhc_complexes", [])
             if not isinstance(complexes, list):
                 continue

@@ -139,6 +139,81 @@ def _classify_polymer_class(chain_payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _monomer_sample_from_prep_row(
+    row: dict[str, Any],
+    *,
+    source_path: str,
+    assembly_id: str,
+) -> MonomerSample:
+    pdb_id = str(row.get("pdb_id", "") or "")
+    label_asym_id = str(row.get("label_asym_id", "") or "")
+    return MonomerSample(
+        monomer_id=_canonical_monomer_id(pdb_id, label_asym_id, assembly_id),
+        pdb_id=pdb_id,
+        label_asym_id=label_asym_id,
+        auth_asym_id=row.get("auth_asym_id"),
+        entity_id=str(row.get("entity_id", "") or ""),
+        entity_type=str(row.get("entity_type", "") or ""),
+        entity_description=row.get("entity_description"),
+        polymer_type=row.get("polymer_type"),
+        polymer_class=str(row.get("polymer_class", "") or ""),
+        chain_type=str(row.get("chain_type", "") or ""),
+        subtype=row.get("subtype"),
+        sequence=str(row.get("sequence", "") or ""),
+        length=int(row.get("length", 0) or 0),
+        residue_count=int(row.get("residue_count", 0) or 0),
+        atom_count=int(row.get("atom_count", 0) or 0),
+        source_path=source_path,
+        source_case_dir=str(row.get("source_case_dir", "") or ""),
+        parsed_coordinate_segments=json.loads(row.get("parsed_coordinate_segments", "[]") or "[]"),
+        unresolved_sequence_segments=json.loads(row.get("unresolved_sequence_segments", "[]") or "[]"),
+        special_residue_details=json.loads(row.get("special_residue_details", "[]") or "[]"),
+        special_component_details=json.loads(row.get("special_component_details", "[]") or "[]"),
+        assembly_id=assembly_id,
+    )
+
+
+def _collect_high_order_chain_assembly_refs(
+    prep_dir: str | Path,
+    *,
+    cif_files_directory: str | None,
+) -> set[tuple[str, str, str, str]]:
+    """Return (source_path, pdb_id, label_asym_id, assembly_id) refs from high-order prep tables."""
+
+    refs: set[tuple[str, str, str, str]] = set()
+    for row in iter_parquet_rows(prep_dir, "dimers", required=False):
+        source_path = resolve_source_path(str(row.get("source_path", "") or ""), cif_files_directory)
+        pdb_id = str(row.get("pdb_id", "") or "")
+        assembly_id = str(row.get("assembly_id", "") or "")
+        for field_name in ("label_asym_id_1", "label_asym_id_2"):
+            label_asym_id = str(row.get(field_name, "") or "")
+            if source_path and pdb_id and label_asym_id and assembly_id:
+                refs.add((source_path, pdb_id, label_asym_id, assembly_id))
+
+    json_fields_by_table = {
+        "multimers": ("member_chain_ids",),
+        "antibody_complexes": ("antibody_chain_ids", "antigen_chain_ids"),
+        "tcr_complexes": ("tcr_chain_ids", "mhc_chain_ids", "peptide_chain_ids"),
+    }
+    for table_name, field_names in json_fields_by_table.items():
+        for row in iter_parquet_rows(prep_dir, table_name, required=False):
+            source_path = resolve_source_path(str(row.get("source_path", "") or ""), cif_files_directory)
+            pdb_id = str(row.get("pdb_id", "") or "")
+            assembly_id = str(row.get("assembly_id", "") or "")
+            if not source_path or not pdb_id or not assembly_id:
+                continue
+            for field_name in field_names:
+                try:
+                    chain_ids = json.loads(row.get(field_name, "[]") or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    chain_ids = []
+                for label_asym_id in chain_ids:
+                    label_asym_id = str(label_asym_id or "")
+                    if label_asym_id:
+                        refs.add((source_path, pdb_id, label_asym_id, assembly_id))
+    return refs
+
+
 @dataclass(slots=True)
 class MonomerSample:
     monomer_id: str
@@ -212,7 +287,7 @@ def collect_canonical_monomers(
     release_filter_decisions: dict[str, tuple[bool, str]] = {}
     case_paths = [Path(path).resolve() for path in case_dirs]
     prep_case_ids: set[str] = set()
-    canonical: dict[tuple[str, str], MonomerSample] = {}
+    canonical: dict[tuple[str, str, str, str], MonomerSample] = {}
     counts_by_polymer_class: dict[str, int] = defaultdict(int)
     num_case_bundles = 0
     polymer_observations = 0
@@ -226,6 +301,7 @@ def collect_canonical_monomers(
     if pf is not None:
         pf.close()
         release_dates_by_source: dict[str, Any] = {}
+        prep_rows_by_chain: dict[tuple[str, str, str], dict[str, Any]] = {}
         if cutoff_date_value is not None:
             for quality_row in iter_parquet_rows(
                 prep_dir,
@@ -262,35 +338,51 @@ def collect_canonical_monomers(
             eligible_observations += 1
             assembly_id = str(row.get("assembly_id", "") or "")
             key = (source_path, assembly_id, pdb_id, label_asym_id)
+            prep_rows_by_chain.setdefault((source_path, pdb_id, label_asym_id), dict(row))
             if key not in canonical:
-                canonical[key] = MonomerSample(
-                    monomer_id=_canonical_monomer_id(pdb_id, label_asym_id, assembly_id),
-                    pdb_id=pdb_id,
-                    label_asym_id=label_asym_id,
-                    auth_asym_id=row.get("auth_asym_id"),
-                    entity_id=str(row.get("entity_id", "") or ""),
-                    entity_type=str(row.get("entity_type", "") or ""),
-                    entity_description=row.get("entity_description"),
-                    polymer_type=row.get("polymer_type"),
-                    polymer_class=str(row.get("polymer_class", "") or ""),
-                    chain_type=str(row.get("chain_type", "") or ""),
-                    subtype=row.get("subtype"),
-                    sequence=str(row.get("sequence", "") or ""),
-                    length=int(row.get("length", 0) or 0),
-                    residue_count=int(row.get("residue_count", 0) or 0),
-                    atom_count=int(row.get("atom_count", 0) or 0),
+                canonical[key] = _monomer_sample_from_prep_row(
+                    row,
                     source_path=source_path,
-                    source_case_dir=str(row.get("source_case_dir", "") or ""),
-                    parsed_coordinate_segments=json.loads(row.get("parsed_coordinate_segments", "[]") or "[]"),
-                    unresolved_sequence_segments=json.loads(row.get("unresolved_sequence_segments", "[]") or "[]"),
-                    special_residue_details=json.loads(row.get("special_residue_details", "[]") or "[]"),
-                    special_component_details=json.loads(row.get("special_component_details", "[]") or "[]"),
                     assembly_id=assembly_id,
                 )
                 counts_by_polymer_class[str(row.get("polymer_class", "") or "")] += 1
             source_case_dir = str(row.get("source_case_dir", "") or "")
             if source_case_dir:
                 prep_case_ids.add(source_case_dir)
+        added_from_high_order_refs = 0
+        for source_path, pdb_id, label_asym_id, assembly_id in _collect_high_order_chain_assembly_refs(
+            prep_dir,
+            cif_files_directory=cif_files_directory,
+        ):
+            key = (source_path, assembly_id, pdb_id, label_asym_id)
+            if key in canonical:
+                continue
+            row = prep_rows_by_chain.get((source_path, pdb_id, label_asym_id))
+            if row is None:
+                continue
+            source_key = source_path or f"prep:{pdb_id}:{row.get('source_case_dir', '')}"
+            if not _release_filter_allows_source(
+                source_key=source_key,
+                release_date_value=release_dates_by_source.get(source_path, ""),
+                cutoff_date_value=cutoff_date_value,
+                decisions=release_filter_decisions,
+                stats=release_filter_stats,
+            ):
+                continue
+            canonical[key] = _monomer_sample_from_prep_row(
+                row,
+                source_path=source_path,
+                assembly_id=assembly_id,
+            )
+            counts_by_polymer_class[str(row.get("polymer_class", "") or "")] += 1
+            eligible_observations += 1
+            added_from_high_order_refs += 1
+        if added_from_high_order_refs:
+            LOGGER.warning(
+                "Added %d assembly-scoped monomers referenced by high-order prep rows; "
+                "rebuild prep to persist corrected assembly ids.",
+                added_from_high_order_refs,
+            )
         num_case_bundles = len(prep_case_ids)
     else:
         # Slow path: read individual JSON bundles
@@ -338,7 +430,7 @@ def collect_canonical_monomers(
                         continue
                     eligible_observations += 1
                     bundle_assembly_id = str(summary.get("assembly_id", "") or "")
-                    if not bundle_assembly_id and assembly_ids:
+                    if not bundle_assembly_id and len(assembly_ids) == 1:
                         bundle_assembly_id = assembly_ids[0]
                     key = (source_path, bundle_assembly_id, pdb_id, label_asym_id)
                     if key not in canonical:

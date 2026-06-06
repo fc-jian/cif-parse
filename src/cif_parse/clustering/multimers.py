@@ -235,7 +235,8 @@ def collect_multimer_observations(
             if allowed_source_paths is not None and source_path not in allowed_source_paths:
                 continue
             assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
-            default_assembly_id = assembly_ids[0] if len(assembly_ids) == 1 else None
+            summary_assembly_id = str(summary.get("assembly_id", "") or "")
+            default_assembly_id = summary_assembly_id or (assembly_ids[0] if len(assembly_ids) == 1 else None)
             multimers = payload.get("tight_multimers", [])
             if not isinstance(multimers, list):
                 continue
@@ -265,7 +266,7 @@ def collect_multimer_observations(
                     member_copy_numbers,
                     strict=False,
                 ):
-                    slow_mul_asm = str(multimer.get("assembly_id") or summary.get("assembly_id") or "")
+                    slow_mul_asm = str(multimer.get("assembly_id") or default_assembly_id or "")
                     monomer_id = canonical_monomer_id(pdb_id, chain_id, slow_mul_asm)
                     member_monomer_ids.append(monomer_id)
                     cluster_source, cluster_id, sequence_cluster_id = resolve_monomer_cluster(

@@ -1,8 +1,4 @@
-"""Process-level LRU cache reading AtomArrays from parse ``atoms/*.pkl``.
-
-Zero directory enumeration: each worker computes the pkl path directly from
-``{cases_root}/{case_id}/atoms/{assembly_id}.pkl`` using ``infer_case_id``.
-"""
+"""Process-level LRU cache reading AtomArrays from parse ``atoms/*.pkl``."""
 
 from __future__ import annotations
 
@@ -52,15 +48,74 @@ def resolve_cases_root(prep_dir: str | Path) -> Path:
     return root
 
 
+def load_source_case_dir_map(prep_dir: str | Path) -> dict[str, str]:
+    """Load source_path -> source_case_dir from prep Parquet tables."""
+
+    def _read_table(table_name: str, mapping: dict[str, str]) -> None:
+        import pyarrow.parquet as pq
+
+        path = Path(prep_dir) / f"{table_name}.parquet"
+        if not path.exists():
+            return
+        pf = pq.ParquetFile(path)
+        try:
+            schema_names = set(pf.schema_arrow.names)
+            if "source_path" not in schema_names or "source_case_dir" not in schema_names:
+                return
+            for rg_idx in range(pf.metadata.num_row_groups):
+                tbl = pf.read_row_group(rg_idx, columns=["source_path", "source_case_dir"])
+                sources = tbl.column("source_path").to_pylist()
+                case_dirs = tbl.column("source_case_dir").to_pylist()
+                for source_path, source_case_dir in zip(sources, case_dirs):
+                    source_path = str(source_path or "")
+                    source_case_dir = str(source_case_dir or "")
+                    if source_path and source_case_dir:
+                        mapping.setdefault(source_path, source_case_dir)
+        finally:
+            pf.close()
+
+    try:
+        mapping: dict[str, str] = {}
+        _read_table("entry_quality", mapping)
+        if mapping:
+            return mapping
+        for table_name in ("monomers", "dimers", "multimers", "antibody_complexes", "tcr_complexes"):
+            _read_table(table_name, mapping)
+        return mapping
+    except Exception:
+        LOGGER.debug("Failed to load source_case_dir map from prep", exc_info=True)
+        return {}
+
+
+def _candidate_atoms_dirs(root: Path, case_id: str) -> list[Path]:
+    case_path = Path(case_id)
+    candidates: list[Path] = []
+    if case_path.is_absolute():
+        candidates.append(case_path / "atoms")
+    else:
+        candidates.append(root / case_path / "atoms")
+        candidates.append(root / "cases" / case_path / "atoms")
+    # Keep order stable while avoiding duplicate filesystem checks.
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        key = path.resolve(strict=False)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
 class PklAtomReader:
-    """Read AtomArrays from ``{cases_root}/{case_id}/atoms/{asm}.pkl``.
+    """Read AtomArrays from parse ``atoms/{assembly_id}.pkl`` caches."""
 
-    Zero directory scan — paths are computed directly from *cases_root*
-    and the monomer's source_path via ``infer_case_id``.
-    """
-
-    def __init__(self, cases_root: str | Path) -> None:
+    def __init__(
+        self,
+        cases_root: str | Path,
+        source_case_dir_map: dict[str, str] | None = None,
+    ) -> None:
         self._root = Path(cases_root)
+        self._source_case_dir_map = dict(source_case_dir_map or {})
         self._aa_cache: dict[tuple[str, str | None], Any] = {}
 
     # ------------------------------------------------------------------
@@ -89,8 +144,10 @@ class PklAtomReader:
         source_path: str,
         assembly_id: str | None = None,
     ) -> Any | None:
-        atoms_dir = self._root / infer_case_id(source_path) / "atoms"
-        cache_key = (str(atoms_dir), assembly_id)
+        case_id = self._source_case_dir_map.get(str(source_path)) or infer_case_id(source_path)
+        atoms_dirs = _candidate_atoms_dirs(self._root, case_id)
+        atoms_dir = next((candidate for candidate in atoms_dirs if candidate.is_dir()), atoms_dirs[0])
+        cache_key = (str(atoms_dir.resolve(strict=False)), assembly_id)
         if cache_key not in self._aa_cache:
             pkl_path = atoms_dir / f"{assembly_id or '_none'}.pkl"
             raw = _load_pkl_bytes(str(pkl_path))

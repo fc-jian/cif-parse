@@ -97,6 +97,28 @@ def _split_stage_subcommand(argv: list[str] | None) -> tuple[str | None, list[st
     return None, argv
 
 
+def _normalize_legacy_positional_inputs(argv: list[str] | None) -> list[str] | None:
+    """Treat legacy leading positional paths as --inputs values."""
+
+    if argv is None or not argv:
+        return argv
+    first = argv[0]
+    if first in CLUSTER_STAGE_SUBCOMMANDS or first == "prep" or first.startswith("-"):
+        return argv
+    inputs: list[str] = []
+    rest_start = 0
+    for index, token in enumerate(argv):
+        if token.startswith("-") or token in CLUSTER_STAGE_SUBCOMMANDS or token == "prep":
+            rest_start = index
+            break
+        inputs.append(token)
+    else:
+        rest_start = len(argv)
+    if not inputs:
+        return argv
+    return ["--inputs", *inputs, *argv[rest_start:]]
+
+
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
@@ -654,9 +676,16 @@ def _run_structure(
     # Build direct pkl reader from parse atoms (primary coordinate source).
     pkl_reader = None
     if prep_dir:
-        from cif_parse.clustering.atom_cache import resolve_cases_root, PklAtomReader
+        from cif_parse.clustering.atom_cache import (
+            PklAtomReader,
+            load_source_case_dir_map,
+            resolve_cases_root,
+        )
         try:
-            pkl_reader = PklAtomReader(resolve_cases_root(prep_dir))
+            pkl_reader = PklAtomReader(
+                resolve_cases_root(prep_dir),
+                load_source_case_dir_map(prep_dir),
+            )
         except Exception:
             LOGGER.warning("[fallback] Failed to init PklAtomReader", exc_info=True)
 
@@ -894,7 +923,7 @@ def _run_full(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    raw_argv = _normalize_legacy_positional_inputs(list(sys.argv[1:] if argv is None else argv))
     stage_subcommand, parse_argv = _split_stage_subcommand(raw_argv)
     bootstrap_parser = argparse.ArgumentParser(prog="cif-parse-cluster", add_help=False)
     bootstrap_parser.add_argument("--config", type=Path, default=None)

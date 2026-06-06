@@ -31,6 +31,28 @@ def _assembly_sort_key(label: str) -> tuple[int, int | str]:
     return (1, label)
 
 
+def _assembly_id_from_location(path: Path) -> str | None:
+    name = path.name
+    if name.startswith(JSON_CASE_ASSEMBLY_BUNDLE_PREFIX):
+        remainder = name.removeprefix(JSON_CASE_ASSEMBLY_BUNDLE_PREFIX)
+        for suffix in (".json.gz", ".json"):
+            if remainder.endswith(suffix):
+                remainder = remainder[: -len(suffix)]
+                break
+        return remainder or None
+    if name.startswith(ASSEMBLY_OUTPUT_DIR_PREFIX):
+        return name.removeprefix(ASSEMBLY_OUTPUT_DIR_PREFIX) or None
+    return None
+
+
+def _annotate_payload_assembly_id(payload: dict[str, Any], assembly_id: str | None) -> None:
+    if not assembly_id:
+        return
+    summary = payload.get("structure_summary")
+    if isinstance(summary, dict) and not summary.get("assembly_id"):
+        summary["assembly_id"] = assembly_id
+
+
 def _list_multi_bundle_paths(case_path: Path) -> list[Path]:
     bundle_paths = sorted(
         case_path.glob(f"{JSON_CASE_ASSEMBLY_BUNDLE_PREFIX}*.json.gz"),
@@ -95,6 +117,10 @@ def load_case_output_bundles(case_outdir: str | Path) -> list[dict[str, Any]]:
         payload = load_json(bundle_path)
         if not isinstance(payload, dict):
             raise TypeError(f"Expected dict payload in {bundle_path}")
+        _annotate_payload_assembly_id(
+            payload,
+            _assembly_id_from_location(bundle_path) or _assembly_id_from_location(case_path),
+        )
         return [payload]
 
     multi_locations = _list_multi_bundle_paths(case_path)
@@ -107,12 +133,14 @@ def load_case_output_bundles(case_outdir: str | Path) -> list[dict[str, Any]]:
             payload = load_json(location)
             if not isinstance(payload, dict):
                 raise TypeError(f"Expected dict payload in {location}")
+            _annotate_payload_assembly_id(payload, _assembly_id_from_location(location))
             payloads.append(payload)
         return payloads
 
     payload: dict[str, Any] = {}
     for artifact_name in JSON_CASE_ARTIFACT_NAMES:
         payload[artifact_name] = load_case_output_artifact(case_path, artifact_name)
+    _annotate_payload_assembly_id(payload, _assembly_id_from_location(case_path))
     return [payload]
 
 
