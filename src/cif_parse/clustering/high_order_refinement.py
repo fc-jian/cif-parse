@@ -7,13 +7,17 @@ from typing import Any, Callable, TypeVar
 
 from tqdm import tqdm
 
-from cif_parse.clustering.parallel import AlignmentTask, run_alignment_tasks
+from cif_parse.clustering.parallel import AlignmentTask, iter_alignment_task_results
 from cif_parse.clustering.protein_structures import USalignAlignmentResult
 
 
 LOGGER = logging.getLogger(__name__)
 MemberT = TypeVar("MemberT")
 StructureT = TypeVar("StructureT")
+
+
+class HighOrderRefinementError(RuntimeError):
+    """Raised when high-order structure refinement cannot be completed exactly."""
 
 
 def _make_identical_alignment(
@@ -52,20 +56,20 @@ class GreedySignatureRefinementResult:
     num_signature_clusters_split: int
 
 
-def _structure_file_size(structure: Any) -> int:
+def _structure_weight(structure: Any) -> int:
+    atom_count = int(getattr(structure, "atom_count", 0) or 0)
+    if atom_count > 0:
+        return atom_count
+    residue_count = int(getattr(structure, "residue_count", 0) or 0)
+    if residue_count > 0:
+        return residue_count
     path = getattr(structure, "extracted_pdb_path", None)
     if path:
         try:
             return Path(path).stat().st_size
         except OSError:
             pass
-    residue_count = int(getattr(structure, "residue_count", 0) or 0)
-    atom_count = int(getattr(structure, "atom_count", 0) or 0)
-    return residue_count * 1000 + atom_count
-
-
-def _task_size(task: AlignmentTask) -> int:
-    return _structure_file_size(task.query) + _structure_file_size(task.target)
+    return 0
 
 
 def refine_signature_groups_greedy(
@@ -81,8 +85,10 @@ def refine_signature_groups_greedy(
     alignment_jobs: int,
     usalign_executable: str,
     tm_score_threshold: float,
+    min_alignment_coverage_ratio: float = 0.50,
     can_skip_alignment: Callable[[MemberT, MemberT], bool] | None = None,
     show_progress: bool = True,
+    fail_fast: bool = True,
 ) -> GreedySignatureRefinementResult:
     """Refine signature buckets with a stage-wide USalign queue.
 
@@ -93,6 +99,10 @@ def refine_signature_groups_greedy(
     """
 
     states: list[dict[str, Any]] = []
+    structure_weights = {
+        structure_id: _structure_weight(structure)
+        for structure_id, structure in extracted_structures.items()
+    }
     for signature_cluster_id, members in tqdm(
         signature_groups,
         desc="Preparing high-order refinement groups",
@@ -105,6 +115,15 @@ def refine_signature_groups_greedy(
         unresolved_members = [
             member for member in members if member_id(member) not in extracted_structures
         ]
+        if len(members) > 1 and unresolved_members:
+            unresolved_ids = ", ".join(
+                member_id(member) for member in sorted(unresolved_members, key=member_id)[:5]
+            )
+            raise HighOrderRefinementError(
+                f"High-order signature {signature_cluster_id} has "
+                f"{len(unresolved_members)} unavailable structures among {len(members)} members "
+                f"(examples: {unresolved_ids}). Refusing singleton fallback."
+            )
         states.append(
             {
                 "signature_cluster_id": signature_cluster_id,
@@ -124,7 +143,7 @@ def refine_signature_groups_greedy(
 
     while True:
         active_states: list[dict[str, Any]] = []
-        alignment_tasks: list[AlignmentTask] = []
+        num_alignment_tasks = 0
         for state in states:
             pending: list[MemberT] = state["pending"]
             if not pending:
@@ -147,41 +166,86 @@ def refine_signature_groups_greedy(
                         target_residue_count=getattr(ts, "residue_count", 1) or 1,
                     )
                     continue
-                alignment_tasks.append(
-                    AlignmentTask(
+                num_alignment_tasks += 1
+        if not active_states:
+            break
+
+        active_states.sort(
+            key=lambda state: max(
+                (
+                    structure_weights.get(member_id(state["round_representative"]), 0)
+                    + structure_weights.get(member_id(candidate), 0)
+                    for candidate in state["round_candidates"]
+                    if tuple(
+                        sorted(
+                            (
+                                member_id(state["round_representative"]),
+                                member_id(candidate),
+                            )
+                        )
+                    )
+                    not in alignment_cache
+                ),
+                default=0,
+            ),
+            reverse=True,
+        )
+
+        def _iter_round_tasks():
+            for state in active_states:
+                representative = state["round_representative"]
+                representative_id = member_id(representative)
+                candidates = sorted(
+                    state["round_candidates"],
+                    key=lambda candidate: structure_weights.get(member_id(candidate), 0),
+                    reverse=True,
+                )
+                for candidate in candidates:
+                    candidate_id = member_id(candidate)
+                    pair_key = tuple(sorted((representative_id, candidate_id)))
+                    if pair_key in alignment_cache:
+                        continue
+                    yield AlignmentTask(
                         key=pair_key,
-                        query=extracted_structures[member_id(representative)],
-                        target=extracted_structures[member_id(candidate)],
+                        query=extracted_structures[representative_id],
+                        target=extracted_structures[candidate_id],
                         context={
                             "signature_cluster_id": state["signature_cluster_id"],
                             "representative": representative,
                             "candidate": candidate,
                         },
                     )
-                )
-        if not active_states:
-            break
 
-        alignment_tasks.sort(key=_task_size, reverse=True)
-        if alignment_tasks:
+        if num_alignment_tasks:
             LOGGER.info(
-                "Submitting %d high-order USalign tasks across %d signature groups (largest PDB pairs first)",
-                len(alignment_tasks),
+                "Submitting %d high-order USalign tasks across %d signature groups (largest structures first)",
+                num_alignment_tasks,
                 len(active_states),
             )
-        successes, failures = run_alignment_tasks(
-            alignment_tasks,
+        failure_by_key: dict[tuple[str, str], Exception] = {}
+        success_keys: set[tuple[str, str]] = set()
+        for task, result, error in iter_alignment_task_results(
+            _iter_round_tasks(),
             runner,
             max_workers=alignment_jobs,
+            total=num_alignment_tasks,
             show_progress=show_progress,
             progress_desc="Running high-order USalign",
             usalign_executable=usalign_executable,
             tm_score_threshold=tm_score_threshold,
-        )
-        failure_by_key = {task.key: exc for task, exc in failures}
-        for task, result in successes:
+            min_alignment_coverage_ratio=min_alignment_coverage_ratio,
+        ):
+            if error is not None:
+                if fail_fast:
+                    raise HighOrderRefinementError(
+                        "High-order USalign failed for "
+                        f"{task.key[0]} vs {task.key[1]} in "
+                        f"{task.context['signature_cluster_id']}: {error}"
+                    ) from error
+                failure_by_key[task.key] = error
+                continue
             alignment_cache[task.key] = result
-        success_keys = {task.key for task, _ in successes}
+            success_keys.add(task.key)
 
         for state in active_states:
             signature_cluster_id = state["signature_cluster_id"]
@@ -208,7 +272,7 @@ def refine_signature_groups_greedy(
                 if pair_key in success_keys:
                     alignment_rows.append(alignment_row(signature_cluster_id, result))
                     num_alignment_runs += 1
-                if result.max_tm_score >= tm_score_threshold:
+                if result.meets_tm_threshold:
                     assigned.append(candidate)
                 else:
                     remaining.append(candidate)
@@ -226,13 +290,8 @@ def refine_signature_groups_greedy(
         signature_cluster_id = state["signature_cluster_id"]
         members = state["members"]
         extracted_members = state["extracted_members"]
-        unresolved_members = state["unresolved_members"]
         local_clusters: list[tuple[list[MemberT], MemberT]] = state["local_clusters"]
-        if unresolved_members and extracted_members:
-            for unresolved in sorted(unresolved_members, key=structural_sort_key):
-                local_clusters.append(([unresolved], unresolved))
-                warning_rows.append(unavailable_warning(signature_cluster_id, unresolved))
-        elif not extracted_members and members:
+        if not extracted_members and len(members) == 1:
             representative = min(members, key=structural_sort_key)
             local_clusters.append((list(members), representative))
 
@@ -272,152 +331,27 @@ def refine_signature_groups_three_phase(
     alignment_jobs: int,
     usalign_executable: str,
     tm_score_threshold: float,
+    min_alignment_coverage_ratio: float = 0.50,
     can_skip_alignment: Callable[[MemberT, MemberT], bool] | None = None,
     show_progress: bool = True,
+    fail_fast: bool = True,
 ) -> GreedySignatureRefinementResult:
-    """Three-phase refinement: enumerate all pairwise tasks upfront, execute in
-    one globally-sorted batch, then greedily reconstruct clusters.
+    """Compatibility wrapper for the bounded greedy high-order scheduler."""
 
-    This trades more USalign calls for full parallelism — all groups share
-    a single ``run_alignment_tasks`` invocation instead of lock-step rounds.
-    """
-
-    # ---- Phase 1: enumerate ALL pairwise tasks across all groups --------
-    alignment_tasks: list[AlignmentTask] = []
-    group_states: list[dict[str, Any]] = []
-    identical_pairs: dict[tuple[str, str], USalignAlignmentResult] = {}
-
-    for signature_cluster_id, members in tqdm(
+    return refine_signature_groups_greedy(
         signature_groups,
-        desc="Preparing high-order USalign tasks",
-        unit="sig-group",
-        disable=not show_progress or len(signature_groups) < 2,
-    ):
-        extracted = [m for m in members if member_id(m) in extracted_structures]
-        unresolved = [m for m in members if member_id(m) not in extracted_structures]
-        pending = sorted(extracted, key=structural_sort_key)
-        group_states.append({
-            "signature_cluster_id": signature_cluster_id,
-            "members": members,
-            "extracted_members": extracted,
-            "unresolved_members": unresolved,
-            "pending_sorted": pending,
-        })
-
-        # Enumerate all pairwise comparisons (C(k,2)) for greedy later
-        for i, rep_candidate in enumerate(pending):
-            for j in range(i + 1, len(pending)):
-                candidate = pending[j]
-                pair_key = tuple(sorted((member_id(rep_candidate), member_id(candidate))))
-                if can_skip_alignment is not None and can_skip_alignment(rep_candidate, candidate):
-                    qs = extracted_structures.get(member_id(rep_candidate))
-                    ts = extracted_structures.get(member_id(candidate))
-                    identical_pairs[pair_key] = _make_identical_alignment(
-                        member_id(rep_candidate), member_id(candidate),
-                        query_residue_count=getattr(qs, "residue_count", 1) or 1,
-                        target_residue_count=getattr(ts, "residue_count", 1) or 1,
-                    )
-                    continue
-                alignment_tasks.append(AlignmentTask(
-                    key=pair_key,
-                    query=extracted_structures[member_id(rep_candidate)],
-                    target=extracted_structures[member_id(candidate)],
-                    context={
-                        "signature_cluster_id": signature_cluster_id,
-                        "representative": rep_candidate,
-                        "candidate": candidate,
-                    },
-                ))
-
-    # ---- Phase 2: execute all tasks in one globally-sorted batch ---------
-    alignment_tasks.sort(key=_task_size, reverse=True)
-    if alignment_tasks:
-        LOGGER.info(
-            "Three-phase: submitting %d high-order USalign tasks across %d groups",
-            len(alignment_tasks), len(signature_groups),
-        )
-    successes, failures = run_alignment_tasks(
-        alignment_tasks, runner,
-        max_workers=alignment_jobs,
-        show_progress=show_progress,
-        progress_desc="Running high-order USalign",
+        extracted_structures,
+        member_id=member_id,
+        structural_sort_key=structural_sort_key,
+        alignment_row=alignment_row,
+        alignment_failure_warning=alignment_failure_warning,
+        unavailable_warning=unavailable_warning,
+        runner=runner,
+        alignment_jobs=alignment_jobs,
         usalign_executable=usalign_executable,
         tm_score_threshold=tm_score_threshold,
-    )
-
-    alignment_cache: dict[tuple[str, str], Any] = dict(identical_pairs)
-    failure_by_key: dict[tuple[str, str], Exception] = {}
-    for task, exc in failures:
-        failure_by_key[task.key] = exc
-    for task, result in successes:
-        alignment_cache[task.key] = result
-    success_keys = {t.key for t, _ in successes}
-
-    # ---- Phase 3: greedy reconstruction per group ------------------------
-    alignment_rows: list[dict[str, Any]] = []
-    warning_rows: list[dict[str, Any]] = []
-    cluster_members: list[tuple[str, str, list[Any], Any]] = []
-    num_alignment_runs = 0
-    num_alignment_failures = 0
-    num_signature_clusters_split = 0
-
-    for state in tqdm(
-        group_states,
-        desc="Reconstructing high-order clusters",
-        unit="sig-group",
-        disable=not show_progress or len(group_states) < 2,
-    ):
-        sig_id = state["signature_cluster_id"]
-        members = state["members"]
-        extracted = state["extracted_members"]
-        unresolved = state["unresolved_members"]
-        pending = sorted(extracted, key=structural_sort_key)
-        local_clusters: list[tuple[list[MemberT], MemberT]] = []
-
-        while pending:
-            rep = pending[0]
-            assigned = [rep]
-            remaining = []
-            for candidate in pending[1:]:
-                pair_key = tuple(sorted((member_id(rep), member_id(candidate))))
-                if pair_key in failure_by_key:
-                    num_alignment_failures += 1
-                    warning_rows.append(alignment_failure_warning(sig_id, rep, candidate, failure_by_key[pair_key]))
-                    remaining.append(candidate)
-                    continue
-                result = alignment_cache.get(pair_key)
-                if result is None:
-                    remaining.append(candidate)
-                    continue
-                if pair_key in success_keys:
-                    alignment_rows.append(alignment_row(sig_id, result))
-                    num_alignment_runs += 1
-                if result.max_tm_score >= tm_score_threshold:
-                    assigned.append(candidate)
-                else:
-                    remaining.append(candidate)
-            local_clusters.append((assigned, rep))
-            pending = remaining
-
-        if unresolved and extracted:
-            for u in sorted(unresolved, key=structural_sort_key):
-                local_clusters.append(([u], u))
-                warning_rows.append(unavailable_warning(sig_id, u))
-        elif not extracted and members:
-            rep = min(members, key=structural_sort_key)
-            local_clusters.append((list(members), rep))
-
-        if len(local_clusters) > 1:
-            num_signature_clusters_split += 1
-        for cl_members, rep in local_clusters:
-            cluster_members.append((sig_id, member_id(rep), sorted(cl_members, key=member_id), rep))
-
-    return GreedySignatureRefinementResult(
-        alignment_cache=alignment_cache,
-        alignment_rows=alignment_rows,
-        warning_rows=warning_rows,
-        cluster_members=cluster_members,
-        num_alignment_runs=num_alignment_runs,
-        num_alignment_failures=num_alignment_failures,
-        num_signature_clusters_split=num_signature_clusters_split,
+        min_alignment_coverage_ratio=min_alignment_coverage_ratio,
+        can_skip_alignment=can_skip_alignment,
+        show_progress=show_progress,
+        fail_fast=fail_fast,
     )

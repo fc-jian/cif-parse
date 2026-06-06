@@ -118,7 +118,7 @@ cif-parse-cluster abag      --prep-dir clustering_prep --outdir cluster_outputs
 
 Pass `--ignore-structure` to a high-order stage only when you intentionally want signatures based on sequence cluster ids alone.
 
-Pass `--cutoff-date YYYY-MM-DD` to `seq` or the full clustering command to include only source files whose metadata `release_date` is strictly earlier than that day. Files without release-date metadata are excluded when the cutoff is set. The cutoff is written to sequence `manifest.json.gz`; `structure` and high-order subcommands refuse to consume sequence clusters whose recorded cutoff differs from the current `--cutoff-date`.
+Pass `--cutoff-date YYYY-MM-DD` to `seq` or the full clustering command to include only source files whose metadata `release_date` is strictly earlier than that day. Files without release-date metadata are excluded when the cutoff is set. The cutoff is written to sequence `manifest.json.gz`; `structure` and high-order subcommands refuse to consume sequence clusters whose recorded cutoff differs from the current `--cutoff-date`. High-order collection is restricted to the source files represented by the filtered monomer inventory even when prep contains additional entries, and a member missing its sequence/structure assignment is treated as an error instead of an implicit singleton cluster.
 
 Run sequence-only clustering directly from case JSON:
 
@@ -152,7 +152,7 @@ Key clustering defaults:
 
 1. Protein sequence clustering uses `mmseqs2` with sequence identity threshold `0.40`.
 2. Protein monomer structure clustering uses `max(TM(query,target), TM(target,query)) >= 0.50`.
-3. Protein monomer alignment coverage requires `aligned_length / shorter_resolved_structure_length >= 0.50`; full-sequence coverage is still reported for diagnostics.
+3. Protein monomer alignment coverage requires `aligned_length / shorter_resolved_structure_length >= 0.50`; high-order refinement reports coverage for diagnostics but clusters by TM-score only.
 4. Dimer, multimer, antibody-antigen, and TCR-pMHC complex clustering default to signature clustering plus `USalign -mm 1 -ter 1` refinement with TM-score threshold `0.50`; dimer and antibody-antigen refinement write only interface residues before USalign (`dimer_interface_residue_cutoff` default `8.0 Å`; `antibody_complex_interface_residue_cutoff` default `20.0 Å`), so their TM-scores are interface-local.
 5. Monomer extraction and structure clustering run in a **pipelined** mode: structures are extracted per sequence cluster on-the-fly while USalign runs on previously extracted clusters, overlapping I/O and computation.
 6. The legacy full command now calls the split stages as `seq -> structure -> parallel(tcr, abag, multimer, dimer)`. For maximum throughput on a scheduler, run `seq` and `structure` first, then submit high-order stage subcommands in parallel.

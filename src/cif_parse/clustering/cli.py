@@ -7,7 +7,6 @@ import logging
 import sys
 import time
 import tomllib
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -504,7 +503,10 @@ def build_parser(
         "--min-alignment-coverage-ratio",
         type=float,
         default=float(clustering_defaults.get("min_alignment_coverage_ratio", 0.50)),
-        help="Minimum aligned-length / shorter resolved-structure length ratio for protein structure clustering",
+        help=(
+            "Minimum aligned-length / shorter resolved-structure length ratio for monomer "
+            "structure clustering; high-order refinement reports this coverage but clusters by TM-score only"
+        ),
     )
     parser.add_argument(
         "--usalign-executable",
@@ -809,6 +811,7 @@ def _build_high_order_specs(args: argparse.Namespace, sequence_dataset: dict[str
         "drop_hydrogens": not args.keep_hydrogens,
         "usalign_executable": args.usalign_executable,
         "alignment_jobs": args.usalign_jobs,
+        "min_alignment_coverage_ratio": args.min_alignment_coverage_ratio,
         "cif_files_directory": cif_files_directory,
         "prep_dir": prep_dir,
         "include_structure_assignments": not args.ignore_structure,
@@ -878,24 +881,13 @@ def _run_full(args: argparse.Namespace) -> int:
     enabled = [stage for stage, _ in _build_high_order_specs(args, sequence_dataset)]
     if enabled:
         t3 = time.monotonic()
-        LOGGER.info("Building higher-order clusters in parallel [%s]", ", ".join(enabled))
-        max_workers = min(len(enabled), max(1, args.jobs))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_stage = {
-                executor.submit(_run_high_order_stage, args, stage, sequence_dataset): stage
-                for stage in ("tcr", "abag", "multimer", "dimer")
-                if stage in enabled
-            }
-            future_iter = tqdm(
-                as_completed(future_to_stage),
-                total=len(future_to_stage),
-                desc="Joining higher-order stages",
-                unit="stage",
-            )
-            for future in future_iter:
-                stage = future_to_stage[future]
-                future.result()
-                LOGGER.info("Higher-order stage %s joined", stage)
+        LOGGER.info("Building higher-order clusters serially [%s]", ", ".join(enabled))
+        for stage in tqdm(
+            [name for name in ("tcr", "abag", "multimer", "dimer") if name in enabled],
+            desc="Running higher-order stages",
+            unit="stage",
+        ):
+            _run_high_order_stage(args, stage, sequence_dataset)
         LOGGER.info("Higher-order clustering complete (%.1fs)", time.monotonic() - t3)
     LOGGER.info("Clustering pipeline finished (%.1fs total)", time.monotonic() - t0)
     return 0

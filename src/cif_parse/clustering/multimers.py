@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -18,14 +16,17 @@ from biotite.structure.io.pdb import PDBFile
 from cif_parse.clustering.common import (
     canonical_monomer_id,
     load_monomer_cluster_assignments,
+    load_monomer_inventory,
+    monomer_inventory_source_paths,
     resolve_monomer_cluster,
 )
-from cif_parse.clustering.high_order_refinement import refine_signature_groups_three_phase
+from cif_parse.clustering.dimers import _resolve_usalign_executable
+from cif_parse.clustering.high_order_refinement import refine_signature_groups_greedy
 from cif_parse.clustering.protein_structures import (
     USalignAlignmentResult,
     parse_usalign_output,
 )
-from cif_parse.clustering.parallel import normalize_worker_count
+from cif_parse.clustering.parallel import iter_threaded_results, normalize_worker_count
 from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
@@ -155,17 +156,19 @@ def collect_multimer_observations(
     cif_files_directory: str | None = None,
     prep_db_path: str | Path | None = None,
     prep_dir: str | Path | None = None,
+    allowed_source_paths: set[str] | None = None,
 ) -> list[MultimerObservation]:
     observations: list[MultimerObservation] = []
 
     # Fast path: read pre-parsed Parquet
-    from cif_parse.clustering.prep import open_prep_parquet, iter_parquet_rows
-    pf = open_prep_parquet(prep_dir, "multimers", required=True) if prep_dir else None
-    if pf is not None:
+    from cif_parse.clustering.prep import iter_parquet_rows
+    if prep_dir:
         for row in tqdm(iter_parquet_rows(prep_dir, "multimers", required=True),
                         desc="Collecting multimers", unit="multimer"):
             pdb_id = row.get("pdb_id", "")
             source_path = resolve_source_path(row.get("source_path", ""), cif_files_directory)
+            if allowed_source_paths is not None and source_path not in allowed_source_paths:
+                continue
             if not pdb_id:
                 continue
             m_cids = json.loads(row.get("member_chain_ids", "[]"))
@@ -229,6 +232,8 @@ def collect_multimer_observations(
                 str(summary.get("source_path", "") or ""),
                 cif_files_directory,
             )
+            if allowed_source_paths is not None and source_path not in allowed_source_paths:
+                continue
             assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
             default_assembly_id = assembly_ids[0] if len(assembly_ids) == 1 else None
             multimers = payload.get("tight_multimers", [])
@@ -368,6 +373,60 @@ def _coerce_multimer_chain_id(atom_array: AtomArray, chain_id: str) -> AtomArray
     return copied
 
 
+def _member_instance_sym_id(
+    instance: dict[str, Any],
+    *,
+    label_asym_id: str,
+    chain_operations: dict[str, list[str]] | None = None,
+) -> int | None:
+    raw_sym_id = instance.get("sym_id")
+    if raw_sym_id is not None and str(raw_sym_id) != "":
+        try:
+            return int(raw_sym_id)
+        except (TypeError, ValueError):
+            pass
+
+    instance_id = str(instance.get("instance_id", "") or "")
+    if "@" in instance_id:
+        try:
+            return int(instance_id.rsplit("@", 1)[1]) - 1
+        except ValueError:
+            pass
+
+    operation_id = str(instance.get("operation_id", "") or "")
+    operation_ids = (chain_operations or {}).get(label_asym_id, [])
+    if operation_id and operation_id in operation_ids:
+        return operation_ids.index(operation_id)
+    return None
+
+
+def _multimer_instance_signature(
+    observation: MultimerObservation,
+) -> tuple[tuple[str, int | None, str], ...]:
+    if observation.member_instances:
+        instances = []
+        for instance in observation.member_instances:
+            label_asym_id = str(instance.get("label_asym_id", "") or "")
+            instances.append(
+                (
+                    label_asym_id,
+                    _member_instance_sym_id(instance, label_asym_id=label_asym_id),
+                    str(instance.get("operation_id", "") or ""),
+                )
+            )
+        return tuple(
+            sorted(
+                instances,
+                key=lambda item: (
+                    item[0],
+                    -1 if item[1] is None else item[1],
+                    item[2],
+                ),
+            )
+        )
+    return tuple(sorted((chain_id, None, "") for chain_id in observation.member_chain_ids))
+
+
 def extract_multimer_structure(
     observation: MultimerObservation,
     *,
@@ -385,31 +444,35 @@ def extract_multimer_structure(
 
     chain_operations = assembly_chain_operations or {}
     instance_atom_arrays: list[AtomArray] = []
-    selection_count = 0
     for instance_index, instance in enumerate(observation.member_instances):
         label_asym_id = str(instance.get("label_asym_id", "") or "")
         if not label_asym_id:
-            continue
-        sym_id: int | None = None
-        operation_id = str(instance.get("operation_id", "") or "")
-        if observation.assembly_id and label_asym_id in chain_operations and operation_id:
-            operation_ids = chain_operations.get(label_asym_id, [])
-            if operation_id in operation_ids:
-                sym_id = operation_ids.index(operation_id)
+            raise ValueError(
+                f"Multimer member instance lacks label_asym_id: "
+                f"{observation.multimer_observation_id}"
+            )
+        sym_id = _member_instance_sym_id(
+            instance,
+            label_asym_id=label_asym_id,
+            chain_operations=chain_operations,
+        )
         selected = _select_instance_atoms(atom_array, label_asym_id=label_asym_id, sym_id=sym_id)
-        if selected.array_length() == 0 and sym_id is not None:
-            selected = _select_instance_atoms(atom_array, label_asym_id=label_asym_id, sym_id=None)
         if selected.array_length() == 0:
-            continue
-        selection_count += 1
+            instance_id = str(instance.get("instance_id", "") or label_asym_id)
+            raise ValueError(
+                f"Requested multimer member instance {instance_id!r} is unavailable for "
+                f"{observation.multimer_observation_id}"
+            )
         instance_atom_arrays.append(_coerce_multimer_chain_id(selected, _pdb_chain_id(instance_index)))
 
     if not instance_atom_arrays:
         for chain_index, label_asym_id in enumerate(observation.member_chain_ids):
             selected = _select_instance_atoms(atom_array, label_asym_id=label_asym_id, sym_id=None)
             if selected.array_length() == 0:
-                continue
-            selection_count += 1
+                raise ValueError(
+                    f"Requested multimer chain {label_asym_id!r} is unavailable for "
+                    f"{observation.multimer_observation_id}"
+                )
             instance_atom_arrays.append(_coerce_multimer_chain_id(selected, _pdb_chain_id(chain_index)))
 
     if not instance_atom_arrays:
@@ -464,59 +527,51 @@ def extract_multimer_structures(
     prep_dir: str | Path | None = None,
     show_progress: bool = True,
     log_summary: bool = True,
+    raise_on_failure: bool = False,
 ) -> tuple[dict[str, ExtractedMultimerStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     structures: dict[str, ExtractedMultimerStructure] = {}
     failures: list[dict[str, str]] = []
 
-    sorted_observations = sorted(observations, key=lambda item: item.multimer_observation_id)
+    sorted_observations = sorted(
+        observations,
+        key=lambda item: (
+            item.source_path,
+            item.assembly_id or "",
+            item.multimer_observation_id,
+        ),
+    )
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
-    _pkl_reader = None
-    if prep_dir:
-        from cif_parse.clustering.atom_cache import resolve_cases_root, PklAtomReader
-        try:
-            _pkl_reader = PklAtomReader(resolve_cases_root(prep_dir))
-        except Exception:
-            pass
-
     def _try_assemble_multimer(obs: MultimerObservation) -> AtomArray | None:
-        if _pkl_reader is None:
+        if prep_dir is None:
             return None
+        from cif_parse.clustering.prep import assemble_atom_array_from_chains
+
         chain_specs = []
         for inst in obs.member_instances:
             lbl = str(inst.get("label_asym_id", "") or "")
             if not lbl:
                 continue
-            sym = inst.get("sym_id")
-            if sym is None:
-                instance_id = str(inst.get("instance_id", "") or "")
-                if "@" in instance_id:
-                    try:
-                        sym = int(instance_id.rsplit("@", 1)[1]) - 1
-                    except ValueError:
-                        sym = None
-            try:
-                sym_id = int(sym) if sym is not None and str(sym) != "" else None
-            except (TypeError, ValueError):
-                sym_id = None
-            chain_specs.append((lbl, sym_id))
+            chain_specs.append(
+                (
+                    lbl,
+                    _member_instance_sym_id(inst, label_asym_id=lbl),
+                )
+            )
         if not chain_specs:
             return None
-        return _pkl_reader.load_chains(
-            obs.source_path, chain_specs,
+        return assemble_atom_array_from_chains(
+            prep_dir,
+            obs.source_path,
+            chain_specs,
             assembly_id=obs.assembly_id,
         )
 
-    def _load_chain_ops_only(observation: MultimerObservation) -> dict[str, list[str]]:
-        return {}
-
-    def _process_one(observation: MultimerObservation) -> ExtractedMultimerStructure | None:
+    def _process_one(observation: MultimerObservation) -> ExtractedMultimerStructure:
         atom_array = _try_assemble_multimer(observation)
-        if atom_array is not None:
-            chain_ops = _load_chain_ops_only(observation)
-        else:
+        if atom_array is None:
             raise ValueError(
                 f"Prep coordinates missing for multimer {observation.multimer_observation_id}"
             )
@@ -526,59 +581,36 @@ def extract_multimer_structures(
             model=model,
             drop_hydrogens=drop_hydrogens,
             atom_array=atom_array,
-            assembly_chain_operations=chain_ops,
         )
 
-    if extraction_jobs <= 1 or len(sorted_observations) <= 1:
-        observation_iter = (
-            tqdm(sorted_observations, desc="Extracting multimer structures", unit="multimer")
-            if show_progress
-            else sorted_observations
-        )
-        for observation in observation_iter:
-            try:
-                structures[observation.multimer_observation_id] = _process_one(observation)
-            except Exception as exc:
-                LOGGER.warning(
-                    "Failed to extract multimer %s: %s",
-                    observation.multimer_observation_id,
-                    exc,
-                )
-                failures.append(
-                    {"multimer_observation_id": observation.multimer_observation_id, "error": str(exc)}
-                )
-    else:
-        with ThreadPoolExecutor(max_workers=min(extraction_jobs, len(sorted_observations))) as executor:
-            future_to_obs = {
-                executor.submit(_process_one, observation): observation
-                for observation in sorted_observations
-            }
-            future_iter = as_completed(future_to_obs)
-            if show_progress:
-                future_iter = tqdm(
-                    future_iter,
-                    total=len(future_to_obs),
-                    desc="Extracting multimer structures",
-                    unit="multimer",
-                )
-            for future in future_iter:
-                observation = future_to_obs[future]
-                try:
-                    extracted = future.result()
-                    if extracted is not None:
-                        structures[observation.multimer_observation_id] = extracted
-                except Exception as exc:
-                    LOGGER.warning(
-                        "Failed to extract multimer %s: %s",
-                        observation.multimer_observation_id,
-                        exc,
-                    )
-                    failures.append(
-                        {"multimer_observation_id": observation.multimer_observation_id, "error": str(exc)}
-                    )
+    for observation, extracted, error in iter_threaded_results(
+        sorted_observations,
+        _process_one,
+        max_workers=min(extraction_jobs, max(1, len(sorted_observations))),
+        total=len(sorted_observations),
+        show_progress=show_progress,
+        progress_desc="Extracting multimer structures",
+        progress_unit="multimer",
+    ):
+        if error is not None:
+            if raise_on_failure:
+                raise RuntimeError(
+                    f"Failed to extract multimer {observation.multimer_observation_id}: {error}"
+                ) from error
+            LOGGER.warning(
+                "Failed to extract multimer %s: %s",
+                observation.multimer_observation_id,
+                error,
+            )
+            failures.append(
+                {"multimer_observation_id": observation.multimer_observation_id, "error": str(error)}
+            )
+            continue
+        if extracted is not None:
+            structures[observation.multimer_observation_id] = extracted
 
     dump_jsonl(outdir / "multimer_structure_extraction_failures.jsonl", failures)
-    dump_jsonl(outdir / "multimer_structures.jsonl", [item.to_dict() for item in structures.values()])
+    dump_jsonl(outdir / "multimer_structures.jsonl", (item.to_dict() for item in structures.values()))
     manifest = {
         "num_multimer_observations": len(sorted_observations),
         "num_extracted_multimer_structures": len(structures),
@@ -597,11 +629,13 @@ def run_multimer_usalign_alignment(
     *,
     usalign_executable: str = "USalign",
     tm_score_threshold: float = 0.50,
+    min_alignment_coverage_ratio: float = 0.50,
 ) -> USalignAlignmentResult:
-    if shutil.which(usalign_executable) is None:
+    resolved_executable = _resolve_usalign_executable(usalign_executable)
+    if resolved_executable is None:
         raise FileNotFoundError(f"{usalign_executable} executable not found in PATH")
     command = [
-        usalign_executable,
+        resolved_executable,
         query.extracted_pdb_path,
         target.extracted_pdb_path,
         "-mol",
@@ -619,7 +653,7 @@ def run_multimer_usalign_alignment(
         query_length=query.residue_count,
         target_length=target.residue_count,
         tm_score_threshold=tm_score_threshold,
-        min_alignment_coverage_ratio=0.0,
+        min_alignment_coverage_ratio=min_alignment_coverage_ratio,
     )
 
 
@@ -631,6 +665,7 @@ def refine_multimer_signature_clusters(
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
+    min_alignment_coverage_ratio: float = 0.50,
     show_progress: bool = True,
     log_summary: bool = True,
     max_atoms_for_refinement: int | None = 10_000,
@@ -687,6 +722,7 @@ def refine_multimer_signature_clusters(
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
             "multimer_tm_score_threshold": tm_score_threshold,
+            "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "alignment_jobs": alignment_jobs,
         }
         if log_summary:
@@ -715,7 +751,7 @@ def refine_multimer_signature_clusters(
         if show_progress
         else small_groups
     )
-    refined = refine_signature_groups_three_phase(
+    refined = refine_signature_groups_greedy(
         signature_iter,
         extracted_structures,
         member_id=lambda item: item.multimer_observation_id,
@@ -731,6 +767,8 @@ def refine_multimer_signature_clusters(
             "tm_score_min": result.min_tm_score,
             "tm_score_max": result.max_tm_score,
             "tm_score_for_clustering": result.max_tm_score,
+            "alignment_coverage_shorter": result.shorter_length_coverage,
+            "alignment_coverage_resolved": result.resolved_length_coverage,
         },
         alignment_failure_warning=lambda signature_cluster_id, representative, candidate, exc: {
             "warning_code": "multimer_usalign_failed",
@@ -748,11 +786,12 @@ def refine_multimer_signature_clusters(
         alignment_jobs=alignment_jobs,
         usalign_executable=usalign_executable,
         tm_score_threshold=tm_score_threshold,
+        min_alignment_coverage_ratio=min_alignment_coverage_ratio,
         show_progress=show_progress,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
             and a.assembly_id == b.assembly_id
-            and sorted(a.member_chain_ids) == sorted(b.member_chain_ids)
+            and _multimer_instance_signature(a) == _multimer_instance_signature(b)
         ),
     )
     alignment_cache = refined.alignment_cache
@@ -858,6 +897,7 @@ def refine_multimer_signature_clusters(
         "num_alignment_failures": num_alignment_failures,
         "num_signature_clusters_split": num_signature_clusters_split,
         "multimer_tm_score_threshold": tm_score_threshold,
+        "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
         "alignment_jobs": alignment_jobs,
     }
     if log_summary:
@@ -891,6 +931,7 @@ def build_multimer_signature_clusters(
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
+    min_alignment_coverage_ratio: float = 0.50,
     cif_files_directory: str | None = None,
     prep_dir: str | Path | None = None,
     include_structure_assignments: bool = True,
@@ -900,15 +941,19 @@ def build_multimer_signature_clusters(
         clustering_outdir,
         include_structure=include_structure_assignments,
     )
+    allowed_source_paths = monomer_inventory_source_paths(
+        load_monomer_inventory(clustering_outdir)
+    )
     observations = collect_multimer_observations(
         case_dirs, monomer_assignments,
         cif_files_directory=cif_files_directory,
         prep_dir=prep_dir,
+        allowed_source_paths=allowed_source_paths,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    dump_jsonl(outdir / "multimer_inventory.jsonl", [item.to_dict() for item in observations])
+    dump_jsonl(outdir / "multimer_inventory.jsonl", (item.to_dict() for item in observations))
     dump_csv_rows(outdir / "multimer_inventory.csv", [item.to_record() for item in observations])
 
     grouped: dict[str, list[MultimerObservation]] = {}
@@ -964,64 +1009,18 @@ def build_multimer_signature_clusters(
         )
 
     if structure_refinement_mode == "greedy":
-        extracted_structures: dict[str, ExtractedMultimerStructure] = {}
-        structure_rows: list[dict[str, Any]] = []
-        structure_failure_rows: list[dict[str, Any]] = []
-
-        def _record_extraction_result(
-            structures: dict[str, ExtractedMultimerStructure],
-            extract_manifest: dict[str, Any],
-            group_outdir: Path,
-        ) -> None:
-            extraction_manifest["num_extracted_multimer_structures"] += extract_manifest.get(
-                "num_extracted_multimer_structures",
-                0,
-            )
-            extraction_manifest["num_failed_multimer_structure_extractions"] += extract_manifest.get(
-                "num_failed_multimer_structure_extractions",
-                0,
-            )
-            structure_rows.extend(item.to_dict() for item in structures.values())
-            failures_path = group_outdir / "multimer_structure_extraction_failures.jsonl"
-            if failures_path.exists():
-                for line in failures_path.read_text(encoding="utf-8").splitlines():
-                    if line.strip():
-                        structure_failure_rows.append(json.loads(line))
-
-        multi_member_groups = [
-            (signature_cluster_id, members)
-            for signature_cluster_id, members in signature_groups
-            if len(members) > 1
-        ]
-        if multi_member_groups:
-            max_extract_workers = min(normalize_worker_count(alignment_jobs), len(multi_member_groups))
-            with ThreadPoolExecutor(max_workers=max_extract_workers) as executor:
-                future_to_group = {}
-                for signature_cluster_id, members in multi_member_groups:
-                    group_outdir = outdir / "structures" / "groups" / signature_cluster_id
-                    future = executor.submit(
-                        extract_multimer_structures,
-                        members,
-                        outdir=group_outdir,
-                        model=model,
-                        drop_hydrogens=drop_hydrogens,
-                        extraction_jobs=1,
-                        prep_dir=prep_dir,
-                        show_progress=False,
-                        log_summary=False,
-                    )
-                    future_to_group[future] = (signature_cluster_id, members, group_outdir)
-                future_iter = tqdm(
-                    as_completed(future_to_group),
-                    total=len(future_to_group),
-                    desc="Extracting multimer signature groups",
-                    unit="sig-group",
-                )
-                for future in future_iter:
-                    signature_cluster_id, members, group_outdir = future_to_group[future]
-                    structures, extract_manifest = future.result()
-                    extracted_structures.update(structures)
-                    _record_extraction_result(structures, extract_manifest, group_outdir)
+        extracted_structures, extract_manifest = extract_multimer_structures(
+            refinement_observations,
+            outdir=outdir / "structures",
+            model=model,
+            drop_hydrogens=drop_hydrogens,
+            extraction_jobs=alignment_jobs,
+            prep_dir=prep_dir,
+            show_progress=True,
+            log_summary=True,
+            raise_on_failure=True,
+        )
+        extraction_manifest.update(extract_manifest)
 
         refined = refine_multimer_signature_clusters(
             signature_groups,
@@ -1030,6 +1029,7 @@ def build_multimer_signature_clusters(
             usalign_executable=usalign_executable,
             alignment_runner=alignment_runner,
             alignment_jobs=alignment_jobs,
+            min_alignment_coverage_ratio=min_alignment_coverage_ratio,
             show_progress=True,
             log_summary=True,
             max_atoms_for_refinement=max_atoms_for_refinement,
@@ -1051,22 +1051,6 @@ def build_multimer_signature_clusters(
         representative_rows.sort(key=lambda row: _multimer_cluster_sort_key(row["multimer_cluster_id"]))
         signature_rows.sort(key=lambda row: _multimer_cluster_sort_key(row["multimer_cluster_id"]))
 
-        structures_dir = outdir / "structures"
-        dump_jsonl(structures_dir / "multimer_structure_extraction_failures.jsonl", structure_failure_rows)
-        dump_jsonl(structures_dir / "multimer_structures.jsonl", structure_rows)
-        dump_json(
-            structures_dir / "multimer_structure_manifest.json",
-            {
-                "num_multimer_observations": extraction_manifest["num_multimer_structure_extraction_candidates"],
-                "num_extracted_multimer_structures": extraction_manifest["num_extracted_multimer_structures"],
-                "num_failed_multimer_structure_extractions": extraction_manifest[
-                    "num_failed_multimer_structure_extractions"
-                ],
-                "extraction_jobs": normalize_worker_count(alignment_jobs),
-                "num_signature_groups_pipelined": len(multi_member_groups),
-            },
-            indent=2,
-        )
         manifest = {
             "num_multimer_observations": len(observations),
             "num_multimer_clusters": refined_manifest["num_multimer_clusters"],
@@ -1082,6 +1066,7 @@ def build_multimer_signature_clusters(
             "num_alignment_failures": refined_manifest["num_alignment_failures"],
             "num_signature_clusters_split": refined_manifest["num_signature_clusters_split"],
             "multimer_tm_score_threshold": multimer_tm_score_threshold,
+            "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "structure_refinement_mode": structure_refinement_mode,
             "alignment_jobs": refined_manifest["alignment_jobs"],
             **extraction_manifest,
@@ -1186,6 +1171,7 @@ def build_multimer_signature_clusters(
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
             "multimer_tm_score_threshold": multimer_tm_score_threshold,
+            "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "structure_refinement_mode": structure_refinement_mode,
             **extraction_manifest,
         }

@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+class MissingMonomerClusterAssignmentError(ValueError):
+    """Raised when a high-order member has no sequence/structure assignment."""
+
+
 def canonical_monomer_id(pdb_id: str, label_asym_id: str, assembly_id: str = "") -> str:
     if assembly_id:
         return f"{pdb_id}:{assembly_id}:{label_asym_id}"
@@ -17,7 +21,10 @@ def load_monomer_inventory(clustering_outdir: str | Path) -> dict[str, dict[str,
 
     inventory_path = Path(clustering_outdir) / "monomer_inventory.jsonl"
     if not inventory_path.exists():
-        return {}
+        raise FileNotFoundError(
+            "High-order clustering requires monomer_inventory.jsonl from the sequence "
+            f"clustering stage. Missing {inventory_path}."
+        )
 
     inventory: dict[str, dict[str, Any]] = {}
     with inventory_path.open(encoding="utf-8") as handle:
@@ -73,14 +80,42 @@ def resolve_monomer_cluster(
     monomer_id: str,
     assignments: dict[str, dict[str, str]],
 ) -> tuple[str, str | None, str | None]:
-    assignment = assignments.get(monomer_id, {})
+    assignment = assignments.get(monomer_id)
+    if assignment is None:
+        raise MissingMonomerClusterAssignmentError(
+            "High-order clustering encountered a monomer absent from the sequence clustering "
+            f"dataset: {monomer_id}. Refusing to create an implicit singleton cluster. "
+            "Verify that prep inputs, cutoff-date, and sequence clustering artifacts match."
+        )
     structure_cluster_id = assignment.get("structure_cluster_id") or None
     sequence_cluster_id = assignment.get("sequence_cluster_id") or None
     if structure_cluster_id is not None:
         return "structure", structure_cluster_id, sequence_cluster_id
     if sequence_cluster_id is not None:
         return "sequence", sequence_cluster_id, sequence_cluster_id
-    return "unclustered", f"monomer:{monomer_id}", None
+    raise MissingMonomerClusterAssignmentError(
+        "High-order clustering found an empty monomer cluster assignment for "
+        f"{monomer_id}. Refusing to create an implicit singleton cluster."
+    )
+
+
+def monomer_inventory_source_paths(
+    inventory: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Return the exact source scope represented by the sequence dataset."""
+
+    missing_source_ids = [
+        monomer_id
+        for monomer_id, row in inventory.items()
+        if not str(row.get("source_path", "") or "")
+    ]
+    if missing_source_ids:
+        preview = ", ".join(sorted(missing_source_ids)[:5])
+        raise ValueError(
+            "Sequence monomer inventory contains entries without source_path; cannot enforce "
+            f"the high-order cutoff scope. Example monomer ids: {preview}"
+        )
+    return {str(row["source_path"]) for row in inventory.values()}
 
 
 def _looks_like_case_output_dir(path: Path) -> bool:

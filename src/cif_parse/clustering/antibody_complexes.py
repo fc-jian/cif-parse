@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -17,15 +15,20 @@ from cif_parse.clustering.common import (
     canonical_monomer_id,
     load_monomer_cluster_assignments,
     load_monomer_inventory,
+    monomer_inventory_source_paths,
     resolve_monomer_cluster,
 )
-from cif_parse.clustering.dimers import DimerObservation, extract_dimer_structure
-from cif_parse.clustering.high_order_refinement import refine_signature_groups_three_phase
+from cif_parse.clustering.dimers import (
+    DimerObservation,
+    _resolve_usalign_executable,
+    extract_dimer_structure,
+)
+from cif_parse.clustering.high_order_refinement import refine_signature_groups_greedy
 from cif_parse.clustering.protein_structures import (
     USalignAlignmentResult,
     parse_usalign_output,
 )
-from cif_parse.clustering.parallel import normalize_worker_count
+from cif_parse.clustering.parallel import iter_threaded_results, normalize_worker_count
 from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
@@ -358,19 +361,21 @@ def collect_antibody_complex_observations(
     cif_files_directory: str | None = None,
     prep_db_path: str | Path | None = None,
     prep_dir: str | Path | None = None,
+    allowed_source_paths: set[str] | None = None,
 ) -> list[AntibodyComplexObservation]:
     observations: list[AntibodyComplexObservation] = []
 
     # Fast path: read pre-parsed Parquet
-    from cif_parse.clustering.prep import open_prep_parquet, iter_parquet_rows
-    pf = open_prep_parquet(prep_dir, "antibody_complexes", required=True) if prep_dir else None
-    if pf is not None:
+    from cif_parse.clustering.prep import iter_parquet_rows
+    if prep_dir:
         for row in tqdm(iter_parquet_rows(prep_dir, "antibody_complexes", required=True),
                         desc="Collecting antibody complexes", unit="complex"):
             pdb_id = row.get("pdb_id", "")
             if not pdb_id:
                 continue
             sp = resolve_source_path(row.get("source_path", ""), cif_files_directory)
+            if allowed_source_paths is not None and sp not in allowed_source_paths:
+                continue
             observations.append(_build_antibody_observation(
                 pdb_id=pdb_id, source_path=sp,
                 assembly_id=row.get("assembly_id"),
@@ -413,6 +418,8 @@ def collect_antibody_complex_observations(
                 str(summary.get("source_path", "") or ""),
                 cif_files_directory,
             )
+            if allowed_source_paths is not None and source_path not in allowed_source_paths:
+                continue
             assembly_ids = [str(item) for item in summary.get("assembly_ids", []) if str(item)]
             default_assembly_id = assembly_ids[0] if len(assembly_ids) == 1 else None
             complexes = payload.get("antibody_antigen_complexes", [])
@@ -697,31 +704,34 @@ def extract_antibody_complex_structures(
     prep_dir: str | Path | None = None,
     show_progress: bool = True,
     log_summary: bool = True,
+    raise_on_failure: bool = False,
 ) -> tuple[dict[str, ExtractedAntibodyComplexStructure], dict[str, Any]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     structures: dict[str, ExtractedAntibodyComplexStructure] = {}
     failures: list[dict[str, str]] = []
 
-    sorted_observations = sorted(observations, key=lambda item: item.complex_observation_id)
+    sorted_observations = sorted(
+        observations,
+        key=lambda item: (
+            item.source_path,
+            item.assembly_id or "",
+            item.complex_observation_id,
+        ),
+    )
     extraction_jobs = normalize_worker_count(extraction_jobs)
 
-    _pkl_reader = None
-    if prep_dir:
-        from cif_parse.clustering.atom_cache import resolve_cases_root, PklAtomReader
-        try:
-            _pkl_reader = PklAtomReader(resolve_cases_root(prep_dir))
-        except Exception:
-            pass
-
     def _try_assemble_ab(obs: AntibodyComplexObservation) -> AtomArray | None:
-        if _pkl_reader is None:
+        if prep_dir is None:
             return None
+        from cif_parse.clustering.prep import assemble_atom_array_from_chains
+
         antibody_chain_ids, antigen_chain_ids = _antibody_antigen_chain_parts(obs)
         chain_ids = _ordered_unique_chain_ids([*antibody_chain_ids, *antigen_chain_ids])
         if not chain_ids:
             return None
-        return _pkl_reader.load_chains(
+        return assemble_atom_array_from_chains(
+            prep_dir,
             obs.source_path,
             [(cid, None) for cid in chain_ids],
             assembly_id=obs.assembly_id,
@@ -742,53 +752,32 @@ def extract_antibody_complex_structures(
             interface_residue_cutoff=interface_residue_cutoff,
         )
 
-    if extraction_jobs <= 1 or len(sorted_observations) <= 1:
-        observation_iter = (
-            tqdm(sorted_observations, desc="Extracting antibody complex structures", unit="complex")
-            if show_progress
-            else sorted_observations
-        )
-        for observation in observation_iter:
-            try:
-                structures[observation.complex_observation_id] = _process_one(observation)
-            except Exception as exc:
-                LOGGER.warning(
-                    "Failed to extract antibody complex %s: %s",
-                    observation.complex_observation_id,
-                    exc,
-                )
-                failures.append(
-                    {"complex_observation_id": observation.complex_observation_id, "error": str(exc)}
-                )
-    else:
-        with ThreadPoolExecutor(max_workers=min(extraction_jobs, len(sorted_observations))) as executor:
-            future_to_obs = {
-                executor.submit(_process_one, observation): observation
-                for observation in sorted_observations
-            }
-            future_iter = as_completed(future_to_obs)
-            if show_progress:
-                future_iter = tqdm(
-                    future_iter,
-                    total=len(future_to_obs),
-                    desc="Extracting antibody complex structures",
-                    unit="complex",
-                )
-            for future in future_iter:
-                observation = future_to_obs[future]
-                try:
-                    extracted = future.result()
-                    if extracted is not None:
-                        structures[observation.complex_observation_id] = extracted
-                except Exception as exc:
-                    LOGGER.warning(
-                        "Failed to extract antibody complex %s: %s",
-                        observation.complex_observation_id,
-                        exc,
-                    )
-                    failures.append(
-                        {"complex_observation_id": observation.complex_observation_id, "error": str(exc)}
-                    )
+    for observation, extracted, error in iter_threaded_results(
+        sorted_observations,
+        _process_one,
+        max_workers=min(extraction_jobs, max(1, len(sorted_observations))),
+        total=len(sorted_observations),
+        show_progress=show_progress,
+        progress_desc="Extracting antibody complex structures",
+        progress_unit="complex",
+    ):
+        if error is not None:
+            if raise_on_failure:
+                raise RuntimeError(
+                    "Failed to extract antibody complex "
+                    f"{observation.complex_observation_id}: {error}"
+                ) from error
+            LOGGER.warning(
+                "Failed to extract antibody complex %s: %s",
+                observation.complex_observation_id,
+                error,
+            )
+            failures.append(
+                {"complex_observation_id": observation.complex_observation_id, "error": str(error)}
+            )
+            continue
+        if extracted is not None:
+            structures[observation.complex_observation_id] = extracted
 
     dump_jsonl(
         outdir / "antibody_complex_structure_extraction_failures.jsonl",
@@ -796,7 +785,7 @@ def extract_antibody_complex_structures(
     )
     dump_jsonl(
         outdir / "antibody_complex_structures.jsonl",
-        [item.to_dict() for item in structures.values()],
+        (item.to_dict() for item in structures.values()),
     )
     manifest = {
         "num_antibody_complex_observations": len(sorted_observations),
@@ -819,11 +808,13 @@ def run_antibody_complex_usalign_alignment(
     *,
     usalign_executable: str = "USalign",
     tm_score_threshold: float = 0.50,
+    min_alignment_coverage_ratio: float = 0.50,
 ) -> USalignAlignmentResult:
-    if shutil.which(usalign_executable) is None:
+    resolved_executable = _resolve_usalign_executable(usalign_executable)
+    if resolved_executable is None:
         raise FileNotFoundError(f"{usalign_executable} executable not found in PATH")
     command = [
-        usalign_executable,
+        resolved_executable,
         query.extracted_pdb_path,
         target.extracted_pdb_path,
         "-mol",
@@ -841,7 +832,7 @@ def run_antibody_complex_usalign_alignment(
         query_length=query.residue_count,
         target_length=target.residue_count,
         tm_score_threshold=tm_score_threshold,
-        min_alignment_coverage_ratio=0.0,
+        min_alignment_coverage_ratio=min_alignment_coverage_ratio,
     )
 
 
@@ -853,6 +844,7 @@ def refine_antibody_complex_signature_clusters(
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
+    min_alignment_coverage_ratio: float = 0.50,
     show_progress: bool = True,
     log_summary: bool = True,
 ) -> dict[str, Any]:
@@ -873,7 +865,7 @@ def refine_antibody_complex_signature_clusters(
         if show_progress
         else signature_groups
     )
-    refined = refine_signature_groups_three_phase(
+    refined = refine_signature_groups_greedy(
         signature_iter,
         extracted_structures,
         member_id=lambda item: item.complex_observation_id,
@@ -889,6 +881,8 @@ def refine_antibody_complex_signature_clusters(
             "tm_score_min": result.min_tm_score,
             "tm_score_max": result.max_tm_score,
             "tm_score_for_clustering": result.max_tm_score,
+            "alignment_coverage_shorter": result.shorter_length_coverage,
+            "alignment_coverage_resolved": result.resolved_length_coverage,
         },
         alignment_failure_warning=lambda signature_cluster_id, representative, candidate, exc: {
             "warning_code": "antibody_complex_usalign_failed",
@@ -906,6 +900,7 @@ def refine_antibody_complex_signature_clusters(
         alignment_jobs=alignment_jobs,
         usalign_executable=usalign_executable,
         tm_score_threshold=tm_score_threshold,
+        min_alignment_coverage_ratio=min_alignment_coverage_ratio,
         show_progress=show_progress,
         can_skip_alignment=lambda a, b: (
             a.source_path == b.source_path
@@ -1018,6 +1013,7 @@ def refine_antibody_complex_signature_clusters(
         "num_alignment_failures": num_alignment_failures,
         "num_signature_clusters_split": num_signature_clusters_split,
         "antibody_complex_tm_score_threshold": tm_score_threshold,
+        "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
         "alignment_jobs": alignment_jobs,
     }
     if log_summary:
@@ -1052,6 +1048,7 @@ def build_antibody_complex_signature_clusters(
     usalign_executable: str = "USalign",
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     alignment_jobs: int = 1,
+    min_alignment_coverage_ratio: float = 0.50,
     cif_files_directory: str | None = None,
     prep_dir: str | Path | None = None,
     include_structure_assignments: bool = True,
@@ -1061,19 +1058,21 @@ def build_antibody_complex_signature_clusters(
         include_structure=include_structure_assignments,
     )
     monomer_inventory = load_monomer_inventory(clustering_outdir)
+    allowed_source_paths = monomer_inventory_source_paths(monomer_inventory)
     observations = collect_antibody_complex_observations(
         case_dirs,
         monomer_assignments,
         monomer_inventory,
         cif_files_directory=cif_files_directory,
         prep_dir=prep_dir,
+        allowed_source_paths=allowed_source_paths,
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     dump_jsonl(
         outdir / "antibody_complex_inventory.jsonl",
-        [item.to_dict() for item in observations],
+        (item.to_dict() for item in observations),
     )
     dump_csv_rows(
         outdir / "antibody_complex_inventory.csv",
@@ -1132,65 +1131,28 @@ def build_antibody_complex_signature_clusters(
         )
 
     if structure_refinement_mode == "greedy":
+        structures_dir = outdir / "structures"
         extracted_structures: dict[str, ExtractedAntibodyComplexStructure] = {}
-        structure_rows: list[dict[str, Any]] = []
-        structure_failure_rows: list[dict[str, Any]] = []
-
-        def _record_extraction_result(
-            structures: dict[str, ExtractedAntibodyComplexStructure],
-            extract_manifest: dict[str, Any],
-            group_outdir: Path,
-        ) -> None:
-            extraction_manifest["num_extracted_antibody_complex_structures"] += extract_manifest.get(
-                "num_extracted_antibody_complex_structures",
-                0,
+        multi_member_group_count = sum(1 for _, members in signature_groups if len(members) > 1)
+        if refinement_observations:
+            extracted_structures, extract_manifest = extract_antibody_complex_structures(
+                refinement_observations,
+                outdir=structures_dir,
+                model=model,
+                drop_hydrogens=drop_hydrogens,
+                interface_residue_cutoff=antibody_complex_interface_residue_cutoff,
+                extraction_jobs=alignment_jobs,
+                prep_dir=prep_dir,
+                show_progress=True,
+                log_summary=True,
+                raise_on_failure=True,
             )
-            extraction_manifest["num_failed_antibody_complex_structure_extractions"] += extract_manifest.get(
-                "num_failed_antibody_complex_structure_extractions",
-                0,
-            )
-            structure_rows.extend(item.to_dict() for item in structures.values())
-            failures_path = group_outdir / "antibody_complex_structure_extraction_failures.jsonl"
-            if failures_path.exists():
-                for line in failures_path.read_text(encoding="utf-8").splitlines():
-                    if line.strip():
-                        structure_failure_rows.append(json.loads(line))
-
-        multi_member_groups = [
-            (signature_cluster_id, members)
-            for signature_cluster_id, members in signature_groups
-            if len(members) > 1
-        ]
-        if multi_member_groups:
-            max_extract_workers = min(normalize_worker_count(alignment_jobs), len(multi_member_groups))
-            with ThreadPoolExecutor(max_workers=max_extract_workers) as executor:
-                future_to_group = {}
-                for signature_cluster_id, members in multi_member_groups:
-                    group_outdir = outdir / "structures" / "groups" / signature_cluster_id
-                    future = executor.submit(
-                        extract_antibody_complex_structures,
-                        members,
-                        outdir=group_outdir,
-                        model=model,
-                        drop_hydrogens=drop_hydrogens,
-                        interface_residue_cutoff=antibody_complex_interface_residue_cutoff,
-                        extraction_jobs=1,
-                        prep_dir=prep_dir,
-                        show_progress=False,
-                        log_summary=False,
-                    )
-                    future_to_group[future] = (signature_cluster_id, members, group_outdir)
-                future_iter = tqdm(
-                    as_completed(future_to_group),
-                    total=len(future_to_group),
-                    desc="Extracting antibody signature groups",
-                    unit="sig-group",
-                )
-                for future in future_iter:
-                    signature_cluster_id, members, group_outdir = future_to_group[future]
-                    structures, extract_manifest = future.result()
-                    extracted_structures.update(structures)
-                    _record_extraction_result(structures, extract_manifest, group_outdir)
+            extraction_manifest["num_extracted_antibody_complex_structures"] = extract_manifest[
+                "num_extracted_antibody_complex_structures"
+            ]
+            extraction_manifest[
+                "num_failed_antibody_complex_structure_extractions"
+            ] = extract_manifest["num_failed_antibody_complex_structure_extractions"]
 
         refined = refine_antibody_complex_signature_clusters(
             signature_groups,
@@ -1199,6 +1161,7 @@ def build_antibody_complex_signature_clusters(
             usalign_executable=usalign_executable,
             alignment_runner=alignment_runner,
             alignment_jobs=alignment_jobs,
+            min_alignment_coverage_ratio=min_alignment_coverage_ratio,
             show_progress=True,
             log_summary=True,
         )
@@ -1224,12 +1187,6 @@ def build_antibody_complex_signature_clusters(
         )
         signature_rows.sort(key=lambda row: _antibody_cluster_sort_key(row["antibody_complex_cluster_id"]))
 
-        structures_dir = outdir / "structures"
-        dump_jsonl(
-            structures_dir / "antibody_complex_structure_extraction_failures.jsonl",
-            structure_failure_rows,
-        )
-        dump_jsonl(structures_dir / "antibody_complex_structures.jsonl", structure_rows)
         dump_json(
             structures_dir / "antibody_complex_structure_manifest.json",
             {
@@ -1243,7 +1200,7 @@ def build_antibody_complex_signature_clusters(
                     "num_failed_antibody_complex_structure_extractions"
                 ],
                 "extraction_jobs": normalize_worker_count(alignment_jobs),
-                "num_signature_groups_pipelined": len(multi_member_groups),
+                "num_signature_groups_pipelined": multi_member_group_count,
                 "antibody_complex_interface_residue_cutoff": (
                     float(antibody_complex_interface_residue_cutoff)
                     if antibody_complex_interface_residue_cutoff is not None
@@ -1265,6 +1222,7 @@ def build_antibody_complex_signature_clusters(
             "num_alignment_failures": refined_manifest["num_alignment_failures"],
             "num_signature_clusters_split": refined_manifest["num_signature_clusters_split"],
             "antibody_complex_tm_score_threshold": antibody_complex_tm_score_threshold,
+            "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "antibody_complex_interface_residue_cutoff": (
                 float(antibody_complex_interface_residue_cutoff)
                 if antibody_complex_interface_residue_cutoff is not None
@@ -1370,6 +1328,7 @@ def build_antibody_complex_signature_clusters(
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
             "antibody_complex_tm_score_threshold": antibody_complex_tm_score_threshold,
+            "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "antibody_complex_interface_residue_cutoff": (
                 float(antibody_complex_interface_residue_cutoff)
                 if antibody_complex_interface_residue_cutoff is not None
