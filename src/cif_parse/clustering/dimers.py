@@ -715,7 +715,7 @@ def extract_dimer_structures(
                 raise RuntimeError(
                     f"Failed to extract dimer {observation.dimer_observation_id}: {error}"
                 ) from error
-            LOGGER.warning("Failed to extract dimer %s: %s", observation.dimer_observation_id, error)
+            LOGGER.debug("Failed to extract dimer %s: %s", observation.dimer_observation_id, error)
             failures.append(
                 {"dimer_observation_id": observation.dimer_observation_id, "error": str(error)}
             )
@@ -723,7 +723,8 @@ def extract_dimer_structures(
         if extracted is not None:
             structures[observation.dimer_observation_id] = extracted
 
-    dump_jsonl(outdir / "dimer_structure_extraction_failures.jsonl", failures)
+    failure_path = outdir / "dimer_structure_extraction_failures.jsonl"
+    dump_jsonl(failure_path, failures)
     dump_jsonl(outdir / "dimer_structures.jsonl", (item.to_dict() for item in structures.values()))
     manifest = {
         "num_dimer_observations": len(sorted_observations),
@@ -735,6 +736,12 @@ def extract_dimer_structures(
         ),
     }
     dump_json(outdir / "dimer_structure_manifest.json", manifest, indent=2)
+    if failures:
+        LOGGER.warning(
+            "Skipped %d failed dimer structure extractions; details written to %s",
+            len(failures),
+            failure_path,
+        )
     if log_summary:
         LOGGER.info("Extracted %d dimer structures (%d failures)", len(structures), len(failures))
     return structures, manifest
@@ -836,7 +843,7 @@ def refine_dimer_signature_clusters(
             "error": str(exc),
         },
         unavailable_warning=lambda signature_cluster_id, member: {
-            "warning_code": "dimer_structure_unavailable_singleton_cluster",
+            "warning_code": "dimer_structure_unavailable_skipped",
             "signature_cluster_id": signature_cluster_id,
             "dimer_observation_id": member.dimer_observation_id,
         },
@@ -872,6 +879,7 @@ def refine_dimer_signature_clusters(
     num_alignment_runs = refined.num_alignment_runs
     num_alignment_failures = refined.num_alignment_failures
     num_signature_clusters_split = refined.num_signature_clusters_split
+    num_skipped_missing_structure = refined.num_members_skipped_missing_structure
 
     grouped_signature_sizes = {signature_cluster_id: 0 for signature_cluster_id, _ in signature_groups}
     for signature_cluster_id, _, _, _ in cluster_members:
@@ -940,18 +948,20 @@ def refine_dimer_signature_clusters(
         "num_alignment_runs": num_alignment_runs,
         "num_alignment_failures": num_alignment_failures,
         "num_signature_clusters_split": num_signature_clusters_split,
+        "num_dimer_observations_skipped_missing_structure": num_skipped_missing_structure,
         "dimer_tm_score_threshold": tm_score_threshold,
         "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
         "alignment_jobs": alignment_jobs,
     }
     if log_summary:
         LOGGER.info(
-            "Dimer refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits)",
+            "Dimer refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits, %d skipped missing structure)",
             len(signature_groups),
             len(cluster_members),
             num_alignment_runs,
             num_alignment_failures,
             num_signature_clusters_split,
+            num_skipped_missing_structure,
         )
     return {
         "manifest": manifest,
@@ -1105,7 +1115,7 @@ def build_dimer_signature_clusters(
                 prep_dir=prep_dir,
                 show_progress=True,
                 log_summary=True,
-                raise_on_failure=True,
+                raise_on_failure=False,
             )
             extraction_manifest["num_extracted_dimer_structures"] = extract_manifest[
                 "num_extracted_dimer_structures"
@@ -1172,6 +1182,9 @@ def build_dimer_signature_clusters(
             "num_alignment_runs": refined_manifest["num_alignment_runs"],
             "num_alignment_failures": refined_manifest["num_alignment_failures"],
             "num_signature_clusters_split": refined_manifest["num_signature_clusters_split"],
+            "num_dimer_observations_skipped_missing_structure": refined_manifest[
+                "num_dimer_observations_skipped_missing_structure"
+            ],
             "dimer_tm_score_threshold": dimer_tm_score_threshold,
             "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "dimer_interface_residue_cutoff": (
@@ -1247,6 +1260,7 @@ def build_dimer_signature_clusters(
             "num_alignment_runs": 0,
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
+            "num_dimer_observations_skipped_missing_structure": 0,
             "dimer_tm_score_threshold": dimer_tm_score_threshold,
             "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "dimer_interface_residue_cutoff": (
@@ -1264,6 +1278,14 @@ def build_dimer_signature_clusters(
     dump_jsonl(outdir / "dimer_pairwise_alignments.jsonl", alignment_rows)
     dump_jsonl(outdir / "dimer_cluster_warnings.jsonl", warning_rows)
     dump_json(outdir / "dimer_cluster_manifest.json", manifest, indent=2)
+    LOGGER.info(
+        "Dimer clustering finished: %d observations, %d clusters, %d extraction failures, %d skipped missing structure, %d warnings",
+        manifest["num_dimer_observations"],
+        manifest["num_dimer_clusters"],
+        manifest["num_failed_dimer_structure_extractions"],
+        manifest["num_dimer_observations_skipped_missing_structure"],
+        len(warning_rows),
+    )
     return {
         "manifest": manifest,
         "observations": observations,

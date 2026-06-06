@@ -597,7 +597,7 @@ def extract_multimer_structures(
                 raise RuntimeError(
                     f"Failed to extract multimer {observation.multimer_observation_id}: {error}"
                 ) from error
-            LOGGER.warning(
+            LOGGER.debug(
                 "Failed to extract multimer %s: %s",
                 observation.multimer_observation_id,
                 error,
@@ -609,7 +609,8 @@ def extract_multimer_structures(
         if extracted is not None:
             structures[observation.multimer_observation_id] = extracted
 
-    dump_jsonl(outdir / "multimer_structure_extraction_failures.jsonl", failures)
+    failure_path = outdir / "multimer_structure_extraction_failures.jsonl"
+    dump_jsonl(failure_path, failures)
     dump_jsonl(outdir / "multimer_structures.jsonl", (item.to_dict() for item in structures.values()))
     manifest = {
         "num_multimer_observations": len(sorted_observations),
@@ -618,6 +619,12 @@ def extract_multimer_structures(
         "extraction_jobs": extraction_jobs,
     }
     dump_json(outdir / "multimer_structure_manifest.json", manifest, indent=2)
+    if failures:
+        LOGGER.warning(
+            "Skipped %d failed multimer structure extractions; details written to %s",
+            len(failures),
+            failure_path,
+        )
     if log_summary:
         LOGGER.info("Extracted %d multimer structures (%d failures)", len(structures), len(failures))
     return structures, manifest
@@ -702,17 +709,30 @@ def refine_multimer_signature_clusters(
     # Pre-populate cluster_members for large groups (no USalign, one cluster each).
     large_cluster_members: list[tuple[str, str, list[Any], Any]] = []
     large_warning_rows: list[dict[str, Any]] = []
+    num_large_skipped_missing_structure = 0
     for sig_id, members in large_groups:
         extracted = [m for m in members if m.multimer_observation_id in extracted_structures]
-        representative = max(extracted, key=lambda m: (extracted_structures[m.multimer_observation_id].atom_count), default=extracted[0] if extracted else members[0])
-        large_cluster_members.append((sig_id, representative.multimer_observation_id, sorted(members, key=lambda m: m.multimer_observation_id), representative))
-        for m in members:
-            if m.multimer_observation_id not in extracted_structures:
-                large_warning_rows.append({
-                    "warning_code": "multimer_structure_unavailable_single_cluster",
-                    "signature_cluster_id": sig_id,
-                    "multimer_observation_id": m.multimer_observation_id,
-                })
+        missing = [m for m in members if m.multimer_observation_id not in extracted_structures]
+        num_large_skipped_missing_structure += len(missing)
+        if extracted:
+            representative = max(
+                extracted,
+                key=lambda m: extracted_structures[m.multimer_observation_id].atom_count,
+            )
+            large_cluster_members.append(
+                (
+                    sig_id,
+                    representative.multimer_observation_id,
+                    sorted(extracted, key=lambda m: m.multimer_observation_id),
+                    representative,
+                )
+            )
+        for m in missing:
+            large_warning_rows.append({
+                "warning_code": "multimer_structure_unavailable_skipped",
+                "signature_cluster_id": sig_id,
+                "multimer_observation_id": m.multimer_observation_id,
+            })
 
     if not small_groups:
         manifest = {
@@ -721,15 +741,19 @@ def refine_multimer_signature_clusters(
             "num_alignment_runs": 0,
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
+            "num_multimer_observations_skipped_missing_structure": (
+                num_large_skipped_missing_structure
+            ),
             "multimer_tm_score_threshold": tm_score_threshold,
             "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "alignment_jobs": alignment_jobs,
         }
         if log_summary:
             LOGGER.info(
-                "Multimer refinement: %d signature clusters -> %d refined clusters (0 alignments, 0 failures, 0 splits — all skipped: too large)",
+                "Multimer refinement: %d signature clusters -> %d refined clusters (0 alignments, 0 failures, 0 splits, %d skipped missing structure; all eligible groups too large)",
                 len(signature_groups),
                 len(large_cluster_members),
+                num_large_skipped_missing_structure,
             )
         return {
             "manifest": manifest,
@@ -778,7 +802,7 @@ def refine_multimer_signature_clusters(
             "error": str(exc),
         },
         unavailable_warning=lambda signature_cluster_id, member: {
-            "warning_code": "multimer_structure_unavailable_singleton_cluster",
+            "warning_code": "multimer_structure_unavailable_skipped",
             "signature_cluster_id": signature_cluster_id,
             "multimer_observation_id": member.multimer_observation_id,
         },
@@ -801,6 +825,10 @@ def refine_multimer_signature_clusters(
     num_alignment_runs = refined.num_alignment_runs
     num_alignment_failures = refined.num_alignment_failures
     num_signature_clusters_split = refined.num_signature_clusters_split
+    num_skipped_missing_structure = (
+        refined.num_members_skipped_missing_structure
+        + num_large_skipped_missing_structure
+    )
 
     membership_rows: list[dict[str, Any]] = []
     representative_rows: list[dict[str, Any]] = []
@@ -896,18 +924,20 @@ def refine_multimer_signature_clusters(
         "num_alignment_runs": num_alignment_runs,
         "num_alignment_failures": num_alignment_failures,
         "num_signature_clusters_split": num_signature_clusters_split,
+        "num_multimer_observations_skipped_missing_structure": num_skipped_missing_structure,
         "multimer_tm_score_threshold": tm_score_threshold,
         "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
         "alignment_jobs": alignment_jobs,
     }
     if log_summary:
         LOGGER.info(
-            "Multimer refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits)",
+            "Multimer refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits, %d skipped missing structure)",
             len(signature_groups),
             len(cluster_members),
             num_alignment_runs,
             num_alignment_failures,
             num_signature_clusters_split,
+            num_skipped_missing_structure,
         )
     return {
         "manifest": manifest,
@@ -1018,7 +1048,7 @@ def build_multimer_signature_clusters(
             prep_dir=prep_dir,
             show_progress=True,
             log_summary=True,
-            raise_on_failure=True,
+            raise_on_failure=False,
         )
         extraction_manifest.update(extract_manifest)
 
@@ -1065,6 +1095,9 @@ def build_multimer_signature_clusters(
             "num_alignment_runs": refined_manifest["num_alignment_runs"],
             "num_alignment_failures": refined_manifest["num_alignment_failures"],
             "num_signature_clusters_split": refined_manifest["num_signature_clusters_split"],
+            "num_multimer_observations_skipped_missing_structure": refined_manifest[
+                "num_multimer_observations_skipped_missing_structure"
+            ],
             "multimer_tm_score_threshold": multimer_tm_score_threshold,
             "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "structure_refinement_mode": structure_refinement_mode,
@@ -1170,6 +1203,7 @@ def build_multimer_signature_clusters(
             "num_alignment_runs": 0,
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
+            "num_multimer_observations_skipped_missing_structure": 0,
             "multimer_tm_score_threshold": multimer_tm_score_threshold,
             "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "structure_refinement_mode": structure_refinement_mode,
@@ -1182,6 +1216,14 @@ def build_multimer_signature_clusters(
     dump_jsonl(outdir / "multimer_pairwise_alignments.jsonl", alignment_rows)
     dump_jsonl(outdir / "multimer_cluster_warnings.jsonl", warning_rows)
     dump_json(outdir / "multimer_cluster_manifest.json", manifest, indent=2)
+    LOGGER.info(
+        "Multimer clustering finished: %d observations, %d clusters, %d extraction failures, %d skipped missing structure, %d warnings",
+        manifest["num_multimer_observations"],
+        manifest["num_multimer_clusters"],
+        manifest["num_failed_multimer_structure_extractions"],
+        manifest["num_multimer_observations_skipped_missing_structure"],
+        len(warning_rows),
+    )
     return {
         "manifest": manifest,
         "observations": observations,

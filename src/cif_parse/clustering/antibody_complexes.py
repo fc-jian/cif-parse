@@ -767,7 +767,7 @@ def extract_antibody_complex_structures(
                     "Failed to extract antibody complex "
                     f"{observation.complex_observation_id}: {error}"
                 ) from error
-            LOGGER.warning(
+            LOGGER.debug(
                 "Failed to extract antibody complex %s: %s",
                 observation.complex_observation_id,
                 error,
@@ -779,8 +779,9 @@ def extract_antibody_complex_structures(
         if extracted is not None:
             structures[observation.complex_observation_id] = extracted
 
+    failure_path = outdir / "antibody_complex_structure_extraction_failures.jsonl"
     dump_jsonl(
-        outdir / "antibody_complex_structure_extraction_failures.jsonl",
+        failure_path,
         failures,
     )
     dump_jsonl(
@@ -797,6 +798,12 @@ def extract_antibody_complex_structures(
         ),
     }
     dump_json(outdir / "antibody_complex_structure_manifest.json", manifest, indent=2)
+    if failures:
+        LOGGER.warning(
+            "Skipped %d failed antibody complex structure extractions; details written to %s",
+            len(failures),
+            failure_path,
+        )
     if log_summary:
         LOGGER.info("Extracted %d antibody complex structures (%d failures)", len(structures), len(failures))
     return structures, manifest
@@ -892,7 +899,7 @@ def refine_antibody_complex_signature_clusters(
             "error": str(exc),
         },
         unavailable_warning=lambda signature_cluster_id, member: {
-            "warning_code": "antibody_complex_structure_unavailable_singleton_cluster",
+            "warning_code": "antibody_complex_structure_unavailable_skipped",
             "signature_cluster_id": signature_cluster_id,
             "complex_observation_id": member.complex_observation_id,
         },
@@ -916,6 +923,7 @@ def refine_antibody_complex_signature_clusters(
     num_alignment_runs = refined.num_alignment_runs
     num_alignment_failures = refined.num_alignment_failures
     num_signature_clusters_split = refined.num_signature_clusters_split
+    num_skipped_missing_structure = refined.num_members_skipped_missing_structure
 
     grouped_signature_sizes = {signature_cluster_id: 0 for signature_cluster_id, _ in signature_groups}
     for signature_cluster_id, _, _, _ in cluster_members:
@@ -1012,18 +1020,22 @@ def refine_antibody_complex_signature_clusters(
         "num_alignment_runs": num_alignment_runs,
         "num_alignment_failures": num_alignment_failures,
         "num_signature_clusters_split": num_signature_clusters_split,
+        "num_antibody_complex_observations_skipped_missing_structure": (
+            num_skipped_missing_structure
+        ),
         "antibody_complex_tm_score_threshold": tm_score_threshold,
         "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
         "alignment_jobs": alignment_jobs,
     }
     if log_summary:
         LOGGER.info(
-            "Antibody complex refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits)",
+            "Antibody complex refinement: %d signature clusters -> %d refined clusters (%d alignments, %d failures, %d splits, %d skipped missing structure)",
             len(signature_groups),
             len(cluster_members),
             num_alignment_runs,
             num_alignment_failures,
             num_signature_clusters_split,
+            num_skipped_missing_structure,
         )
     return {
         "manifest": manifest,
@@ -1145,7 +1157,7 @@ def build_antibody_complex_signature_clusters(
                 prep_dir=prep_dir,
                 show_progress=True,
                 log_summary=True,
-                raise_on_failure=True,
+                raise_on_failure=False,
             )
             extraction_manifest["num_extracted_antibody_complex_structures"] = extract_manifest[
                 "num_extracted_antibody_complex_structures"
@@ -1221,6 +1233,9 @@ def build_antibody_complex_signature_clusters(
             "num_alignment_runs": refined_manifest["num_alignment_runs"],
             "num_alignment_failures": refined_manifest["num_alignment_failures"],
             "num_signature_clusters_split": refined_manifest["num_signature_clusters_split"],
+            "num_antibody_complex_observations_skipped_missing_structure": refined_manifest[
+                "num_antibody_complex_observations_skipped_missing_structure"
+            ],
             "antibody_complex_tm_score_threshold": antibody_complex_tm_score_threshold,
             "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "antibody_complex_interface_residue_cutoff": (
@@ -1327,6 +1342,7 @@ def build_antibody_complex_signature_clusters(
             "num_alignment_runs": 0,
             "num_alignment_failures": 0,
             "num_signature_clusters_split": 0,
+            "num_antibody_complex_observations_skipped_missing_structure": 0,
             "antibody_complex_tm_score_threshold": antibody_complex_tm_score_threshold,
             "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
             "antibody_complex_interface_residue_cutoff": (
@@ -1344,6 +1360,14 @@ def build_antibody_complex_signature_clusters(
     dump_jsonl(outdir / "antibody_complex_pairwise_alignments.jsonl", alignment_rows)
     dump_jsonl(outdir / "antibody_complex_cluster_warnings.jsonl", warning_rows)
     dump_json(outdir / "antibody_complex_cluster_manifest.json", manifest, indent=2)
+    LOGGER.info(
+        "Antibody complex clustering finished: %d observations, %d clusters, %d extraction failures, %d skipped missing structure, %d warnings",
+        manifest["num_antibody_complex_observations"],
+        manifest["num_antibody_complex_clusters"],
+        manifest["num_failed_antibody_complex_structure_extractions"],
+        manifest["num_antibody_complex_observations_skipped_missing_structure"],
+        len(warning_rows),
+    )
     return {
         "manifest": manifest,
         "observations": observations,

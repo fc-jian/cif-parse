@@ -54,6 +54,7 @@ class GreedySignatureRefinementResult:
     num_alignment_runs: int
     num_alignment_failures: int
     num_signature_clusters_split: int
+    num_members_skipped_missing_structure: int
 
 
 def _structure_weight(structure: Any) -> int:
@@ -99,6 +100,8 @@ def refine_signature_groups_greedy(
     """
 
     states: list[dict[str, Any]] = []
+    warning_rows: list[dict[str, Any]] = []
+    num_members_skipped_missing_structure = 0
     structure_weights = {
         structure_id: _structure_weight(structure)
         for structure_id, structure in extracted_structures.items()
@@ -116,14 +119,9 @@ def refine_signature_groups_greedy(
             member for member in members if member_id(member) not in extracted_structures
         ]
         if len(members) > 1 and unresolved_members:
-            unresolved_ids = ", ".join(
-                member_id(member) for member in sorted(unresolved_members, key=member_id)[:5]
-            )
-            raise HighOrderRefinementError(
-                f"High-order signature {signature_cluster_id} has "
-                f"{len(unresolved_members)} unavailable structures among {len(members)} members "
-                f"(examples: {unresolved_ids}). Refusing singleton fallback."
-            )
+            num_members_skipped_missing_structure += len(unresolved_members)
+            for member in sorted(unresolved_members, key=member_id):
+                warning_rows.append(unavailable_warning(signature_cluster_id, member))
         states.append(
             {
                 "signature_cluster_id": signature_cluster_id,
@@ -137,7 +135,6 @@ def refine_signature_groups_greedy(
 
     alignment_cache: dict[tuple[str, str], Any] = {}
     alignment_rows: list[dict[str, Any]] = []
-    warning_rows: list[dict[str, Any]] = []
     num_alignment_runs = 0
     num_alignment_failures = 0
 
@@ -307,6 +304,12 @@ def refine_signature_groups_greedy(
                 )
             )
 
+    if num_members_skipped_missing_structure:
+        LOGGER.warning(
+            "Skipped %d high-order observations with unavailable extracted structures",
+            num_members_skipped_missing_structure,
+        )
+
     return GreedySignatureRefinementResult(
         alignment_cache=alignment_cache,
         alignment_rows=alignment_rows,
@@ -315,6 +318,7 @@ def refine_signature_groups_greedy(
         num_alignment_runs=num_alignment_runs,
         num_alignment_failures=num_alignment_failures,
         num_signature_clusters_split=num_signature_clusters_split,
+        num_members_skipped_missing_structure=num_members_skipped_missing_structure,
     )
 
 
