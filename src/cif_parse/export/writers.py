@@ -4,6 +4,7 @@ import csv
 import gzip
 import json
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 
@@ -72,7 +73,7 @@ def dump_csv_rows(path: str | Path, rows: list[dict[str, Any]]) -> Path:
     return output_path
 
 
-def dump_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> Path:
+def dump_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> Path:
     """Write newline-delimited JSON rows and return the output path."""
 
     output_path = Path(path)

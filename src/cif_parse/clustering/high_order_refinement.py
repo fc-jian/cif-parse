@@ -73,7 +73,7 @@ def _structure_weight(structure: Any) -> int:
     return 0
 
 
-def refine_signature_groups_greedy(
+def _refine_signature_groups_greedy_round_barrier(
     signature_groups: list[tuple[str, list[MemberT]]],
     extracted_structures: dict[str, StructureT],
     *,
@@ -358,4 +358,282 @@ def refine_signature_groups_three_phase(
         can_skip_alignment=can_skip_alignment,
         show_progress=show_progress,
         fail_fast=fail_fast,
+    )
+
+
+def refine_signature_groups_greedy(
+    signature_groups: list[tuple[str, list[MemberT]]],
+    extracted_structures: dict[str, StructureT],
+    *,
+    member_id: Callable[[MemberT], str],
+    structural_sort_key: Callable[[MemberT], Any],
+    alignment_row: Callable[[str, Any], dict[str, Any]],
+    alignment_failure_warning: Callable[[str, MemberT, MemberT, Exception], dict[str, Any]],
+    unavailable_warning: Callable[[str, MemberT], dict[str, Any]],
+    runner: Callable[..., Any],
+    alignment_jobs: int,
+    usalign_executable: str,
+    tm_score_threshold: float,
+    min_alignment_coverage_ratio: float = 0.50,
+    can_skip_alignment: Callable[[MemberT, MemberT], bool] | None = None,
+    show_progress: bool = True,
+    fail_fast: bool = True,
+) -> GreedySignatureRefinementResult:
+    """Refine independent signature groups with one asynchronous worker pool."""
+
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    import heapq
+    import itertools
+
+    from cif_parse.clustering.parallel import _semaphored_runner, normalize_worker_count
+
+    states: dict[str, dict[str, Any]] = {}
+    warning_rows: list[dict[str, Any]] = []
+    num_members_skipped_missing_structure = 0
+    for signature_cluster_id, members in tqdm(
+        signature_groups,
+        desc="Preparing high-order refinement groups",
+        unit="sig-group",
+        disable=not show_progress or len(signature_groups) < 2,
+    ):
+        extracted_members = [
+            member for member in members if member_id(member) in extracted_structures
+        ]
+        unresolved_members = [
+            member for member in members if member_id(member) not in extracted_structures
+        ]
+        if len(members) > 1:
+            num_members_skipped_missing_structure += len(unresolved_members)
+            warning_rows.extend(
+                unavailable_warning(signature_cluster_id, member)
+                for member in sorted(unresolved_members, key=member_id)
+            )
+        states[signature_cluster_id] = {
+            "signature_cluster_id": signature_cluster_id,
+            "members": members,
+            "extracted_members": extracted_members,
+            "pending": sorted(extracted_members, key=structural_sort_key),
+            "local_clusters": [],
+        }
+
+    alignment_jobs = normalize_worker_count(alignment_jobs)
+    alignment_cache: dict[tuple[str, str], Any] = {}
+    alignment_rows: list[dict[str, Any]] = []
+    num_alignment_runs = 0
+    num_alignment_failures = 0
+    active_count = 0
+    ready_states: list[tuple[int, str, int]] = []
+    ready_counter = itertools.count()
+
+    def _queue_state(state: dict[str, Any]) -> None:
+        cursor = state["round_cursor"]
+        representative_id = member_id(state["round_representative"])
+        candidate = state["round_candidates"][cursor]
+        pair_weight = (
+            _structure_weight(extracted_structures[representative_id])
+            + _structure_weight(extracted_structures[member_id(candidate)])
+        )
+        heapq.heappush(
+            ready_states,
+            (
+                -pair_weight,
+                state["signature_cluster_id"],
+                next(ready_counter),
+            ),
+        )
+
+    def _start_round(state: dict[str, Any]) -> None:
+        nonlocal active_count
+        while state["pending"]:
+            representative = state["pending"][0]
+            candidates = state["pending"][1:]
+            if not candidates:
+                state["local_clusters"].append(([representative], representative))
+                state["pending"] = []
+                return
+            state["round_representative"] = representative
+            state["round_candidates"] = candidates
+            state["round_cursor"] = 0
+            state["round_done"] = 0
+            state["round_results"] = {}
+            state["round_failures"] = {}
+            _queue_state(state)
+            active_count += 1
+            return
+
+    def _finish_round(state: dict[str, Any]) -> None:
+        nonlocal active_count, num_alignment_failures
+        representative = state["round_representative"]
+        assigned = [representative]
+        remaining: list[MemberT] = []
+        for candidate in state["round_candidates"]:
+            candidate_id = member_id(candidate)
+            failure = state["round_failures"].get(candidate_id)
+            if failure is not None:
+                num_alignment_failures += 1
+                warning_rows.append(
+                    alignment_failure_warning(
+                        state["signature_cluster_id"],
+                        representative,
+                        candidate,
+                        failure,
+                    )
+                )
+                remaining.append(candidate)
+                continue
+            result = state["round_results"][candidate_id]
+            if result.meets_tm_threshold:
+                assigned.append(candidate)
+            else:
+                remaining.append(candidate)
+        state["local_clusters"].append((assigned, representative))
+        state["pending"] = remaining
+        active_count -= 1
+        _start_round(state)
+
+    for state in states.values():
+        _start_round(state)
+
+    future_to_item: dict[Any, tuple[dict[str, Any], MemberT, tuple[str, str]]] = {}
+    max_pending = alignment_jobs * 4
+    progress = tqdm(
+        desc="Running high-order USalign",
+        unit="alignment",
+        disable=not show_progress,
+    )
+    with ThreadPoolExecutor(max_workers=alignment_jobs) as executor:
+        while ready_states or future_to_item or active_count:
+            capacity = max_pending - len(future_to_item)
+            while ready_states and capacity > 0:
+                _, signature_cluster_id, _ = heapq.heappop(ready_states)
+                state = states[signature_cluster_id]
+                cursor = state["round_cursor"]
+                candidates = state["round_candidates"]
+                if cursor >= len(candidates):
+                    continue
+                candidate = candidates[cursor]
+                state["round_cursor"] = cursor + 1
+                if state["round_cursor"] < len(candidates):
+                    _queue_state(state)
+
+                representative = state["round_representative"]
+                representative_id = member_id(representative)
+                candidate_id = member_id(candidate)
+                pair_key = tuple(sorted((representative_id, candidate_id)))
+                cached = alignment_cache.get(pair_key)
+                if cached is not None:
+                    state["round_results"][candidate_id] = cached
+                    state["round_done"] += 1
+                    progress.update(1)
+                    if state["round_done"] == len(candidates):
+                        _finish_round(state)
+                    continue
+                if can_skip_alignment is not None and can_skip_alignment(
+                    representative,
+                    candidate,
+                ):
+                    query_structure = extracted_structures[representative_id]
+                    target_structure = extracted_structures[candidate_id]
+                    result = _make_identical_alignment(
+                        representative_id,
+                        candidate_id,
+                        query_residue_count=getattr(
+                            query_structure,
+                            "residue_count",
+                            1,
+                        )
+                        or 1,
+                        target_residue_count=getattr(
+                            target_structure,
+                            "residue_count",
+                            1,
+                        )
+                        or 1,
+                    )
+                    alignment_cache[pair_key] = result
+                    state["round_results"][candidate_id] = result
+                    state["round_done"] += 1
+                    progress.update(1)
+                    if state["round_done"] == len(candidates):
+                        _finish_round(state)
+                    continue
+
+                future = executor.submit(
+                    _semaphored_runner,
+                    runner,
+                    extracted_structures[representative_id],
+                    extracted_structures[candidate_id],
+                    usalign_executable=usalign_executable,
+                    tm_score_threshold=tm_score_threshold,
+                    min_alignment_coverage_ratio=min_alignment_coverage_ratio,
+                )
+                future_to_item[future] = (state, candidate, pair_key)
+                capacity -= 1
+
+            if future_to_item and (
+                len(future_to_item) >= max_pending or not ready_states
+            ):
+                done, _ = wait(future_to_item, return_when=FIRST_COMPLETED)
+                for future in done:
+                    state, candidate, pair_key = future_to_item.pop(future)
+                    candidate_id = member_id(candidate)
+                    representative = state["round_representative"]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        if fail_fast:
+                            progress.close()
+                            raise HighOrderRefinementError(
+                                "High-order USalign failed for "
+                                f"{pair_key[0]} vs {pair_key[1]} in "
+                                f"{state['signature_cluster_id']}: {exc}"
+                            ) from exc
+                        state["round_failures"][candidate_id] = exc
+                    else:
+                        alignment_cache[pair_key] = result
+                        state["round_results"][candidate_id] = result
+                        alignment_rows.append(
+                            alignment_row(state["signature_cluster_id"], result)
+                        )
+                        num_alignment_runs += 1
+                    state["round_done"] += 1
+                    progress.update(1)
+                    if state["round_done"] == len(state["round_candidates"]):
+                        _finish_round(state)
+            elif not future_to_item and not ready_states and active_count:
+                progress.close()
+                raise RuntimeError("High-order refinement scheduler stalled")
+    progress.close()
+
+    cluster_members: list[tuple[str, str, list[Any], Any]] = []
+    num_signature_clusters_split = 0
+    for signature_cluster_id, _ in signature_groups:
+        state = states[signature_cluster_id]
+        members = state["members"]
+        extracted_members = state["extracted_members"]
+        local_clusters = state["local_clusters"]
+        if not extracted_members and len(members) == 1:
+            representative = min(members, key=structural_sort_key)
+            local_clusters.append((list(members), representative))
+        if len(local_clusters) > 1:
+            num_signature_clusters_split += 1
+        for members_in_cluster, representative in local_clusters:
+            cluster_members.append(
+                (
+                    signature_cluster_id,
+                    member_id(representative),
+                    sorted(members_in_cluster, key=member_id),
+                    representative,
+                )
+            )
+
+    return GreedySignatureRefinementResult(
+        alignment_cache=alignment_cache,
+        alignment_rows=alignment_rows,
+        warning_rows=warning_rows,
+        cluster_members=cluster_members,
+        num_alignment_runs=num_alignment_runs,
+        num_alignment_failures=num_alignment_failures,
+        num_signature_clusters_split=num_signature_clusters_split,
+        num_members_skipped_missing_structure=num_members_skipped_missing_structure,
     )

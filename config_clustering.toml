@@ -172,6 +172,11 @@ jobs = 8
 # Allowed values: integer >= 1.
 # sequence_cluster_jobs = 8
 
+# Number of dimer interface extraction workers.
+# If omitted in custom configs, defaults to `jobs`.
+# Allowed values: integer >= 1.
+# dimer_extraction_jobs = 8
+
 # Maximum concurrent USalign subprocesses per refinement stage.
 # Allowed values: integer >= 1.
 # usalign_jobs = 8

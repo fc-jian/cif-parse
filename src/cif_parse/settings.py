@@ -209,6 +209,7 @@ class ClusteringSettings:
     jobs: int = _DEFAULT_JOB_COUNT
     mmseqs_threads: int | None = None
     sequence_cluster_jobs: int | None = None
+    dimer_extraction_jobs: int | None = None
     usalign_jobs: int | None = None
     log_level: str = "DEBUG"
 
@@ -269,6 +270,8 @@ class ClusteringSettings:
             raise ValueError("clustering.mmseqs_threads must be >= 1")
         if self.sequence_cluster_jobs is not None and self.sequence_cluster_jobs < 1:
             raise ValueError("clustering.sequence_cluster_jobs must be >= 1")
+        if self.dimer_extraction_jobs is not None and self.dimer_extraction_jobs < 1:
+            raise ValueError("clustering.dimer_extraction_jobs must be >= 1")
         if self.usalign_jobs is not None and self.usalign_jobs < 1:
             raise ValueError("clustering.usalign_jobs must be >= 1")
 
@@ -481,6 +484,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "jobs",
             "mmseqs_threads",
             "sequence_cluster_jobs",
+            "dimer_extraction_jobs",
             "usalign_jobs",
             "log_level",
         },
@@ -553,6 +557,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "jobs": validated_clustering.jobs,
         "mmseqs_threads": validated_clustering.mmseqs_threads,
         "sequence_cluster_jobs": validated_clustering.sequence_cluster_jobs,
+        "dimer_extraction_jobs": validated_clustering.dimer_extraction_jobs,
         "usalign_jobs": validated_clustering.usalign_jobs,
         "log_level": validated_clustering.log_level,
     }

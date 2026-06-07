@@ -158,7 +158,7 @@ Key clustering defaults:
 6. The legacy full command now calls the split stages as `seq -> structure -> parallel(tcr, abag, multimer, dimer)`. For maximum throughput on a scheduler, run `seq` and `structure` first, then submit high-order stage subcommands in parallel.
 7. High-order stages write `*_signature_cluster_membership.csv` immediately after signature grouping, before any within-signature structure extraction or USalign refinement.
 8. Higher-order structure refinement skips singleton signature groups: singletons are emitted directly as clusters without writing complex PDBs or running USalign.
-9. `--jobs N` automatically propagates to all subtask workers (`--mmseqs-threads`, `--sequence-cluster-jobs`, `--usalign-jobs`). Individual subtask counts can still be overridden explicitly.
+9. `--jobs N` automatically propagates to all subtask workers (`--mmseqs-threads`, `--sequence-cluster-jobs`, `--dimer-extraction-jobs`, `--usalign-jobs`). Individual subtask counts can still be overridden explicitly.
 10. `--cif-files-directory` is deprecated and ignored by clustering.
 11. Use `--prep-dir` as the full clustering input source for Parquet rows and per-chain cached AtomArrays. Without it, `seq` can run from case JSON; the legacy full command auto-builds temporary prep before any coordinate-consuming stage.
 12. Optional `--cutoff-date YYYY-MM-DD` filters sequence clustering by metadata `release_date < cutoff_date` and is part of the sequence clustering provenance.

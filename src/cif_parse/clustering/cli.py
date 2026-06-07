@@ -194,6 +194,10 @@ def _resolve_worker_counts(args: argparse.Namespace, config_defaults: dict[str, 
         args.mmseqs_threads = config_defaults.get("clustering", {}).get("mmseqs_threads") or args.jobs
     if args.sequence_cluster_jobs is None:
         args.sequence_cluster_jobs = config_defaults.get("clustering", {}).get("sequence_cluster_jobs") or args.jobs
+    if args.dimer_extraction_jobs is None:
+        args.dimer_extraction_jobs = (
+            config_defaults.get("clustering", {}).get("dimer_extraction_jobs") or args.jobs
+        )
     if args.usalign_jobs is None:
         args.usalign_jobs = config_defaults.get("clustering", {}).get("usalign_jobs") or args.jobs
 
@@ -554,6 +558,12 @@ def build_parser(
         help="Number of protein sequence clusters processed concurrently (default: same as --jobs)",
     )
     parser.add_argument(
+        "--dimer-extraction-jobs",
+        type=int,
+        default=clustering_defaults.get("dimer_extraction_jobs"),
+        help="Number of dimer interface extraction workers (default: same as --jobs)",
+    )
+    parser.add_argument(
         "--usalign-jobs",
         type=int,
         default=clustering_defaults.get("usalign_jobs"),
@@ -798,6 +808,8 @@ def _run_structure(
         usalign_executable=args.usalign_executable,
         sequence_cluster_jobs=args.sequence_cluster_jobs,
         pairwise_alignment_jobs=args.usalign_jobs,
+        model=args.model,
+        drop_hydrogens=not args.keep_hydrogens,
         extract_fn=_pipeline_extract,
         protein_subcluster_by_sequence=args.protein_subcluster_by_sequence,
         prep_dir=prep_dir,
@@ -876,6 +888,7 @@ def _build_high_order_specs(args: argparse.Namespace, sequence_dataset: dict[str
             "structure_refinement_mode": args.dimer_structure_mode,
             "dimer_tm_score_threshold": args.dimer_tm_score_threshold,
             "dimer_interface_residue_cutoff": args.dimer_interface_residue_cutoff,
+            "extraction_jobs": args.dimer_extraction_jobs,
         }))
     return specs
 
@@ -960,7 +973,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     _resolve_worker_counts(args, config_defaults)
 
-    for field_name in ("jobs", "mmseqs_threads", "sequence_cluster_jobs", "usalign_jobs"):
+    for field_name in (
+        "jobs",
+        "mmseqs_threads",
+        "sequence_cluster_jobs",
+        "dimer_extraction_jobs",
+        "usalign_jobs",
+    ):
         if getattr(args, field_name) < 1:
             parser.error(f"--{field_name.replace('_', '-')} must be >= 1")
     if args.dimer_interface_residue_cutoff <= 0:

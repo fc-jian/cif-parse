@@ -99,8 +99,13 @@ def alignment_cache_key(
     seq_target: str,
     source_query: str,
     source_target: str,
+    query_monomer_id: str = "",
+    target_monomer_id: str = "",
+    query_coordinate_fingerprint: str = "",
+    target_coordinate_fingerprint: str = "",
     model: int = 1,
     keep_h: bool = False,
+    usalign_mode: str = "monomer",
 ) -> str:
     """Deterministic 32-char hex key for a unique alignment pair."""
     raw = "|".join([
@@ -108,8 +113,13 @@ def alignment_cache_key(
         _seq_hash(seq_target),
         _resolve_cached(source_query),
         _resolve_cached(source_target),
+        str(query_monomer_id),
+        str(target_monomer_id),
+        str(query_coordinate_fingerprint),
+        str(target_coordinate_fingerprint),
         str(int(model)),
         "1" if keep_h else "0",
+        str(usalign_mode),
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
@@ -194,14 +204,10 @@ class AlignmentCacheDB:
             return None  # caller should treat as failure, not re-submit
         if row[2] is None:  # tm_score_max is NULL — pending
             return None
-        self._get_conn().execute(
-            "UPDATE alignment_cache SET queried_at=? WHERE cache_key=?",
-            (_now(), cache_key),
-        )
-        self._get_conn().commit()
         return {
             "tm_score_query": row[0],
             "tm_score_target": row[1],
+            "tm_score_min": min(row[0], row[1]),
             "tm_score_max": row[2],
             "rmsd": row[3],
             "aligned_length": row[4],
@@ -280,12 +286,88 @@ class AlignmentCacheDB:
         )
         self._get_conn().commit()
 
+    def cache_write_results_many(
+        self,
+        rows: list[tuple[str, dict[str, Any]]],
+    ) -> None:
+        """Write completed USalign results in one transaction."""
+        if not rows:
+            return
+        self._get_conn().executemany(
+            """UPDATE alignment_cache SET
+               tm_score_query=?, tm_score_target=?, tm_score_max=?, rmsd=?,
+               aligned_length=?, shorter_length_coverage=?, resolved_length_coverage=?,
+               error_message=NULL
+               WHERE cache_key=?""",
+            [
+                (
+                    result.get("tm_score_query"),
+                    result.get("tm_score_target"),
+                    result.get("tm_score_max"),
+                    result.get("rmsd"),
+                    result.get("aligned_length"),
+                    result.get("shorter_length_coverage"),
+                    result.get("resolved_length_coverage"),
+                    cache_key,
+                )
+                for cache_key, result in rows
+            ],
+        )
+        self._get_conn().commit()
+
     def cache_write_error(self, cache_key: str, error: str) -> None:
         self._get_conn().execute(
             "UPDATE alignment_cache SET error_message=? WHERE cache_key=?",
             (error, cache_key),
         )
         self._get_conn().commit()
+
+    def cache_write_errors_many(self, rows: list[tuple[str, str]]) -> None:
+        """Write failed USalign results in one transaction."""
+        if not rows:
+            return
+        self._get_conn().executemany(
+            "UPDATE alignment_cache SET error_message=? WHERE cache_key=?",
+            [(error, cache_key) for cache_key, error in rows],
+        )
+        self._get_conn().commit()
+
+    def cache_get_records(self, keys: list[str]) -> dict[str, dict[str, Any]]:
+        """Return completed or failed cache records for the requested keys."""
+        if not keys:
+            return {}
+        records: dict[str, dict[str, Any]] = {}
+        chunk_size = 900
+        for start in range(0, len(keys), chunk_size):
+            chunk = keys[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._get_conn().execute(
+                f"""SELECT cache_key, tm_score_query, tm_score_target, tm_score_max,
+                           rmsd, aligned_length, shorter_length_coverage,
+                           resolved_length_coverage, error_message
+                    FROM alignment_cache
+                    WHERE cache_key IN ({placeholders})""",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                tm_score_query = row[1]
+                tm_score_target = row[2]
+                records[row[0]] = {
+                    "tm_score_query": tm_score_query,
+                    "tm_score_target": tm_score_target,
+                    "tm_score_min": (
+                        min(tm_score_query, tm_score_target)
+                        if tm_score_query is not None and tm_score_target is not None
+                        else None
+                    ),
+                    "tm_score_max": row[3],
+                    "rmsd": row[4],
+                    "aligned_length": row[5],
+                    "shorter_length_coverage": row[6],
+                    "resolved_length_coverage": row[7],
+                    "error_message": row[8],
+                }
+        return records
 
     def populate_from(self, other: "AlignmentCacheDB") -> int:
         """Copy all completed entries from another cache DB.  Returns count."""
@@ -415,5 +497,15 @@ class AlignmentCacheDB:
         self._get_conn().executemany(
             "UPDATE phase1_tasks SET status=? WHERE task_id=?",
             [(status, tid) for tid in task_ids],
+        )
+        self._get_conn().commit()
+
+    def task_status_batch_update_by_keys(self, cache_keys: list[str], status: str) -> None:
+        """Update task status by cache key in one transaction."""
+        if not cache_keys:
+            return
+        self._get_conn().executemany(
+            "UPDATE phase1_tasks SET status=? WHERE cache_key=?",
+            [(status, cache_key) for cache_key in cache_keys],
         )
         self._get_conn().commit()

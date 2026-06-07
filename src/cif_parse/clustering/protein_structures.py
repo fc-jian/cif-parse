@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import re
@@ -171,6 +172,10 @@ class ExtractedMonomerStructure:
     atom_count: int
     filter_counts: dict[str, int]
     quality: EntryQualityMetadata
+    assembly_id: str | None = None
+    coordinate_fingerprint: str = ""
+    model: int = 1
+    keep_hydrogens: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -185,6 +190,20 @@ class ExtractedMonomerStructure:
             -float(self.resolved_fraction),
             self.monomer_id,
         )
+
+
+def _atom_coordinate_fingerprint(atom_array: AtomArray) -> str:
+    """Hash the filtered coordinates and residue identity used by USalign."""
+
+    digest = hashlib.sha256()
+    digest.update(atom_array.coord.tobytes(order="C"))
+    for category in ("chain_id", "res_id", "ins_code", "res_name", "atom_name"):
+        try:
+            values = atom_array.get_annotation(category)
+        except (AttributeError, KeyError):
+            continue
+        digest.update(values.tobytes(order="C"))
+    return digest.hexdigest()[:24]
 
 
 @dataclass(slots=True)
@@ -267,6 +286,10 @@ def extract_monomer_from_pkl(
         atom_count=int(chain_atoms.array_length()),
         filter_counts=atom_array_filter_counts(filter_counts),
         quality=quality,
+        assembly_id=monomer.assembly_id,
+        coordinate_fingerprint=_atom_coordinate_fingerprint(_coerced),
+        model=1,
+        keep_hydrogens=not drop_hydrogens,
     )
 
 
@@ -341,6 +364,10 @@ def extract_protein_monomer_structure(
         atom_count=int(chain_atoms.array_length()),
         filter_counts=atom_array_filter_counts(filter_counts),
         quality=quality,
+        assembly_id=monomer.assembly_id,
+        coordinate_fingerprint=_atom_coordinate_fingerprint(chain_atoms),
+        model=model,
+        keep_hydrogens=not drop_hydrogens,
     )
 
 
@@ -661,6 +688,8 @@ def greedy_cluster_protein_structures(
     alignment_runner: Callable[..., USalignAlignmentResult] | None = None,
     sequence_cluster_jobs: int = 1,
     pairwise_alignment_jobs: int = 1,
+    model: int = 1,
+    drop_hydrogens: bool = True,
     extract_fn: Callable[[MonomerSample], ExtractedMonomerStructure | None] | None = None,
     protein_subcluster_by_sequence: bool = True,
     prep_dir: str | Path | None = None,
@@ -694,24 +723,25 @@ def greedy_cluster_protein_structures(
         " (pipelined extraction+clustering)" if pipeline_mode else "",
     )
 
-    # Three-phase parallel pipeline: extract → generate tasks → execute all → resolve
-    if protein_subcluster_by_sequence or pipeline_mode:
-        return _run_three_phase_clustering(
-            monomer_index=monomer_index,
-            sequence_groups=sequence_groups,
-            extracted_structures=extracted_structures,
-            outdir=outdir,
-            runner=runner,
-            tm_score_threshold=tm_score_threshold,
-            min_alignment_coverage_ratio=min_alignment_coverage_ratio,
-            usalign_executable=usalign_executable,
-            sequence_cluster_jobs=sequence_cluster_jobs,
-            pairwise_alignment_jobs=pairwise_alignment_jobs,
-            extract_fn=extract_fn,
-            protein_subcluster_by_sequence=protein_subcluster_by_sequence,
-            prep_dir=prep_dir,
-            cif_idx=cif_idx,
-        )
+    # Use the bounded stage-wide scheduler for both pre-extracted and pipelined inputs.
+    return _run_three_phase_clustering(
+        monomer_index=monomer_index,
+        sequence_groups=sequence_groups,
+        extracted_structures=extracted_structures,
+        outdir=outdir,
+        runner=runner,
+        tm_score_threshold=tm_score_threshold,
+        min_alignment_coverage_ratio=min_alignment_coverage_ratio,
+        usalign_executable=usalign_executable,
+        sequence_cluster_jobs=sequence_cluster_jobs,
+        pairwise_alignment_jobs=pairwise_alignment_jobs,
+        model=model,
+        drop_hydrogens=drop_hydrogens,
+        extract_fn=extract_fn,
+        protein_subcluster_by_sequence=protein_subcluster_by_sequence,
+        prep_dir=prep_dir,
+        cif_idx=cif_idx,
+    )
 
     available_structures = len(extracted_structures)
 
@@ -1241,7 +1271,8 @@ def _reconstruct_structure(
 ) -> ExtractedMonomerStructure:
     """Rebuild ExtractedMonomerStructure from compact worker return + monomer index."""
     (res_frac, meth_pri, res, res_cnt, src_path, pdb_path,
-     pdb_id, lbl, auth, atom_cnt, primary_method) = info
+     pdb_id, lbl, auth, atom_cnt, primary_method, assembly_id,
+     coordinate_fingerprint, model, keep_hydrogens) = info
     m = monomer_index.get(monomer_id)
     return ExtractedMonomerStructure(
         monomer_id=monomer_id, pdb_id=pdb_id, label_asym_id=lbl,
@@ -1256,7 +1287,80 @@ def _reconstruct_structure(
             experimental_methods=[], primary_method=primary_method,
             method_priority=int(meth_pri), resolution=res,
         ),
+        assembly_id=assembly_id or None,
+        coordinate_fingerprint=coordinate_fingerprint,
+        model=int(model),
+        keep_hydrogens=bool(keep_hydrogens),
     )
+
+
+_structure_worker_prep_dir: str | None = None
+_structure_worker_coord_index: dict[str, tuple[Path, int, int]] | None = None
+_structure_worker_pkl_reader: Any = None
+_structure_worker_quality: dict[str, EntryQualityMetadata] = {}
+_structure_worker_drop_hydrogens = True
+_structure_worker_model = 1
+
+
+def _init_structure_group_worker(
+    prep_dir: str,
+    drop_hydrogens: bool,
+    model: int,
+) -> None:
+    """Initialize process-local coordinate readers once per Phase 1 worker."""
+
+    global _structure_worker_prep_dir
+    global _structure_worker_coord_index
+    global _structure_worker_pkl_reader
+    global _structure_worker_quality
+    global _structure_worker_drop_hydrogens
+    global _structure_worker_model
+
+    from cif_parse.clustering.atom_cache import (
+        PklAtomReader,
+        load_source_case_dir_map,
+        resolve_cases_root,
+    )
+    from cif_parse.clustering.prep import load_cif_coords_index
+
+    _structure_worker_prep_dir = prep_dir
+    _structure_worker_coord_index = load_cif_coords_index(prep_dir)
+    _structure_worker_quality = load_entry_quality_metadata_from_prep(prep_dir)
+    _structure_worker_drop_hydrogens = bool(drop_hydrogens)
+    _structure_worker_model = int(model)
+    try:
+        _structure_worker_pkl_reader = PklAtomReader(
+            resolve_cases_root(prep_dir),
+            load_source_case_dir_map(prep_dir),
+        )
+    except (FileNotFoundError, OSError, ValueError):
+        _structure_worker_pkl_reader = None
+
+
+def _load_structure_worker_chain(monomer: MonomerSample) -> AtomArray | None:
+    from cif_parse.clustering.prep import load_chain_atoms
+
+    if _structure_worker_prep_dir is not None and _structure_worker_coord_index is not None:
+        for assembly_id in (monomer.assembly_id, None):
+            atoms = load_chain_atoms(
+                _structure_worker_prep_dir,
+                monomer.source_path,
+                monomer.label_asym_id,
+                assembly_id=assembly_id,
+                index=_structure_worker_coord_index,
+            )
+            if atoms is not None:
+                return atoms
+    if _structure_worker_pkl_reader is not None:
+        for assembly_id in (monomer.assembly_id, None):
+            atoms = _structure_worker_pkl_reader.load_chain(
+                monomer.source_path,
+                monomer.label_asym_id,
+                assembly_id=assembly_id,
+            )
+            if atoms is not None:
+                return atoms
+    return None
 
 
 def _process_one_group_worker(
@@ -1271,26 +1375,15 @@ def _process_one_group_worker(
     4. Enumerates greedy USalign tasks
     5. Returns task list, subcluster map, and extracted structures
     """
-    (seq_cluster_id, member_ids, monomers_data, cases_root,
-     pdb_dir, min_cov) = payload[:6]
-    _quality_dict_ser = payload[6] if len(payload) > 6 else {}
+    (seq_cluster_id, member_ids, monomers_data, pdb_dir, subcluster_by_sequence) = payload
     pdb_dir = Path(pdb_dir)
     pdb_dir.mkdir(parents=True, exist_ok=True)
-
-    # Reconstruct quality metadata
-    quality_by_source: dict[str, EntryQualityMetadata] = {}
-    for k, v in _quality_dict_ser.items():
-        quality_by_source[k] = EntryQualityMetadata(**v)
 
     # Reconstruct monomers from picklable data
     monomer_map: dict[str, MonomerSample] = {}
     for md in monomers_data:
         m = MonomerSample(**md)
         monomer_map[m.monomer_id] = m
-
-    # Build per-worker PklAtomReader
-    from cif_parse.clustering.atom_cache import PklAtomReader
-    reader = PklAtomReader(cases_root)
 
     # Extract chains for all monomers in this group.
     # If a PDB already exists on disk, reuse it to avoid redundant atom
@@ -1307,7 +1400,10 @@ def _process_one_group_worker(
 
         # Early PDB-existence check: skip atom extraction if PDB is present.
         asm_tag = monomer.assembly_id or "na"
-        pdb_path = group_dir / f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}.pdb"
+        pdb_path = group_dir / (
+            f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}"
+            f"_m{_structure_worker_model}_h{int(not _structure_worker_drop_hydrogens)}.pdb"
+        )
         if pdb_path.exists() and pdb_path.stat().st_size > 0:
             try:
                 _pdb_file = PDBFile.read(pdb_path)
@@ -1325,8 +1421,12 @@ def _process_one_group_worker(
                         resolved_fraction=_resolved_count / max(1, monomer.residue_count),
                         atom_count=int(_pdb_atoms.array_length()),
                         filter_counts={},
-                        quality=quality_by_source.get(monomer.source_path)
+                        quality=_structure_worker_quality.get(monomer.source_path)
                         or _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
+                        assembly_id=monomer.assembly_id,
+                        coordinate_fingerprint=_atom_coordinate_fingerprint(_pdb_atoms),
+                        model=_structure_worker_model,
+                        keep_hydrogens=not _structure_worker_drop_hydrogens,
                     )
                     _extract_info[mid] = (
                         _ext.resolved_fraction,
@@ -1340,26 +1440,24 @@ def _process_one_group_worker(
                         _ext.auth_asym_id or "",
                         _ext.atom_count,
                         _ext.quality.primary_method if _ext.quality else None,
+                        _ext.assembly_id or "",
+                        _ext.coordinate_fingerprint,
+                        _ext.model,
+                        _ext.keep_hydrogens,
                     )
                     extracted_list.append(_ext)
                     continue
             except (OSError, ValueError):
                 pass
 
-        chain_atoms = None
-        for aid in (monomer.assembly_id, None):
-            if not aid:
-                continue
-            chain_atoms = reader.load_chain(monomer.source_path, monomer.label_asym_id, str(aid))
-            if chain_atoms is not None:
-                break
-        if chain_atoms is None:
-            chain_atoms = reader.load_chain(monomer.source_path, monomer.label_asym_id, None)
+        chain_atoms = _load_structure_worker_chain(monomer)
         if chain_atoms is None or chain_atoms.array_length() == 0:
             continue
 
         chain_atoms, filter_counts = filter_atom_array_for_analysis(
-            chain_atoms, drop_hydrogens=True, drop_nonfinite=True,
+            chain_atoms,
+            drop_hydrogens=_structure_worker_drop_hydrogens,
+            drop_nonfinite=True,
         )
         if chain_atoms.array_length() == 0:
             continue
@@ -1380,7 +1478,11 @@ def _process_one_group_worker(
             resolved_fraction=resolved_count / max(1, monomer.residue_count),
             atom_count=int(chain_atoms.array_length()),
             filter_counts=atom_array_filter_counts(filter_counts),
-            quality=quality_by_source.get(monomer.source_path) or _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
+            quality=_structure_worker_quality.get(monomer.source_path)
+            or _default_entry_quality(source_path=monomer.source_path, pdb_id=monomer.pdb_id),
+            assembly_id=monomer.assembly_id,
+            model=_structure_worker_model,
+            keep_hydrogens=not _structure_worker_drop_hydrogens,
         )
         # Store compact tuple for main-process reconstruction (avoids ~1KB pickle
         # per structure through multiprocessing queues at million-scale).
@@ -1396,6 +1498,10 @@ def _process_one_group_worker(
             ext.auth_asym_id or "",
             ext.atom_count,
             ext.quality.primary_method if ext.quality else None,
+            ext.assembly_id or "",
+            "",
+            ext.model,
+            ext.keep_hydrogens,
         )
         extracted_list.append(ext)
 
@@ -1410,7 +1516,8 @@ def _process_one_group_worker(
     extracted: dict[str, ExtractedMonomerStructure] = {}
     for mid, info in _extract_info.items():
         (res_frac, meth_pri, res, res_cnt, src_path, pdb_path,
-         pdb_id, lbl, auth, atom_cnt, primary_method) = info
+         pdb_id, lbl, auth, atom_cnt, primary_method, assembly_id,
+         coordinate_fingerprint, model, keep_hydrogens) = info
         m = monomer_map.get(mid)
         extracted[mid] = ExtractedMonomerStructure(
             monomer_id=mid, pdb_id=pdb_id, label_asym_id=lbl, auth_asym_id=auth,
@@ -1424,17 +1531,22 @@ def _process_one_group_worker(
                 experimental_methods=[], primary_method=primary_method,
                 method_priority=int(meth_pri), resolution=res,
             ),
+            assembly_id=assembly_id or None,
+            coordinate_fingerprint=coordinate_fingerprint,
+            model=int(model),
+            keep_hydrogens=bool(keep_hydrogens),
         )
 
     candidates = sorted(extracted_list, key=lambda item: item.quality_sort_key())
 
-    # Subcluster by exact sequence
+    # Subcluster by exact sequence when requested.
     subcluster_rep: dict[str, str] = {}
     from collections import defaultdict as _dd
     seq_groups: dict[str, list[Any]] = _dd(list)
     for c in candidates:
         m = monomer_map.get(c.monomer_id)
-        seq_groups[m.sequence if m else ""].append(c)
+        key = m.sequence if subcluster_by_sequence and m else c.monomer_id
+        seq_groups[key].append(c)
     candidates = []
     for _seq, members in seq_groups.items():
         rep = min(members, key=lambda item: item.quality_sort_key())
@@ -1446,14 +1558,24 @@ def _process_one_group_worker(
         group_dir = pdb_dir / seq_cluster_id
         group_dir.mkdir(parents=True, exist_ok=True)
         asm_tag = monomer_map[rep.monomer_id].assembly_id or "na"
-        pdb_path = group_dir / f"{rep.pdb_id}_{asm_tag}_{rep.label_asym_id}.pdb"
+        pdb_path = group_dir / (
+            f"{rep.pdb_id}_{asm_tag}_{rep.label_asym_id}"
+            f"_m{_structure_worker_model}_h{int(not _structure_worker_drop_hydrogens)}.pdb"
+        )
         if pdb_path.exists() and pdb_path.stat().st_size > 0:
             rep.extracted_pdb_path = str(pdb_path)
+            if not rep.coordinate_fingerprint:
+                try:
+                    existing_atoms = PDBFile.read(pdb_path).get_structure(model=1)
+                    rep.coordinate_fingerprint = _atom_coordinate_fingerprint(existing_atoms)
+                except (OSError, ValueError):
+                    rep.coordinate_fingerprint = ""
             prev = _extract_info.get(rep.monomer_id)
             if prev is not None:
                 _extract_info[rep.monomer_id] = (prev[0], prev[1], prev[2], prev[3], prev[4],
                                                   str(pdb_path), prev[6], prev[7], prev[8], prev[9],
-                                                  prev[10])
+                                                  prev[10], prev[11], rep.coordinate_fingerprint,
+                                                  prev[13], prev[14])
         elif chain_aa is not None and not rep.extracted_pdb_path:
             _coerced = chain_aa.copy()
             _coerced.chain_id[:] = "A"
@@ -1461,61 +1583,65 @@ def _process_one_group_worker(
             pdb_file.set_structure(_coerced)
             pdb_file.write(pdb_path)
             rep.extracted_pdb_path = str(pdb_path)
+            rep.coordinate_fingerprint = _atom_coordinate_fingerprint(_coerced)
             prev = _extract_info.get(rep.monomer_id)
             if prev is not None:
                 _extract_info[rep.monomer_id] = (prev[0], prev[1], prev[2], prev[3], prev[4],
                                                   str(pdb_path), prev[6], prev[7], prev[8], prev[9],
-                                                  prev[10])
-
-    # Greedy round enumeration
-    local_tasks = []
-    pending = sorted(candidates, key=lambda item: item.quality_sort_key())
-    round_num = 0
-    from pathlib import Path as _Path
-    from cif_parse.clustering.usalign_cache import alignment_cache_key
-
-    while pending:
-        rep = pending[0]
-        round_num += 1
-        for candidate in pending[1:]:
-            rep_mono = monomer_map.get(rep.monomer_id)
-            cand_mono = monomer_map.get(candidate.monomer_id)
-            ck = alignment_cache_key(
-                seq_query=rep_mono.sequence if rep_mono else "",
-                seq_target=cand_mono.sequence if cand_mono else "",
-                source_query=rep.source_path,
-                source_target=candidate.source_path,
-            )
-
-            qp = rep.extracted_pdb_path or ""
-            tp = candidate.extracted_pdb_path or ""
-            qsz = _Path(qp).stat().st_size if qp and _Path(qp).exists() else rep.residue_count * 100
-            tsz = _Path(tp).stat().st_size if tp and _Path(tp).exists() else candidate.residue_count * 100
-
-            local_tasks.append({
-                "cache_key": ck,
-                "query_monomer_id": rep.monomer_id,
-                "target_monomer_id": candidate.monomer_id,
-                "query_pdb_path": qp, "target_pdb_path": tp,
-                "query_residue_count": rep.residue_count,
-                "target_residue_count": candidate.residue_count,
-                "query_pdb_size": qsz, "target_pdb_size": tsz,
-                "sequence_cluster_id": seq_cluster_id,
-                "subcluster_rep_id": subcluster_rep.get(rep.monomer_id, rep.monomer_id),
-                "seq_group_idx": 0, "round_num": round_num,
-            })
-        pending = pending[1:]
+                                                  prev[10], prev[11], rep.coordinate_fingerprint,
+                                                  prev[13], prev[14])
 
     return {
         "cluster_id": seq_cluster_id,
-        "tasks": local_tasks,
         "subcluster": subcluster_rep,
         "prefiltered": 0,
         "extracted_info": _extract_info,
     }
 
 
-def _run_three_phase_clustering(
+def _process_structure_group_batch_worker(
+    payloads: list[tuple[Any, ...]],
+) -> list[dict[str, Any]]:
+    return [_process_one_group_worker(payload) for payload in payloads]
+
+
+def _batch_structure_group_items(
+    group_items: list[tuple[str, list[str]]],
+    worker_count: int,
+    *,
+    max_groups_per_batch: int = 64,
+) -> list[list[tuple[str, list[str]]]]:
+    """Bound ProcessPool task count without creating long-running coarse batches."""
+
+    if not group_items:
+        return []
+    target_batches = max(1, min(len(group_items), worker_count * 8))
+    total_members = sum(len(member_ids) for _, member_ids in group_items)
+    target_members = max(1, math.ceil(total_members / target_batches))
+    batches: list[list[tuple[str, list[str]]]] = []
+    current: list[tuple[str, list[str]]] = []
+    current_members = 0
+    for item in group_items:
+        member_count = len(item[1])
+        if current and (
+            current_members + member_count > target_members
+            or len(current) >= max_groups_per_batch
+        ):
+            batches.append(current)
+            current = []
+            current_members = 0
+        current.append(item)
+        current_members += member_count
+        if member_count >= target_members:
+            batches.append(current)
+            current = []
+            current_members = 0
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _run_three_phase_clustering_legacy(
     *,
     monomer_index: dict[str, Any],
     sequence_groups: dict[str, list[str]],
@@ -1527,6 +1653,8 @@ def _run_three_phase_clustering(
     usalign_executable: str,
     sequence_cluster_jobs: int,
     pairwise_alignment_jobs: int,
+    model: int,
+    drop_hydrogens: bool,
     extract_fn: Any | None,
     protein_subcluster_by_sequence: bool,
     prep_dir: str | Path | None = None,
@@ -1976,4 +2104,631 @@ def _run_three_phase_clustering(
         "warning_rows": warning_rows,
         "sequence_groups": _group_member_map if '_group_member_map' in dir() else sequence_groups,
         "monomer_index": _monomer_index_light if '_monomer_index_light' in dir() else monomer_index,
+    }
+
+
+def _structure_alignment_cache_key(
+    query: ExtractedMonomerStructure,
+    target: ExtractedMonomerStructure,
+    monomer_index: dict[str, MonomerSample],
+) -> str:
+    from cif_parse.clustering.usalign_cache import alignment_cache_key
+
+    query_monomer = monomer_index.get(query.monomer_id)
+    target_monomer = monomer_index.get(target.monomer_id)
+    return alignment_cache_key(
+        seq_query=query_monomer.sequence if query_monomer is not None else "",
+        seq_target=target_monomer.sequence if target_monomer is not None else "",
+        source_query=query.source_path,
+        source_target=target.source_path,
+        query_monomer_id=query.monomer_id,
+        target_monomer_id=target.monomer_id,
+        query_coordinate_fingerprint=query.coordinate_fingerprint,
+        target_coordinate_fingerprint=target.coordinate_fingerprint,
+        model=query.model,
+        keep_h=query.keep_hydrogens,
+        usalign_mode="monomer",
+    )
+
+
+def _run_three_phase_clustering(
+    *,
+    monomer_index: dict[str, Any],
+    sequence_groups: dict[str, list[str]],
+    extracted_structures: dict[str, ExtractedMonomerStructure],
+    outdir: Path,
+    runner: Any,
+    tm_score_threshold: float,
+    min_alignment_coverage_ratio: float,
+    usalign_executable: str,
+    sequence_cluster_jobs: int,
+    pairwise_alignment_jobs: int,
+    model: int,
+    drop_hydrogens: bool,
+    extract_fn: Any | None,
+    protein_subcluster_by_sequence: bool,
+    prep_dir: str | Path | None = None,
+    cif_idx: Any = None,
+) -> dict[str, Any]:
+    """Extract structures and run bounded asynchronous greedy refinement."""
+
+    from collections import deque
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+
+    from cif_parse.clustering.usalign_cache import AlignmentCacheDB
+
+    del extract_fn, cif_idx
+    outdir.mkdir(parents=True, exist_ok=True)
+    cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
+    pdb_dir = outdir / "pdbs"
+    pdb_dir.mkdir(parents=True, exist_ok=True)
+
+    group_member_map = {
+        sequence_cluster_id: list(member_ids)
+        for sequence_cluster_id, member_ids in sequence_groups.items()
+    }
+    member_id_set = {
+        monomer_id
+        for member_ids in group_member_map.values()
+        for monomer_id in member_ids
+    }
+    monomer_index_light: dict[str, MonomerSample] = {
+        monomer_id: monomer
+        for monomer_id, monomer in monomer_index.items()
+        if monomer_id in member_id_set
+    }
+    all_subcluster: dict[str, dict[str, str]] = {}
+
+    to_extract = set(monomer_index_light)
+    LOGGER.info(
+        "[checkpoint] Phase 1 start: %d sequence groups, %d monomers",
+        len(group_member_map),
+        len(to_extract),
+    )
+
+    if prep_dir is not None:
+        serialized_monomers = {
+            monomer_id: asdict(monomer)
+            for monomer_id, monomer in tqdm(
+                monomer_index_light.items(),
+                desc="Serialize monomers",
+                unit="monomer",
+            )
+        }
+        group_items = sorted(
+            group_member_map.items(),
+            key=lambda item: (-len(item[1]), item[0]),
+        )
+
+        def _payload(item: tuple[str, list[str]]) -> tuple[Any, ...]:
+            sequence_cluster_id, member_ids = item
+            return (
+                sequence_cluster_id,
+                member_ids,
+                [serialized_monomers[mid] for mid in member_ids if mid in serialized_monomers],
+                str(pdb_dir),
+                protein_subcluster_by_sequence,
+            )
+
+        def _consume_group_result(result: dict[str, Any]) -> None:
+            all_subcluster[result["cluster_id"]] = result["subcluster"]
+            for monomer_id, info in result.get("extracted_info", {}).items():
+                extracted_structures[monomer_id] = _reconstruct_structure(
+                    monomer_id,
+                    info,
+                    monomer_index_light,
+                )
+
+        worker_count = min(max(1, int(sequence_cluster_jobs)), max(1, len(group_items)))
+        cache_db.close()
+        if worker_count == 1:
+            _init_structure_group_worker(
+                str(prep_dir),
+                drop_hydrogens,
+                model,
+            )
+            for item in tqdm(group_items, desc="Phase 1 (extract+subcluster)", unit="group"):
+                _consume_group_result(_process_one_group_worker(_payload(item)))
+        else:
+            item_batches = _batch_structure_group_items(group_items, worker_count)
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=_init_structure_group_worker,
+                initargs=(str(prep_dir), drop_hydrogens, model),
+            ) as executor:
+                batch_iter = iter(item_batches)
+                futures: dict[Any, list[tuple[str, list[str]]]] = {}
+                max_pending = worker_count * 2
+                for _ in range(max_pending):
+                    try:
+                        batch = next(batch_iter)
+                    except StopIteration:
+                        break
+                    payload_batch = [_payload(item) for item in batch]
+                    futures[
+                        executor.submit(
+                            _process_structure_group_batch_worker,
+                            payload_batch,
+                        )
+                    ] = batch
+                progress = tqdm(
+                    total=len(group_items),
+                    desc="Phase 1 (extract+subcluster)",
+                    unit="group",
+                )
+                try:
+                    while futures:
+                        done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            completed_batch = futures.pop(future)
+                            for result in future.result():
+                                _consume_group_result(result)
+                            progress.update(len(completed_batch))
+                            try:
+                                batch = next(batch_iter)
+                            except StopIteration:
+                                continue
+                            payload_batch = [_payload(item) for item in batch]
+                            futures[
+                                executor.submit(
+                                    _process_structure_group_batch_worker,
+                                    payload_batch,
+                                )
+                            ] = batch
+                finally:
+                    progress.close()
+        cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
+    else:
+        for sequence_cluster_id, member_ids in group_member_map.items():
+            available = [
+                extracted_structures[mid]
+                for mid in member_ids
+                if mid in extracted_structures
+            ]
+            grouped: dict[str, list[ExtractedMonomerStructure]] = {}
+            for structure in available:
+                monomer = monomer_index_light.get(structure.monomer_id)
+                key = (
+                    monomer.sequence
+                    if protein_subcluster_by_sequence and monomer is not None
+                    else structure.monomer_id
+                )
+                grouped.setdefault(key, []).append(structure)
+            subcluster: dict[str, str] = {}
+            for members in grouped.values():
+                representative = min(members, key=lambda item: item.quality_sort_key())
+                for member in members:
+                    subcluster[member.monomer_id] = representative.monomer_id
+            all_subcluster[sequence_cluster_id] = subcluster
+
+    extracted_count = sum(
+        1 for monomer_id in to_extract if monomer_id in extracted_structures
+    )
+    extraction_failures = len(to_extract) - extracted_count
+    LOGGER.info(
+        "[checkpoint] Phase 1 complete: %d/%d monomers extracted (%d skipped)",
+        extracted_count,
+        len(to_extract),
+        extraction_failures,
+    )
+
+    states: dict[str, dict[str, Any]] = {}
+    warning_rows: list[dict[str, Any]] = []
+    for sequence_cluster_id, member_ids in group_member_map.items():
+        subcluster = all_subcluster.get(sequence_cluster_id, {})
+        representative_ids = set(subcluster.values())
+        candidates = sorted(
+            (
+                extracted_structures[monomer_id]
+                for monomer_id in representative_ids
+                if monomer_id in extracted_structures
+                and extracted_structures[monomer_id].extracted_pdb_path
+            ),
+            key=lambda item: item.quality_sort_key(),
+        )
+        usable_representative_ids = {item.monomer_id for item in candidates}
+        skipped_ids = sorted(
+            monomer_id
+            for monomer_id in member_ids
+            if monomer_id not in subcluster
+            or subcluster[monomer_id] not in usable_representative_ids
+        )
+        for monomer_id in skipped_ids:
+            warning_rows.append(
+                {
+                    "warning_code": "protein_structure_unavailable_skipped",
+                    "sequence_cluster_id": sequence_cluster_id,
+                    "monomer_id": monomer_id,
+                }
+            )
+        states[sequence_cluster_id] = {
+            "sequence_cluster_id": sequence_cluster_id,
+            "member_ids": member_ids,
+            "subcluster": subcluster,
+            "pending": candidates,
+            "clusters": [],
+            "round_num": 0,
+        }
+
+    total_alignment_runs = 0
+    total_alignment_failures = 0
+    total_cache_hits = 0
+    total_tasks_generated = 0
+    alignment_rows: list[dict[str, Any]] = []
+    ready_states: deque[str] = deque()
+    active_state_count = 0
+
+    def _start_round(state: dict[str, Any]) -> None:
+        nonlocal active_state_count
+        while state["pending"]:
+            representative = state["pending"][0]
+            candidates = state["pending"][1:]
+            if not candidates:
+                state["clusters"].append(
+                    {"representative": representative, "assigned": [(representative, None)]}
+                )
+                state["pending"] = []
+                return
+            state["round_num"] += 1
+            state["round_representative"] = representative
+            state["round_candidates"] = candidates
+            state["round_cursor"] = 0
+            state["round_done"] = 0
+            state["round_results"] = {}
+            state["round_failures"] = {}
+            ready_states.append(state["sequence_cluster_id"])
+            active_state_count += 1
+            return
+
+    def _finish_round(state: dict[str, Any]) -> None:
+        nonlocal active_state_count
+        representative = state["round_representative"]
+        assigned: list[tuple[ExtractedMonomerStructure, dict[str, Any] | None]] = [
+            (representative, None)
+        ]
+        remaining: list[ExtractedMonomerStructure] = []
+        for candidate in state["round_candidates"]:
+            result = state["round_results"].get(candidate.monomer_id)
+            error = state["round_failures"].get(candidate.monomer_id)
+            if error is not None:
+                remaining.append(candidate)
+                warning_rows.append(
+                    {
+                        "warning_code": "protein_usalign_failed",
+                        "sequence_cluster_id": state["sequence_cluster_id"],
+                        "representative_monomer_id": representative.monomer_id,
+                        "candidate_monomer_id": candidate.monomer_id,
+                        "error": error,
+                    }
+                )
+                continue
+            if (
+                result is not None
+                and float(result.get("tm_score_max", 0.0) or 0.0) >= tm_score_threshold
+                and float(result.get("resolved_length_coverage", 0.0) or 0.0)
+                >= min_alignment_coverage_ratio
+            ):
+                assigned.append((candidate, result))
+            else:
+                remaining.append(candidate)
+        state["clusters"].append(
+            {"representative": representative, "assigned": assigned}
+        )
+        state["pending"] = remaining
+        active_state_count -= 1
+        _start_round(state)
+
+    for state in states.values():
+        _start_round(state)
+
+    pairwise_alignment_jobs = max(1, int(pairwise_alignment_jobs))
+    future_to_item: dict[Any, dict[str, Any]] = {}
+    max_pending = pairwise_alignment_jobs * 4
+    progress = tqdm(desc="Phase 2 (USalign)", unit="alignment")
+    with ThreadPoolExecutor(max_workers=pairwise_alignment_jobs) as executor:
+        while ready_states or future_to_item or active_state_count:
+            capacity = max_pending - len(future_to_item)
+            scheduled_items: list[dict[str, Any]] = []
+            while ready_states and len(scheduled_items) < capacity:
+                sequence_cluster_id = ready_states.popleft()
+                state = states[sequence_cluster_id]
+                cursor = state["round_cursor"]
+                candidates = state["round_candidates"]
+                if cursor >= len(candidates):
+                    continue
+                candidate = candidates[cursor]
+                state["round_cursor"] = cursor + 1
+                if state["round_cursor"] < len(candidates):
+                    ready_states.append(sequence_cluster_id)
+                representative = state["round_representative"]
+                cache_key = _structure_alignment_cache_key(
+                    representative,
+                    candidate,
+                    monomer_index_light,
+                )
+                scheduled_items.append(
+                    {
+                        "cache_key": cache_key,
+                        "state": state,
+                        "representative": representative,
+                        "candidate": candidate,
+                    }
+                )
+
+            if scheduled_items:
+                cache_records = cache_db.cache_get_records(
+                    [item["cache_key"] for item in scheduled_items]
+                )
+                new_task_rows: list[dict[str, Any]] = []
+                new_cache_keys: list[str] = []
+                for item in scheduled_items:
+                    state = item["state"]
+                    candidate = item["candidate"]
+                    cached = cache_records.get(item["cache_key"])
+                    if cached is not None and (
+                        cached.get("tm_score_max") is not None
+                        or cached.get("error_message")
+                    ):
+                        total_cache_hits += 1
+                        if cached.get("error_message"):
+                            state["round_failures"][candidate.monomer_id] = str(
+                                cached["error_message"]
+                            )
+                        else:
+                            state["round_results"][candidate.monomer_id] = cached
+                        state["round_done"] += 1
+                        progress.update(1)
+                        if state["round_done"] == len(state["round_candidates"]):
+                            _finish_round(state)
+                        continue
+
+                    representative = item["representative"]
+                    query_path = Path(representative.extracted_pdb_path)
+                    target_path = Path(candidate.extracted_pdb_path)
+                    query_size = (
+                        query_path.stat().st_size
+                        if query_path.exists()
+                        else representative.residue_count * 100
+                    )
+                    target_size = (
+                        target_path.stat().st_size
+                        if target_path.exists()
+                        else candidate.residue_count * 100
+                    )
+                    new_task_rows.append(
+                        {
+                            "cache_key": item["cache_key"],
+                            "query_monomer_id": representative.monomer_id,
+                            "target_monomer_id": candidate.monomer_id,
+                            "query_pdb_path": representative.extracted_pdb_path,
+                            "target_pdb_path": candidate.extracted_pdb_path,
+                            "query_residue_count": representative.residue_count,
+                            "target_residue_count": candidate.residue_count,
+                            "query_pdb_size": query_size,
+                            "target_pdb_size": target_size,
+                            "sequence_cluster_id": state["sequence_cluster_id"],
+                            "subcluster_rep_id": representative.monomer_id,
+                            "round_num": state["round_num"],
+                        }
+                    )
+                    new_cache_keys.append(item["cache_key"])
+                    future = executor.submit(
+                        runner,
+                        representative,
+                        candidate,
+                        usalign_executable=usalign_executable,
+                        tm_score_threshold=tm_score_threshold,
+                        min_alignment_coverage_ratio=min_alignment_coverage_ratio,
+                    )
+                    future_to_item[future] = item
+                if new_task_rows:
+                    cache_db.task_insert_many(new_task_rows)
+                    cache_db.cache_upsert_pending_many(new_cache_keys)
+                    total_tasks_generated += len(new_task_rows)
+
+            if future_to_item and (
+                len(future_to_item) >= max_pending or not ready_states
+            ):
+                done, _ = wait(future_to_item, return_when=FIRST_COMPLETED)
+                result_rows: list[tuple[str, dict[str, Any]]] = []
+                error_rows: list[tuple[str, str]] = []
+                completed_keys: list[str] = []
+                failed_keys: list[str] = []
+                for future in done:
+                    item = future_to_item.pop(future)
+                    state = item["state"]
+                    candidate = item["candidate"]
+                    cache_key = item["cache_key"]
+                    try:
+                        result = future.result()
+                        result_record = {
+                            "tm_score_query": result.tm_score_query,
+                            "tm_score_target": result.tm_score_target,
+                            "tm_score_min": result.min_tm_score,
+                            "tm_score_max": result.max_tm_score,
+                            "rmsd": result.rmsd,
+                            "aligned_length": result.aligned_length,
+                            "shorter_length_coverage": result.shorter_length_coverage,
+                            "resolved_length_coverage": result.resolved_length_coverage,
+                        }
+                        state["round_results"][candidate.monomer_id] = result_record
+                        result_rows.append((cache_key, result_record))
+                        total_alignment_runs += 1
+                        completed_keys.append(cache_key)
+                    except Exception as exc:
+                        error_text = str(exc)
+                        state["round_failures"][candidate.monomer_id] = error_text
+                        error_rows.append((cache_key, error_text))
+                        total_alignment_failures += 1
+                        failed_keys.append(cache_key)
+                    state["round_done"] += 1
+                    progress.update(1)
+                    if state["round_done"] == len(state["round_candidates"]):
+                        _finish_round(state)
+                cache_db.cache_write_results_many(result_rows)
+                cache_db.cache_write_errors_many(error_rows)
+                cache_db.task_status_batch_update_by_keys(completed_keys, "completed")
+                cache_db.task_status_batch_update_by_keys(failed_keys, "failed")
+            elif not future_to_item and not scheduled_items and active_state_count:
+                raise RuntimeError("Structure refinement scheduler stalled with active groups")
+    progress.close()
+
+    membership_rows: list[dict[str, Any]] = []
+    representative_rows: list[dict[str, Any]] = []
+    total_structure_clusters = 0
+    for sequence_cluster_id, state in states.items():
+        subcluster = state["subcluster"]
+        for local_index, cluster in enumerate(state["clusters"], start=1):
+            representative = cluster["representative"]
+            structure_cluster_id = _protein_structure_cluster_id(
+                sequence_cluster_id,
+                local_index,
+            )
+            total_structure_clusters += 1
+            assigned_rep_ids = {
+                member.monomer_id for member, _ in cluster["assigned"]
+            }
+            cluster_member_ids = sorted(
+                monomer_id
+                for monomer_id, representative_id in subcluster.items()
+                if representative_id in assigned_rep_ids
+            )
+            result_by_rep = {
+                member.monomer_id: result
+                for member, result in cluster["assigned"]
+            }
+            for member, result in cluster["assigned"]:
+                if result is None:
+                    continue
+                alignment_rows.append(
+                    {
+                        "sequence_cluster_id": sequence_cluster_id,
+                        "query_monomer_id": representative.monomer_id,
+                        "target_monomer_id": member.monomer_id,
+                        "aligned_length": result.get("aligned_length", 0),
+                        "rmsd": result.get("rmsd", 0),
+                        "tm_score_query": result.get("tm_score_query", 0),
+                        "tm_score_target": result.get("tm_score_target", 0),
+                        "tm_score_min": result.get("tm_score_min", 0),
+                        "tm_score_max": result.get("tm_score_max", 0),
+                        "tm_score_for_clustering": result.get("tm_score_max", 0),
+                        "alignment_coverage_shorter": result.get(
+                            "shorter_length_coverage",
+                            0,
+                        ),
+                        "alignment_coverage_resolved": result.get(
+                            "resolved_length_coverage",
+                            0,
+                        ),
+                    }
+                )
+            for monomer_id in cluster_member_ids:
+                representative_id = subcluster[monomer_id]
+                result = result_by_rep.get(representative_id)
+                if monomer_id == representative.monomer_id:
+                    reason = "representative"
+                elif monomer_id != representative_id:
+                    reason = "identical_sequence_subcluster"
+                else:
+                    reason = "representative_alignment"
+                membership_rows.append(
+                    {
+                        "polymer_class": "protein",
+                        "sequence_cluster_id": sequence_cluster_id,
+                        "structure_cluster_id": structure_cluster_id,
+                        "representative_monomer_id": representative.monomer_id,
+                        "member_monomer_id": monomer_id,
+                        "assignment_reason": reason,
+                        "tm_score_min": (
+                            result.get("tm_score_min", "") if result is not None else ""
+                        ),
+                        "tm_score_max": (
+                            result.get("tm_score_max", "") if result is not None else ""
+                        ),
+                        "tm_score_for_clustering": (
+                            result.get("tm_score_max", "") if result is not None else ""
+                        ),
+                        "alignment_coverage_shorter": (
+                            result.get("shorter_length_coverage", "")
+                            if result is not None
+                            else ""
+                        ),
+                        "alignment_coverage_resolved": (
+                            result.get("resolved_length_coverage", "")
+                            if result is not None
+                            else ""
+                        ),
+                    }
+                )
+            representative_rows.append(
+                {
+                    "sequence_cluster_id": sequence_cluster_id,
+                    "structure_cluster_id": structure_cluster_id,
+                    "representative_monomer_id": representative.monomer_id,
+                    "num_members": len(cluster_member_ids),
+                    "pdb_id": representative.pdb_id,
+                    "label_asym_id": representative.label_asym_id,
+                    "auth_asym_id": representative.auth_asym_id or "",
+                    "resolved_fraction": representative.resolved_fraction,
+                    "primary_method": (
+                        representative.quality.primary_method
+                        if representative.quality is not None
+                        else ""
+                    ),
+                    "resolution": (
+                        representative.quality.resolution
+                        if representative.quality is not None
+                        else ""
+                    ),
+                }
+            )
+
+    membership_rows.sort(
+        key=lambda row: (
+            row["sequence_cluster_id"],
+            row["structure_cluster_id"],
+            row["member_monomer_id"],
+        )
+    )
+    representative_rows.sort(
+        key=lambda row: (
+            row["sequence_cluster_id"],
+            row["structure_cluster_id"],
+        )
+    )
+    cache_db.close()
+
+    manifest = {
+        "num_sequence_clusters": len(group_member_map),
+        "num_sequence_groups": len(group_member_map),
+        "num_structure_clusters": total_structure_clusters,
+        "num_alignment_runs": total_alignment_runs,
+        "num_alignment_failures": total_alignment_failures,
+        "num_sequence_fallback_assignments": 0,
+        "num_all_failure_sequence_cluster_collapses": 0,
+        "num_membership_rows": len(membership_rows),
+        "num_extracted": extracted_count,
+        "num_extraction_failures": extraction_failures,
+        "num_structure_members_skipped_missing_coordinates": extraction_failures,
+        "num_tasks_generated": total_tasks_generated,
+        "num_cache_hits": total_cache_hits,
+        "tm_score_threshold": tm_score_threshold,
+        "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
+        "sequence_cluster_jobs": int(sequence_cluster_jobs),
+        "pairwise_alignment_jobs": pairwise_alignment_jobs,
+    }
+
+    dump_csv_rows(outdir / "protein_structure_cluster_membership.csv", membership_rows)
+    dump_csv_rows(outdir / "protein_structure_cluster_representatives.csv", representative_rows)
+    dump_jsonl(outdir / "protein_structure_pairwise_alignments.jsonl", alignment_rows)
+    dump_jsonl(outdir / "protein_structure_cluster_warnings.jsonl", warning_rows)
+    dump_json(outdir / "protein_structure_cluster_manifest.json", manifest, indent=2)
+    return {
+        "manifest": manifest,
+        "membership_rows": membership_rows,
+        "representative_rows": representative_rows,
+        "alignment_rows": alignment_rows,
+        "warning_rows": warning_rows,
+        "sequence_groups": group_member_map,
+        "monomer_index": monomer_index_light,
     }

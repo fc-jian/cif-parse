@@ -1241,29 +1241,55 @@ def load_chain_from_prep(
 # on the same chunk file never interfere.
 _blob_fd_cache: dict[Path, int] = {}
 _blob_fd_cache_lock = threading.Lock()
-_chain_atom_cache: OrderedDict[tuple[str, str | None, str], Any] = OrderedDict()
+_chain_atom_cache: OrderedDict[tuple[str, str | None, str], tuple[Any, int]] = OrderedDict()
 _chain_atom_cache_lock = threading.Lock()
-_chain_atom_cache_max_items = 200_000
+_chain_atom_cache_max_bytes = 128 * 1024 * 1024
+_chain_atom_cache_bytes = 0
 
 
-def set_chain_atom_cache_limit(max_items: int | None) -> None:
-    """Set the in-process chain AtomArray cache size used by prep readers."""
+def _atom_array_nbytes(atom_array: Any) -> int:
+    """Estimate the resident bytes retained by one AtomArray."""
 
-    global _chain_atom_cache_max_items
-    _chain_atom_cache_max_items = max(0, int(max_items or 0))
-    if _chain_atom_cache_max_items == 0:
+    seen: set[int] = set()
+    total = 0
+    values: list[Any] = [getattr(atom_array, "coord", None), getattr(atom_array, "box", None)]
+    try:
+        values.extend(
+            atom_array.get_annotation(category)
+            for category in atom_array.get_annotation_categories()
+        )
+    except (AttributeError, KeyError, TypeError):
+        pass
+    for value in values:
+        nbytes = getattr(value, "nbytes", None)
+        if nbytes is None or id(value) in seen:
+            continue
+        seen.add(id(value))
+        total += int(nbytes)
+    return max(total, int(getattr(getattr(atom_array, "coord", None), "nbytes", 0) or 0))
+
+
+def set_chain_atom_cache_limit(max_bytes: int | None) -> None:
+    """Set the in-process chain AtomArray cache byte budget."""
+
+    global _chain_atom_cache_max_bytes, _chain_atom_cache_bytes
+    _chain_atom_cache_max_bytes = max(0, int(max_bytes or 0))
+    if _chain_atom_cache_max_bytes == 0:
         clear_chain_atom_cache()
         return
     with _chain_atom_cache_lock:
-        while len(_chain_atom_cache) > _chain_atom_cache_max_items:
-            _chain_atom_cache.popitem(last=False)
+        while _chain_atom_cache and _chain_atom_cache_bytes > _chain_atom_cache_max_bytes:
+            _, (_, evicted_bytes) = _chain_atom_cache.popitem(last=False)
+            _chain_atom_cache_bytes -= evicted_bytes
 
 
 def clear_chain_atom_cache() -> None:
     """Clear cached single-chain AtomArrays loaded from prep chunks."""
 
+    global _chain_atom_cache_bytes
     with _chain_atom_cache_lock:
         _chain_atom_cache.clear()
+        _chain_atom_cache_bytes = 0
 
 
 def _read_blob(entry: tuple[Path, int, int]) -> dict[str, Any] | None:
@@ -1314,21 +1340,33 @@ def load_chain_atoms(
     """
     cache_key = (str(source_path), assembly_id, str(label_asym_id))
     with _chain_atom_cache_lock:
-        cached_atoms = _chain_atom_cache.get(cache_key)
-        if cached_atoms is not None:
+        cached = _chain_atom_cache.get(cache_key)
+        if cached is not None:
             _chain_atom_cache.move_to_end(cache_key)
-            return cached_atoms
-    cached = load_chain_from_prep(prep_dir, source_path, label_asym_id,
-                                  assembly_id=assembly_id, index=index)
-    if cached is None:
+            return cached[0]
+    loaded = load_chain_from_prep(
+        prep_dir,
+        source_path,
+        label_asym_id,
+        assembly_id=assembly_id,
+        index=index,
+    )
+    if loaded is None:
         return None
-    atoms = cached.get("atom_array")
-    if atoms is not None and _chain_atom_cache_max_items > 0:
+    atoms = loaded.get("atom_array")
+    if atoms is not None and _chain_atom_cache_max_bytes > 0:
+        global _chain_atom_cache_bytes
+        atom_bytes = _atom_array_nbytes(atoms)
         with _chain_atom_cache_lock:
-            _chain_atom_cache[cache_key] = atoms
+            existing = _chain_atom_cache.pop(cache_key, None)
+            if existing is not None:
+                _chain_atom_cache_bytes -= existing[1]
+            _chain_atom_cache[cache_key] = (atoms, atom_bytes)
+            _chain_atom_cache_bytes += atom_bytes
             _chain_atom_cache.move_to_end(cache_key)
-            while len(_chain_atom_cache) > _chain_atom_cache_max_items:
-                _chain_atom_cache.popitem(last=False)
+            while _chain_atom_cache and _chain_atom_cache_bytes > _chain_atom_cache_max_bytes:
+                _, (_, evicted_bytes) = _chain_atom_cache.popitem(last=False)
+                _chain_atom_cache_bytes -= evicted_bytes
     return atoms
 
 
