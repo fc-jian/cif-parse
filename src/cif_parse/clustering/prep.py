@@ -116,38 +116,29 @@ def _chain_blob_key(source_path: str, assembly_id: str | None, chain_id: str) ->
 
 
 def _normalize_sequence(value: Any) -> str:
-    return "".join(str(value or "").split()).upper()
+    from cif_parse.clustering.polymer import normalize_sequence
+
+    return normalize_sequence(value)
 
 
 def _is_polymer_chain(chain_payload: dict[str, Any]) -> bool:
-    from cif_parse.constants import POLYMER_CHAIN_TYPES
-    return str(chain_payload.get("chain_type", "")) in POLYMER_CHAIN_TYPES
+    from cif_parse.clustering.polymer import is_polymer_chain
+
+    return is_polymer_chain(chain_payload)
 
 
 def _classify_polymer_class(chain_payload: dict[str, Any]) -> str | None:
-    from cif_parse.constants import PROTEIN_CHAIN_TYPES
-    chain_type = str(chain_payload.get("chain_type", ""))
-    polymer_type = str(chain_payload.get("polymer_type", "") or "").lower()
-    if chain_type in PROTEIN_CHAIN_TYPES:
-        return "protein"
-    if chain_type == "DNA chain":
-        return "dna"
-    if chain_type == "RNA chain":
-        return "rna"
-    if chain_type == "other nucleic acid chain":
-        if "deoxyribo" in polymer_type:
-            return "dna"
-        if "ribo" in polymer_type:
-            return "rna"
-        return "other_nucleic_acid"
-    if chain_type == "other polymer chain":
-        if "deoxyribo" in polymer_type:
-            return "dna"
-        if "ribo" in polymer_type:
-            return "rna"
-        if "peptide" in polymer_type:
-            return "protein"
-    return None
+    from cif_parse.clustering.polymer import classify_polymer_class
+
+    return classify_polymer_class(chain_payload)
+
+
+def _has_sequence_identity(polymer_class: str, sequence: str, chain_payload: dict[str, Any]) -> bool:
+    from cif_parse.clustering.polymer import OTHER_POLYMER_CLASS, has_component_sequence_details
+
+    if sequence:
+        return True
+    return polymer_class == OTHER_POLYMER_CLASS and has_component_sequence_details(chain_payload)
 
 
 _METHOD_PRIORITY = {
@@ -250,7 +241,7 @@ def _extract_bundle_rows(bundle: dict[str, Any], case_id: str) -> dict[str, list
             if polymer_class is None:
                 continue
             seq = _normalize_sequence(chain.get("sequence"))
-            if not seq:
+            if not _has_sequence_identity(polymer_class, seq, chain):
                 continue
             lbl = str(chain.get("label_asym_id", "") or "")
             pid = str(chain.get("pdb_id", "") or pdb_id)

@@ -9,13 +9,20 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from tqdm import tqdm
 
-from cif_parse.constants import POLYMER_CHAIN_TYPES, PROTEIN_CHAIN_TYPES
 from cif_parse.clustering.common import discover_case_output_dirs
 from cif_parse.clustering.prep import iter_parquet_rows, open_prep_parquet
+from cif_parse.clustering.polymer import (
+    OTHER_POLYMER_CLASS,
+    classify_polymer_class,
+    component_sequence_key,
+    has_component_sequence_details,
+    is_polymer_chain,
+    normalize_sequence,
+)
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import normalize_cutoff_date, resolve_source_path
 
@@ -41,8 +48,38 @@ def _format_cluster_id(prefix: str, index: int) -> str:
     return f"{prefix}_{index}"
 
 
+def _cluster_index(cluster_id: str, prefix: str) -> int | None:
+    expected = f"{prefix}_"
+    if not cluster_id.startswith(expected):
+        return None
+    try:
+        return int(cluster_id.removeprefix(expected))
+    except ValueError:
+        return None
+
+
+def _next_cluster_index(rows: Iterable[dict[str, Any]], prefix: str) -> int:
+    max_index = 0
+    for row in rows:
+        parsed = _cluster_index(str(row.get("cluster_id", "") or ""), prefix)
+        if parsed is not None:
+            max_index = max(max_index, parsed)
+    return max_index + 1
+
+
 def _normalize_sequence(value: Any) -> str:
-    return "".join(str(value or "").split()).upper()
+    return normalize_sequence(value)
+
+
+def _has_sequence_identity(
+    *,
+    polymer_class: str,
+    sequence: str,
+    payload: Any,
+) -> bool:
+    if sequence:
+        return True
+    return polymer_class == OTHER_POLYMER_CLASS and has_component_sequence_details(payload)
 
 
 def _parse_release_date(value: Any) -> date | None:
@@ -111,32 +148,11 @@ def _release_filter_allows_source(
 
 
 def _is_polymer_chain(chain_payload: dict[str, Any]) -> bool:
-    return str(chain_payload.get("chain_type", "")) in POLYMER_CHAIN_TYPES
+    return is_polymer_chain(chain_payload)
 
 
 def _classify_polymer_class(chain_payload: dict[str, Any]) -> str | None:
-    chain_type = str(chain_payload.get("chain_type", ""))
-    polymer_type = str(chain_payload.get("polymer_type", "") or "").lower()
-    if chain_type in PROTEIN_CHAIN_TYPES:
-        return "protein"
-    if chain_type == "DNA chain":
-        return "dna"
-    if chain_type == "RNA chain":
-        return "rna"
-    if chain_type == "other nucleic acid chain":
-        if "deoxyribo" in polymer_type:
-            return "dna"
-        if "ribo" in polymer_type:
-            return "rna"
-        return "other_nucleic_acid"
-    if chain_type == "other polymer chain":
-        if "deoxyribo" in polymer_type:
-            return "dna"
-        if "ribo" in polymer_type:
-            return "rna"
-        if "peptide" in polymer_type:
-            return "protein"
-    return None
+    return classify_polymer_class(chain_payload)
 
 
 def _monomer_sample_from_prep_row(
@@ -420,7 +436,11 @@ def collect_canonical_monomers(
                         skipped_unsupported_polymer_class += 1
                         continue
                     sequence = _normalize_sequence(chain_payload.get("sequence"))
-                    if not sequence:
+                    if not _has_sequence_identity(
+                        polymer_class=polymer_class,
+                        sequence=sequence,
+                        payload=chain_payload,
+                    ):
                         skipped_missing_sequence += 1
                         continue
                     pdb_id = str(chain_payload.get("pdb_id", "") or bundle_pdb_id)
@@ -512,6 +532,12 @@ def write_monomer_fastas(monomers: Iterable[MonomerSample], outdir: str | Path) 
         unit="class",
         disable=len(grouped) < 2,
     ):
+        if polymer_class == OTHER_POLYMER_CLASS:
+            LOGGER.info(
+                "Skipping FASTA output for %s; component IDs are not a FASTA alphabet",
+                polymer_class,
+            )
+            continue
         fasta_path = fasta_dir / f"{polymer_class}.fasta"
         fasta_path.parent.mkdir(parents=True, exist_ok=True)
         with fasta_path.open("w", encoding="utf-8") as handle:
@@ -533,50 +559,76 @@ def write_monomer_fastas(monomers: Iterable[MonomerSample], outdir: str | Path) 
     return outputs
 
 
+def _membership_row(
+    *,
+    cluster_method: str,
+    polymer_class: str,
+    cluster_id: str,
+    representative: MonomerSample,
+    member: MonomerSample,
+    sequence_cluster_key: str = "",
+) -> dict[str, Any]:
+    row = {
+        "cluster_stage": "sequence",
+        "cluster_method": cluster_method,
+        "polymer_class": polymer_class,
+        "cluster_id": cluster_id,
+        "representative_monomer_id": representative.monomer_id,
+        "member_monomer_id": member.monomer_id,
+        "pdb_id": member.pdb_id,
+        "label_asym_id": member.label_asym_id,
+        "auth_asym_id": member.auth_asym_id or "",
+        "chain_type": member.chain_type,
+        "sequence_length": len(member.sequence),
+    }
+    if sequence_cluster_key:
+        row["sequence_cluster_key"] = sequence_cluster_key
+    return row
+
+
 def build_exact_sequence_membership(
     monomers: Iterable[MonomerSample],
     *,
     polymer_class: str,
     cluster_prefix: str,
     cluster_method: str = "exact_sequence",
+    key_fn: Callable[[MonomerSample], str] | None = None,
+    start_index: int = 1,
+    include_sequence_cluster_key: bool = False,
 ) -> list[dict[str, Any]]:
     """Group monomers by exact sequence equality."""
 
     grouped: dict[str, list[MonomerSample]] = defaultdict(list)
+    key_fn = key_fn or (lambda item: item.sequence)
     for monomer in tqdm(
         list(monomers),
         desc=f"Grouping {polymer_class} exact sequences",
         unit="monomer",
     ):
         if monomer.polymer_class == polymer_class:
-            grouped[monomer.sequence].append(monomer)
+            grouped[key_fn(monomer)].append(monomer)
 
     rows: list[dict[str, Any]] = []
     sequences = sorted(
         grouped.items(),
         key=lambda item: (-len(item[0]), item[0], [member.monomer_id for member in item[1]]),
     )
-    for index, (_, members) in enumerate(
+    for index, (sequence_key, members) in enumerate(
         tqdm(sequences, desc=f"Building {polymer_class} exact clusters", unit="cluster"),
-        start=1,
+        start=start_index,
     ):
         cluster_id = _format_cluster_id(cluster_prefix, index)
         representative = sorted(members, key=lambda item: item.monomer_id)[0]
         for member in sorted(members, key=lambda item: item.monomer_id):
             rows.append(
-                {
-                    "cluster_stage": "sequence",
-                    "cluster_method": cluster_method,
-                    "polymer_class": polymer_class,
-                    "cluster_id": cluster_id,
-                    "representative_monomer_id": representative.monomer_id,
-                    "member_monomer_id": member.monomer_id,
-                    "pdb_id": member.pdb_id,
-                    "label_asym_id": member.label_asym_id,
-                    "auth_asym_id": member.auth_asym_id or "",
-                    "chain_type": member.chain_type,
-                    "sequence_length": len(member.sequence),
-                }
+                _membership_row(
+                    cluster_method=cluster_method,
+                    polymer_class=polymer_class,
+                    cluster_id=cluster_id,
+                    representative=representative,
+                    member=member,
+                    sequence_cluster_key=sequence_key if include_sequence_cluster_key else "",
+                )
             )
     return rows
 
@@ -594,19 +646,13 @@ def build_singleton_protein_membership(monomers: Iterable[MonomerSample]) -> lis
         start=1,
     ):
         rows.append(
-            {
-                "cluster_stage": "sequence",
-                "cluster_method": "singleton",
-                "polymer_class": "protein",
-                "cluster_id": _format_cluster_id("prot", index),
-                "representative_monomer_id": member.monomer_id,
-                "member_monomer_id": member.monomer_id,
-                "pdb_id": member.pdb_id,
-                "label_asym_id": member.label_asym_id,
-                "auth_asym_id": member.auth_asym_id or "",
-                "chain_type": member.chain_type,
-                "sequence_length": len(member.sequence),
-            }
+            _membership_row(
+                cluster_method="singleton",
+                polymer_class="protein",
+                cluster_id=_format_cluster_id("prot", index),
+                representative=member,
+                member=member,
+            )
         )
     return rows
 
@@ -678,21 +724,50 @@ def parse_mmseqs_cluster_tsv(
         for member_id in sorted(grouped[representative_id]):
             member = monomer_index[member_id]
             rows.append(
-                {
-                    "cluster_stage": "sequence",
-                    "cluster_method": "mmseqs2",
-                    "polymer_class": "protein",
-                    "cluster_id": cluster_id,
-                    "representative_monomer_id": representative.monomer_id,
-                    "member_monomer_id": member.monomer_id,
-                    "pdb_id": member.pdb_id,
-                    "label_asym_id": member.label_asym_id,
-                    "auth_asym_id": member.auth_asym_id or "",
-                    "chain_type": member.chain_type,
-                    "sequence_length": len(member.sequence),
-                }
+                _membership_row(
+                    cluster_method="mmseqs2",
+                    polymer_class="protein",
+                    cluster_id=cluster_id,
+                    representative=representative,
+                    member=member,
+                )
             )
     return rows
+
+
+def build_missing_protein_mmseqs_fallback_membership(
+    monomers: Iterable[MonomerSample],
+    existing_membership_rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Assign protein monomers absent from mmseqs output to exact-sequence clusters."""
+
+    existing_rows = list(existing_membership_rows)
+    monomer_list = [monomer for monomer in monomers if monomer.polymer_class == "protein"]
+    assigned_ids = {
+        str(row.get("member_monomer_id", "") or "")
+        for row in existing_rows
+        if str(row.get("polymer_class", "") or "") == "protein"
+    }
+    missing = [
+        monomer
+        for monomer in monomer_list
+        if monomer.monomer_id not in assigned_ids
+    ]
+    if not missing:
+        return []
+    LOGGER.warning(
+        "mmseqs2 output omitted %d/%d protein monomers; assigning exact-sequence fallback clusters",
+        len(missing),
+        len(monomer_list),
+    )
+    return build_exact_sequence_membership(
+        missing,
+        polymer_class="protein",
+        cluster_prefix="prot",
+        cluster_method="exact_sequence_mmseqs_fallback",
+        start_index=_next_cluster_index(existing_rows, "prot"),
+        include_sequence_cluster_key=True,
+    )
 
 
 def build_monomer_sequence_dataset(
@@ -756,6 +831,9 @@ def build_monomer_sequence_dataset(
                 shutil.copyfile(cluster_tsv, copied_tsv)
                 monomer_index = {monomer.monomer_id: monomer for monomer in monomers}
                 membership_rows.extend(parse_mmseqs_cluster_tsv(copied_tsv, monomer_index))
+        membership_rows.extend(
+            build_missing_protein_mmseqs_fallback_membership(monomers, membership_rows)
+        )
     else:
         raise ValueError(f"Unsupported protein_sequence_mode: {protein_sequence_mode}")
 
@@ -772,8 +850,22 @@ def build_monomer_sequence_dataset(
             cluster_prefix="na",
         )
     )
+    membership_rows.extend(
+        build_exact_sequence_membership(
+            monomers,
+            polymer_class=OTHER_POLYMER_CLASS,
+            cluster_prefix="op",
+            cluster_method="exact_component_sequence",
+            key_fn=component_sequence_key,
+            include_sequence_cluster_key=True,
+        )
+    )
 
     dump_csv_rows(outdir / "sequence_clusters" / "membership.csv", membership_rows)
+
+    cluster_method_counts: dict[str, int] = defaultdict(int)
+    for row in membership_rows:
+        cluster_method_counts[str(row.get("cluster_method", "") or "")] += 1
 
     manifest = {
         **inventory.manifest,
@@ -788,6 +880,7 @@ def build_monomer_sequence_dataset(
         "output_dir": str(outdir.resolve()),
         "fasta_paths": {key: str(path.resolve()) for key, path in sorted(fasta_paths.items())},
         "num_sequence_membership_rows": len(membership_rows),
+        "sequence_cluster_method_counts": dict(sorted(cluster_method_counts.items())),
     }
     dump_json(outdir / "manifest.json.gz", manifest, indent=2)
     LOGGER.info(
