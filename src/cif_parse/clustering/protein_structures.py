@@ -1074,9 +1074,17 @@ def _process_one_group_worker(
                                                   prev[13], prev[14])
         elif chain_aa is not None and not rep.extracted_pdb_path:
             _coerced = _coerce_chain_id_for_pdb(chain_aa)
-            pdb_file = PDBFile()
-            pdb_file.set_structure(_coerced)
-            pdb_file.write(pdb_path)
+            try:
+                pdb_file = PDBFile()
+                pdb_file.set_structure(_coerced)
+                pdb_file.write(pdb_path)
+            except Exception as exc:
+                LOGGER.warning(
+                    "Failed to write protein representative PDB for %s: %s",
+                    rep.monomer_id,
+                    exc,
+                )
+                continue
             rep.extracted_pdb_path = str(pdb_path)
             rep.coordinate_fingerprint = _atom_coordinate_fingerprint(_coerced)
             prev = _extract_info.get(rep.monomer_id)

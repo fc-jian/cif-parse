@@ -10,7 +10,7 @@ import re
 from typing import Any, Iterator, TextIO
 
 import numpy as np
-from biotite.structure.io.pdbx import CIFFile, get_structure, list_assemblies
+from biotite.structure.io.pdbx import CIFFile, get_assembly, get_structure, list_assemblies
 
 from cif_parse.annotate import analyze_antibody_sequence, analyze_immune_sequence
 from cif_parse.constants import (
@@ -22,6 +22,78 @@ from cif_parse.models import ChainRecord, StructureSummary
 from cif_parse.utils import filter_atom_array_for_analysis
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_empty_atom_array_error(exc: Exception) -> bool:
+    return isinstance(exc, ValueError) and str(exc) == "Array must contain at least one element"
+
+
+def get_structure_with_altloc_fallback(
+    cif_file: CIFFile,
+    *,
+    model: int | None = 1,
+    use_author_fields: bool = False,
+):
+    """Read coordinates, retrying with altloc='all' for nonstandard alt IDs."""
+
+    try:
+        return get_structure(
+            cif_file,
+            model=model,
+            use_author_fields=use_author_fields,
+        )
+    except ValueError as exc:
+        if not _is_empty_atom_array_error(exc):
+            raise
+        LOGGER.warning(
+            "Biotite returned an empty atom array with default altloc handling; "
+            "retrying with altloc='all'"
+        )
+        try:
+            return get_structure(
+                cif_file,
+                model=model,
+                use_author_fields=use_author_fields,
+                altloc="all",
+            )
+        except Exception as fallback_exc:
+            raise exc from fallback_exc
+
+
+def get_assembly_with_altloc_fallback(
+    cif_file: CIFFile,
+    *,
+    assembly_id: str,
+    model: int | None = 1,
+    use_author_fields: bool = False,
+):
+    """Read assembly coordinates, retrying with altloc='all' if needed."""
+
+    try:
+        return get_assembly(
+            cif_file,
+            assembly_id=assembly_id,
+            model=model,
+            use_author_fields=use_author_fields,
+        )
+    except ValueError as exc:
+        if not _is_empty_atom_array_error(exc):
+            raise
+        LOGGER.warning(
+            "Biotite returned an empty assembly atom array with default altloc "
+            "handling for assembly %s; retrying with altloc='all'",
+            assembly_id,
+        )
+        try:
+            return get_assembly(
+                cif_file,
+                assembly_id=assembly_id,
+                model=model,
+                use_author_fields=use_author_fields,
+                altloc="all",
+            )
+        except Exception as fallback_exc:
+            raise exc from fallback_exc
 
 
 def _append_warning_detail(record: ChainRecord, warning_code: str, detail: dict[str, Any]) -> None:
@@ -1196,7 +1268,7 @@ def _apply_single_chain_coverage(
         record.features["coverage_mode"] = coverage_mode
 
     try:
-        atom_array = get_structure(
+        atom_array = get_structure_with_altloc_fallback(
             cif_file,
             model=model,
             use_author_fields=False,
@@ -1564,7 +1636,7 @@ def read_structure_summary(
             cif_file=cif_file,
         )
     try:
-        atom_array = get_structure(
+        atom_array = get_structure_with_altloc_fallback(
             cif_file,
             model=model,
             use_author_fields=use_author_fields,

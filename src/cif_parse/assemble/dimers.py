@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from biotite.structure.io.pdbx import CIFFile, get_assembly, get_structure, list_assemblies
+from biotite.structure.io.pdbx import CIFFile, list_assemblies
 
 from cif_parse.constants import POLYMER_CHAIN_TYPES
 from cif_parse.interact.contacts import (
@@ -12,6 +12,10 @@ from cif_parse.interact.contacts import (
     compute_interface_metrics,
 )
 from cif_parse.io import read_cif_file, select_largest_polymer_assembly_id
+from cif_parse.io.cif_reader import (
+    get_assembly_with_altloc_fallback,
+    get_structure_with_altloc_fallback,
+)
 from cif_parse.models import DimerInterfaceRecord
 
 
@@ -147,7 +151,7 @@ def identify_dimer_interfaces(
             atom_array_inputs = [
                 (
                     selected_assembly_id,
-                    get_assembly(
+                    get_assembly_with_altloc_fallback(
                         cif_file,
                         assembly_id=selected_assembly_id,
                         model=model,
@@ -166,7 +170,7 @@ def identify_dimer_interfaces(
             atom_array_inputs = [
                 (
                     None,
-                    get_structure(
+                    get_structure_with_altloc_fallback(
                         cif_file,
                         model=model,
                         use_author_fields=False,

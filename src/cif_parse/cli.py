@@ -12,7 +12,7 @@ import heapq
 from pathlib import Path
 from typing import Any
 
-from cif_parse.export import dump_json
+from cif_parse.export import dump_json, load_case_output_bundle, load_json, resolve_json_path
 from cif_parse.io import read_case_metadata, read_structure_summary
 from cif_parse.pipeline import StructureSkipWarning, infer_case_id, process_single_structure
 from cif_parse.reporting import (
@@ -100,6 +100,32 @@ def build_parser(
         action=argparse.BooleanOptionalAction,
         default=bool(batch_defaults.get("fail_fast", False)),
         help="Stop immediately if any case fails",
+    )
+    batch_parser.add_argument(
+        "--resume",
+        "--skip-existing",
+        dest="resume",
+        action="store_true",
+        default=bool(batch_defaults.get("resume", False)),
+        help=(
+            "Reuse complete existing case outputs under OUTDIR/cases instead of "
+            "reprocessing them; completeness requires result JSON and atom cache pkl files"
+        ),
+    )
+    batch_parser.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="Disable reuse of existing case outputs",
+    )
+    batch_parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        default=bool(batch_defaults.get("summary_only", False)),
+        help=(
+            "Do not parse input CIFs; rebuild manifest/summary/review/metadata by "
+            "scanning existing OUTDIR/cases outputs"
+        ),
     )
     _add_read_options(batch_parser, settings_defaults=settings_defaults)
     _add_runtime_args(
@@ -413,6 +439,313 @@ def _build_case_specs(input_paths: list[Path], outdir: Path) -> list[dict[str, A
     return case_specs
 
 
+def _build_existing_case_specs(outdir: Path) -> list[dict[str, Any]]:
+    """Build case specs from existing ``outdir/cases/*`` directories."""
+
+    cases_dir = outdir / "cases"
+    if not cases_dir.exists():
+        return []
+    specs: list[dict[str, Any]] = []
+    for case_dir in sorted(path for path in cases_dir.iterdir() if path.is_dir()):
+        specs.append(
+            {
+                "case_id": case_dir.name,
+                "input_path": "",
+                "output_dir": str(case_dir),
+            }
+        )
+    return specs
+
+
+def _build_case_specs_from_manifest(outdir: Path, manifest_results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for case_id in sorted(manifest_results):
+        row = manifest_results[case_id]
+        specs.append(
+            {
+                "case_id": case_id,
+                "input_path": str(row.get("input_path", "") or ""),
+                "output_dir": str(row.get("output_dir", "") or outdir / "cases" / case_id),
+            }
+        )
+    return specs
+
+
+def _resolve_optional_json(path: Path) -> Path | None:
+    try:
+        return resolve_json_path(path)
+    except FileNotFoundError:
+        return None
+
+
+def _assembly_sort_key(label: str) -> tuple[int, int | str]:
+    if label.isdigit():
+        return (0, int(label))
+    return (1, label)
+
+
+def _assembly_id_from_result_path(path: Path) -> str | None:
+    name = path.name
+    prefix = "result_assembly_"
+    if name.startswith(prefix):
+        remainder = name.removeprefix(prefix)
+        for suffix in (".json.gz", ".json"):
+            if remainder.endswith(suffix):
+                remainder = remainder[: -len(suffix)]
+                break
+        return remainder or None
+    if path.parent.name.startswith("assembly_"):
+        return path.parent.name.removeprefix("assembly_") or None
+    return None
+
+
+def _find_existing_case_payloads(case_dir: Path) -> list[tuple[dict[str, Any], Path, Path]]:
+    """Load existing case payloads with their JSON path and atom-cache root."""
+
+    result_path = _resolve_optional_json(case_dir / "result.json")
+    if result_path is not None:
+        payload = load_json(result_path)
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected dict payload in {result_path}")
+        return [(payload, result_path, case_dir)]
+
+    assembly_paths: dict[str, Path] = {}
+    for candidate in list(case_dir.glob("result_assembly_*.json.gz")) + list(
+        case_dir.glob("result_assembly_*.json")
+    ):
+        if candidate.name.endswith(".json.gz"):
+            key = candidate.name.removesuffix(".json.gz")
+        else:
+            key = candidate.name.removesuffix(".json")
+        assembly_paths[key] = candidate
+    if assembly_paths:
+        loaded: list[tuple[dict[str, Any], Path, Path]] = []
+        for key, path in sorted(
+            assembly_paths.items(),
+            key=lambda item: _assembly_sort_key(item[0].removeprefix("result_assembly_")),
+        ):
+            payload = load_json(path)
+            if not isinstance(payload, dict):
+                raise TypeError(f"Expected dict payload in {path}")
+            loaded.append((payload, path, case_dir))
+        return loaded
+
+    assembly_dirs = sorted(
+        [
+            path
+            for path in case_dir.iterdir()
+            if path.is_dir() and path.name.startswith("assembly_")
+        ],
+        key=lambda path: _assembly_sort_key(path.name.removeprefix("assembly_")),
+    ) if case_dir.exists() else []
+    loaded = []
+    for assembly_dir in assembly_dirs:
+        assembly_result = _resolve_optional_json(assembly_dir / "result.json")
+        if assembly_result is not None:
+            payload = load_json(assembly_result)
+        elif _resolve_optional_json(assembly_dir / "structure_summary.json") is not None:
+            payload = load_case_output_bundle(assembly_dir)
+            assembly_result = resolve_json_path(assembly_dir / "structure_summary.json")
+        else:
+            continue
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected dict payload in {assembly_result}")
+        loaded.append((payload, assembly_result, assembly_dir))
+    if loaded:
+        return loaded
+
+    if _resolve_optional_json(case_dir / "structure_summary.json") is not None:
+        payload = load_case_output_bundle(case_dir)
+        summary_path = resolve_json_path(case_dir / "structure_summary.json")
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected dict payload in {summary_path}")
+        return [(payload, summary_path, case_dir)]
+
+    return []
+
+
+def _nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _validate_existing_atom_cache(
+    payloads: list[tuple[dict[str, Any], Path, Path]],
+) -> list[str]:
+    missing: list[str] = []
+    for payload, result_path, atom_root in payloads:
+        summary = payload.get("structure_summary", {})
+        if not isinstance(summary, dict):
+            summary = {}
+        assembly_id = str(summary.get("assembly_id", "") or "")
+        if not assembly_id:
+            assembly_id = _assembly_id_from_result_path(result_path) or ""
+        atoms_dir = atom_root / "atoms"
+        required = [atoms_dir / "_none.pkl"]
+        if assembly_id:
+            required.append(atoms_dir / f"{assembly_id}.pkl")
+        for atom_path in required:
+            if not _nonempty_file(atom_path):
+                missing.append(str(atom_path))
+    return missing
+
+
+def _result_from_existing_case(task: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Build a batch result from an existing complete case output."""
+
+    case_dir = Path(task["output_dir"])
+    try:
+        payloads = _find_existing_case_payloads(case_dir)
+        if not payloads:
+            return None, "no result JSON found"
+        missing_atoms = _validate_existing_atom_cache(payloads)
+        if missing_atoms:
+            preview = ", ".join(missing_atoms[:4])
+            if len(missing_atoms) > 4:
+                preview += f", ... ({len(missing_atoms)} total)"
+            return None, f"missing atom cache pkl: {preview}"
+
+        primary_payload = payloads[0][0]
+        summary = primary_payload.get("structure_summary", {})
+        if not isinstance(summary, dict):
+            return None, "result JSON missing structure_summary object"
+        chain_inventory = primary_payload.get("chain_inventory", [])
+        if not isinstance(chain_inventory, list):
+            return None, "result JSON missing chain_inventory list"
+
+        output_paths = [str(result_path) for _, result_path, _ in payloads]
+        assembly_ids: list[str] = []
+        assembly_results: list[dict[str, Any]] = []
+        total_dimers = 0
+        total_multimers = 0
+        total_antibody_complexes = 0
+        total_tcr_complexes = 0
+        for payload, result_path, _ in payloads:
+            item_summary = payload.get("structure_summary", {})
+            if not isinstance(item_summary, dict):
+                item_summary = {}
+            assembly_id = str(item_summary.get("assembly_id", "") or "")
+            if not assembly_id:
+                assembly_id = _assembly_id_from_result_path(result_path) or ""
+            if assembly_id:
+                assembly_ids.append(assembly_id)
+            dimer_count = len(payload.get("dimer_interfaces", []) or [])
+            multimer_count = len(payload.get("tight_multimers", []) or [])
+            antibody_count = len(payload.get("antibody_antigen_complexes", []) or [])
+            tcr_count = len(payload.get("tcr_pmhc_complexes", []) or [])
+            total_dimers += dimer_count
+            total_multimers += multimer_count
+            total_antibody_complexes += antibody_count
+            total_tcr_complexes += tcr_count
+            assembly_results.append(
+                {
+                    "pdb_id": item_summary.get("pdb_id", summary.get("pdb_id", "")),
+                    "input_path": item_summary.get("source_path", task.get("input_path", "")),
+                    "output_dir": str(result_path.parent),
+                    "output_paths": [str(result_path)],
+                    "num_chains": len(payload.get("chain_inventory", []) or []),
+                    "num_dimers": dimer_count,
+                    "num_multimers": multimer_count,
+                    "num_antibody_antigen_complexes": antibody_count,
+                    "num_tcr_pmhc_complexes": tcr_count,
+                    "chain_type_counts": item_summary.get("chain_type_counts", {}),
+                    "assembly_id": assembly_id or None,
+                }
+            )
+
+        metadata = summary.get("entry_metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        input_path = str(task.get("input_path") or summary.get("source_path", "") or "")
+        result = {
+            "case_id": task["case_id"],
+            "pdb_id": summary.get("pdb_id", ""),
+            "input_path": input_path,
+            "output_dir": str(case_dir),
+            "output_paths": output_paths,
+            "num_chains": len(chain_inventory),
+            "num_dimers": total_dimers,
+            "num_multimers": total_multimers,
+            "num_antibody_antigen_complexes": total_antibody_complexes,
+            "num_tcr_pmhc_complexes": total_tcr_complexes,
+            "chain_type_counts": summary.get("chain_type_counts", {}),
+            "status": "ok",
+            "resumed": True,
+            "_meta": metadata,
+        }
+        if assembly_ids:
+            result["num_assemblies_processed"] = len(assembly_ids)
+            result["processed_assembly_ids"] = assembly_ids
+            result["assembly_results"] = assembly_results
+        return result, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _settings_fingerprint(settings_payload: dict[str, Any]) -> dict[str, Any]:
+    ignored = {"log_level", "verbose"}
+    return {
+        key: settings_payload[key]
+        for key in sorted(settings_payload)
+        if key not in ignored
+    }
+
+
+def _load_existing_manifest(outdir: Path) -> dict[str, Any] | None:
+    try:
+        manifest = load_json(outdir / "manifest.json")
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        LOGGER.warning("Could not read existing manifest under %s: %s", outdir, exc)
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def _existing_manifest_results_by_case(outdir: Path) -> dict[str, dict[str, Any]]:
+    manifest = _load_existing_manifest(outdir)
+    if not manifest:
+        return {}
+    rows = manifest.get("results", [])
+    if not isinstance(rows, list):
+        return {}
+    results: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        case_id = str(row.get("case_id", "") or "")
+        if case_id:
+            results[case_id] = row
+    return results
+
+
+def _validate_resume_settings(outdir: Path, settings_payload: dict[str, Any]) -> str | None:
+    manifest = _load_existing_manifest(outdir)
+    if not manifest:
+        return None
+    previous = manifest.get("settings")
+    if not isinstance(previous, dict):
+        return None
+    previous_fp = _settings_fingerprint(previous)
+    current_fp = _settings_fingerprint(settings_payload)
+    if previous_fp == current_fp:
+        return None
+    changed = sorted(
+        key
+        for key in set(previous_fp) | set(current_fp)
+        if previous_fp.get(key) != current_fp.get(key)
+    )
+    preview = ", ".join(changed[:8])
+    if len(changed) > 8:
+        preview += f", ... ({len(changed)} total)"
+    return (
+        "existing manifest settings differ from current batch settings "
+        f"({preview}); run without --resume or use a fresh --outdir"
+    )
+
+
 def _build_metadata_csv(results: list[dict[str, Any]], output_path: Path) -> None:
     """Write a per-case metadata CSV with experimental details and chain counts."""
     import csv
@@ -722,6 +1055,62 @@ def _print_batch_result(
     print(outdir)
 
 
+def _write_batch_artifacts(
+    *,
+    settings: AppSettings,
+    settings_payload: dict[str, Any],
+    outdir: Path,
+    input_paths: list[str | Path],
+    results: list[dict[str, Any]],
+) -> tuple[dict[str, Any], Path, Path, Path, Path]:
+    results.sort(key=lambda item: item["case_id"])
+    summary = _summarize_batch_results(results)
+    resumed_count = sum(1 for result in results if result.get("resumed"))
+    if resumed_count:
+        summary["resumed_existing_count"] = resumed_count
+    review_results: list[dict[str, Any]] = []
+    for result in results:
+        review_result = dict(result)
+        if result.get("status") == "ok":
+            review_result["metrics"] = collect_case_review_metrics(
+                result["output_dir"],
+                low_confidence_antibody_threshold=settings.low_confidence_antibody_threshold,
+            )
+        review_results.append(review_result)
+    review = build_review_report(review_results)
+    warning_counts = review.get("warning_counts", {})
+    if isinstance(warning_counts, dict):
+        batch_warning_counts = warning_counts.get("batch", {})
+        if isinstance(batch_warning_counts, dict):
+            summary["warning_counts"] = batch_warning_counts
+            summary["warning_count"] = sum(int(value) for value in batch_warning_counts.values())
+    manifest = {
+        "settings": settings_payload,
+        "input_paths": [str(path) for path in input_paths],
+        "results": results,
+    }
+    manifest_path = dump_json(outdir / "manifest.json.gz", manifest)
+    summary_path = dump_json(outdir / "summary.json", summary)
+    review_path = dump_json(outdir / "review.json.gz", review)
+    html_report_path = outdir / "summary_report.html"
+    html_report_path.write_text(
+        build_batch_html_report(
+            summary=summary,
+            review=review,
+            manifest=manifest,
+            artifact_paths={
+                "manifest_path": str(manifest_path),
+                "summary_path": str(summary_path),
+                "review_path": str(review_path),
+                "html_report_path": str(html_report_path.resolve()),
+            },
+        ),
+        encoding="utf-8",
+    )
+    _build_metadata_csv(results, outdir / "metadata.csv")
+    return summary, manifest_path, summary_path, review_path, html_report_path
+
+
 def main(argv: list[str] | None = None) -> int:
     """Execute the CLI."""
 
@@ -776,13 +1165,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "batch":
         parser.error(f"Unsupported command: {args.command}")
 
-    input_paths = _resolve_batch_inputs(args.inputs, args.input_list)
-    case_specs = _build_case_specs(input_paths, args.outdir)
-    LOGGER.info(
-        "Starting batch processing for %d inputs with %d worker(s)",
-        len(case_specs),
-        args.jobs,
-    )
     settings_payload = {
         "output_format": settings.output_format,
         "assembly_mode": settings.assembly_mode,
@@ -813,6 +1195,90 @@ def main(argv: list[str] | None = None) -> int:
         "sadie_domain_limit": settings.sadie_domain_limit,
         "low_confidence_antibody_threshold": settings.low_confidence_antibody_threshold,
     }
+
+    if args.summary_only:
+        existing_manifest = _load_existing_manifest(args.outdir)
+        manifest_results = _existing_manifest_results_by_case(args.outdir)
+        summary_settings_payload = (
+            existing_manifest.get("settings")
+            if isinstance(existing_manifest, dict) and isinstance(existing_manifest.get("settings"), dict)
+            else settings_payload
+        )
+        if args.inputs or args.input_list is not None:
+            input_paths = _resolve_batch_inputs(args.inputs, args.input_list)
+            case_specs = _build_case_specs(input_paths, args.outdir)
+            manifest_input_paths: list[str | Path] = input_paths
+        elif manifest_results:
+            case_specs = _build_case_specs_from_manifest(args.outdir, manifest_results)
+            manifest_input_paths = (
+                existing_manifest.get("input_paths", [])
+                if isinstance(existing_manifest, dict) and isinstance(existing_manifest.get("input_paths"), list)
+                else []
+            )
+        else:
+            case_specs = _build_existing_case_specs(args.outdir)
+            manifest_input_paths = []
+        if not case_specs:
+            parser.error("--summary-only found no existing case outputs under OUTDIR/cases")
+        LOGGER.info("Rebuilding batch summary from %d existing case output(s)", len(case_specs))
+        results = []
+        for task in case_specs:
+            manifest_result = manifest_results.get(str(task["case_id"]))
+            if manifest_result is not None and manifest_result.get("status") != "ok":
+                results.append(dict(manifest_result))
+                if not manifest_input_paths and manifest_result.get("input_path"):
+                    manifest_input_paths.append(str(manifest_result["input_path"]))
+                continue
+            result, reason = _result_from_existing_case(task)
+            if result is not None:
+                results.append(result)
+                if not manifest_input_paths and result.get("input_path"):
+                    manifest_input_paths.append(str(result["input_path"]))
+                continue
+            results.append(
+                {
+                    "case_id": task["case_id"],
+                    "input_path": task.get("input_path", ""),
+                    "output_dir": task["output_dir"],
+                    "status": "error",
+                    "error": f"existing case output is incomplete: {reason}",
+                    "_meta": {},
+                }
+            )
+        summary, manifest_path, summary_path, review_path, html_report_path = _write_batch_artifacts(
+            settings=settings,
+            settings_payload=summary_settings_payload,
+            outdir=args.outdir,
+            input_paths=manifest_input_paths,
+            results=results,
+        )
+        LOGGER.info(
+            "Rebuilt batch summary: %d success, %d failure",
+            summary["success_count"],
+            summary["failure_count"],
+        )
+        _print_batch_result(
+            settings,
+            args.outdir,
+            manifest_path,
+            summary_path,
+            review_path,
+            html_report_path,
+            summary,
+        )
+        return 0 if summary["failure_count"] == 0 else 1
+
+    input_paths = _resolve_batch_inputs(args.inputs, args.input_list)
+    case_specs = _build_case_specs(input_paths, args.outdir)
+    LOGGER.info(
+        "Starting batch processing for %d inputs with %d worker(s)",
+        len(case_specs),
+        args.jobs,
+    )
+    if args.resume:
+        resume_error = _validate_resume_settings(args.outdir, settings_payload)
+        if resume_error:
+            parser.error(resume_error)
     tasks = [
         {
             **case_spec,
@@ -822,6 +1288,45 @@ def main(argv: list[str] | None = None) -> int:
     ]
 
     results: list[dict[str, Any]] = []
+    if args.resume:
+        manifest_results = _existing_manifest_results_by_case(args.outdir)
+        pending_tasks: list[dict[str, Any]] = []
+        resumed = 0
+        for task in tasks:
+            manifest_result = manifest_results.get(str(task["case_id"]))
+            if manifest_results and (
+                manifest_result is None
+                or manifest_result.get("status") != "ok"
+                or (
+                    task.get("input_path")
+                    and manifest_result.get("input_path")
+                    and str(manifest_result.get("input_path")) != str(task.get("input_path"))
+                )
+            ):
+                LOGGER.debug(
+                    "Existing output for %s is not reusable according to previous manifest",
+                    task["case_id"],
+                )
+                pending_tasks.append(task)
+                continue
+            result, reason = _result_from_existing_case(task)
+            if result is None:
+                LOGGER.debug(
+                    "Existing output for %s is not reusable: %s",
+                    task["case_id"],
+                    reason,
+                )
+                pending_tasks.append(task)
+                continue
+            results.append(result)
+            resumed += 1
+        tasks = pending_tasks
+        if resumed:
+            LOGGER.info(
+                "Reused %d existing complete case output(s); %d case(s) remain to process",
+                resumed,
+                len(tasks),
+            )
 
     # ── Streaming preflight → priority heap → process pool ──────────────
     # Pre-scan preflight results stream into a max-heap (largest assembly
@@ -972,53 +1477,18 @@ def main(argv: list[str] | None = None) -> int:
                         break
                     _fill_process_window()
 
-    results.sort(key=lambda item: item["case_id"])
-    summary = _summarize_batch_results(results)
-    review_results: list[dict[str, Any]] = []
-    for result in results:
-        review_result = dict(result)
-        if result.get("status") == "ok":
-            review_result["metrics"] = collect_case_review_metrics(
-                result["output_dir"],
-                low_confidence_antibody_threshold=settings.low_confidence_antibody_threshold,
-            )
-        review_results.append(review_result)
-    review = build_review_report(review_results)
-    warning_counts = review.get("warning_counts", {})
-    if isinstance(warning_counts, dict):
-        batch_warning_counts = warning_counts.get("batch", {})
-        if isinstance(batch_warning_counts, dict):
-            summary["warning_counts"] = batch_warning_counts
-            summary["warning_count"] = sum(int(value) for value in batch_warning_counts.values())
-    manifest = {
-        "settings": settings_payload,
-        "input_paths": [str(path) for path in input_paths],
-        "results": results,
-    }
-    manifest_path = dump_json(args.outdir / "manifest.json.gz", manifest)
-    summary_path = dump_json(args.outdir / "summary.json", summary)
-    review_path = dump_json(args.outdir / "review.json.gz", review)
-    html_report_path = args.outdir / "summary_report.html"
-    html_report_path.write_text(
-        build_batch_html_report(
-            summary=summary,
-            review=review,
-            manifest=manifest,
-            artifact_paths={
-                "manifest_path": str(manifest_path),
-                "summary_path": str(summary_path),
-                "review_path": str(review_path),
-                "html_report_path": str(html_report_path.resolve()),
-            },
-        ),
-        encoding="utf-8",
+    summary, manifest_path, summary_path, review_path, html_report_path = _write_batch_artifacts(
+        settings=settings,
+        settings_payload=settings_payload,
+        outdir=args.outdir,
+        input_paths=input_paths,
+        results=results,
     )
     LOGGER.info(
         "Finished batch: %d success, %d failure",
         summary["success_count"],
         summary["failure_count"],
     )
-    _build_metadata_csv(results, args.outdir / "metadata.csv")
     _print_batch_result(
         settings,
         args.outdir,

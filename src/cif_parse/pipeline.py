@@ -33,7 +33,11 @@ from cif_parse.io import (
     read_structure_preflight,
 )
 from cif_parse.io.cif_reader import read_cif_file, select_largest_polymer_assembly_id
-from cif_parse.io.cif_reader import preflight_assembly_atom_counts
+from cif_parse.io.cif_reader import (
+    get_assembly_with_altloc_fallback,
+    get_structure_with_altloc_fallback,
+    preflight_assembly_atom_counts,
+)
 from cif_parse.constants import (
     BRANCHED_CHAIN_TYPES,
     METAL_CHAIN_TYPES,
@@ -867,9 +871,12 @@ def _dump_atom_cache_au(
     if au_cache_path.exists():
         return
     try:
-        from biotite.structure.io.pdbx import get_structure
         cif_file = cif_file or read_cif_file(input_path)
-        atom_array = get_structure(cif_file, model=model, use_author_fields=False)
+        atom_array = get_structure_with_altloc_fallback(
+            cif_file,
+            model=model,
+            use_author_fields=False,
+        )
         if atom_array is not None and len(atom_array) > 0:
             au_cache_path.write_bytes(
                 zlib.compress(pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL), 3)
@@ -942,8 +949,6 @@ def _dump_atom_cache(
     atoms_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        from biotite.structure.io.pdbx import get_assembly, get_structure
-
         cif_file = cif_file or read_cif_file(input_path)
 
         # For pre-split assembly files the input CIF already contains the
@@ -955,7 +960,11 @@ def _dump_atom_cache(
             au_cache_path = atoms_dir / "_none.pkl"
             if not asm_cache_path.exists():
                 try:
-                    atom_array = get_structure(cif_file, model=model, use_author_fields=False)
+                    atom_array = get_structure_with_altloc_fallback(
+                        cif_file,
+                        model=model,
+                        use_author_fields=False,
+                    )
                     if atom_array is not None and len(atom_array) > 0:
                         blob = zlib.compress(pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL), 3)
                         asm_cache_path.write_bytes(blob)
@@ -975,7 +984,11 @@ def _dump_atom_cache(
         au_cache_path = atoms_dir / "_none.pkl"
         if not au_cache_path.exists():
             try:
-                atom_array = get_structure(cif_file, model=model, use_author_fields=False)
+                atom_array = get_structure_with_altloc_fallback(
+                    cif_file,
+                    model=model,
+                    use_author_fields=False,
+                )
                 if atom_array is not None and len(atom_array) > 0:
                     au_cache_path.write_bytes(
                         zlib.compress(pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL), 3)
@@ -1002,7 +1015,7 @@ def _dump_atom_cache(
                 asm_cache_path = atoms_dir / f"{effective_assembly_id}.pkl"
                 if not asm_cache_path.exists():
                     try:
-                        atom_array = get_assembly(
+                        atom_array = get_assembly_with_altloc_fallback(
                             cif_file,
                             assembly_id=effective_assembly_id,
                             model=model,

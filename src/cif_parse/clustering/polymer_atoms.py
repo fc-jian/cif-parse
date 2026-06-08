@@ -32,9 +32,18 @@ def prepare_polymer_atoms_for_usalign(
         copied.chain_id[:] = chain_id
     # mmCIF uses HETATM for many polymerized modified residues, including D-aa.
     # USalign ignores these records in PDB input, so emit selected polymer atoms
-    # as ATOM while preserving their original residue names.
+    # as ATOM. PDB residue names are limited to 3 characters; sanitize only this
+    # USalign copy so mmCIF/JSON annotations keep their original CCD IDs.
     if hasattr(copied, "hetero"):
         copied.hetero[:] = False
+    if hasattr(copied, "res_name"):
+        copied.res_name = np.asarray(
+            [
+                residue_name if 0 < len(residue_name) <= 3 else "UNK"
+                for residue_name in (str(value).strip() for value in copied.res_name)
+            ],
+            dtype="U3",
+        )
     return copied
 
 
