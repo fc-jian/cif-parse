@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -500,9 +501,11 @@ def extract_multimer_structure(
     )
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    pdb_path = outdir / (
-        f"{observation.pdb_id}_{observation.assembly_id or 'asu'}_{observation.multimer_id}.pdb"
-    )
+    safe_id = observation.multimer_observation_id.replace(":", "_").replace("/", "_")
+    shard = hashlib.sha256(observation.multimer_observation_id.encode()).hexdigest()[:2]
+    pdb_dir = outdir / shard
+    pdb_dir.mkdir(parents=True, exist_ok=True)
+    pdb_path = pdb_dir / f"{safe_id}.pdb"
     pdb_file = PDBFile()
     pdb_file.set_structure(multimer_atoms)
     pdb_file.write(pdb_path)
