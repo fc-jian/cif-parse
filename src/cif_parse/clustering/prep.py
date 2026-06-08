@@ -1,9 +1,9 @@
 """Pre-processing for clustering at any scale.
 
 Produces a self-contained directory that replaces thousands of individual
-``result.json.gz`` reads with columnar Parquet scans and converts parse-stage
-atom pickle caches into a compact binary coordinate index.  Clustering
-consumers do not read original mmCIF files.
+``result.json.gz`` reads with columnar Parquet scans.  Coordinates are read
+from parse-stage ``atoms/*.pkl`` caches via the source map written by prep;
+clustering consumers do not read original mmCIF files.
 
 Layout
 ------
@@ -15,8 +15,8 @@ Layout
     ├── multimers.parquet             # pre-parsed tight multimer rows
     ├── antibody_complexes.parquet    # pre-parsed antibody-antigen complex rows
     ├── tcr_complexes.parquet         # pre-parsed TCR-pMHC complex rows
-    ├── cif_coords.bin               # concatenated pickled AtomArray blobs
-    ├── cif_coords.idx               # 76-byte fixed-width index
+    ├── entry_quality.parquet         # source-level quality metadata
+    └── source_case_dir_map.json      # source_path -> parse case directory
 
 Builder
 -------
@@ -27,53 +27,23 @@ configured with ``--prep-jobs``.
 Consumers
 ---------
 The ``collect_*`` functions in each clustering module use PyArrow to scan the
-Parquet files in a streaming fashion.  The ``extract_*`` functions use
-memory-mapped I/O to fetch cached AtomArray objects via the binary index.
+Parquet files in a streaming fashion.  The ``extract_*`` functions fetch
+cached AtomArray objects from parse-stage atom pickle files.
 """
 
 from __future__ import annotations
 
-import heapq
-import hashlib
 import json
 import logging
-import math
-import os as _os
-import pickle
 import shutil
-import struct
-import threading
 import time
-import zlib
-from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
 from tqdm import tqdm
 
 LOGGER = logging.getLogger(__name__)
-
-# ── constants ────────────────────────────────────────────────────────────────
-
-_IDX_ENTRY_STRUCT = struct.Struct("64s Q I")  # hash(64 B hex ASCII), offset(8 B), len(4 B)
-_IDX_ENTRY_SIZE = _IDX_ENTRY_STRUCT.size  # 76 bytes
-
-# Compressed blob format: 4-byte magic + 4-byte raw length + zlib(data)
-_BLOB_MAGIC = b"\x01\xC1\xF0\x01"
-_BLOB_HEADER = struct.Struct("4s I")
-_ZLIB_LEVEL = 3  # fast, ~7x compression on AtomArray pickles
-
-
-def _compress_blob(data: bytes) -> bytes:
-    return _BLOB_HEADER.pack(_BLOB_MAGIC, len(data)) + zlib.compress(data, _ZLIB_LEVEL)
-
-
-def _decompress_blob(data: bytes) -> bytes:
-    magic, raw_len = _BLOB_HEADER.unpack(data[: _BLOB_HEADER.size])
-    if magic != _BLOB_MAGIC:
-        raise ValueError("cif_coords blob has unexpected magic; rebuild prep")
-    return zlib.decompress(data[_BLOB_HEADER.size:])
 
 # Parquet output file names
 PARQUET_TABLES = [
@@ -84,33 +54,6 @@ PARQUET_TABLES = [
     "antibody_complexes",
     "tcr_complexes",
 ]
-
-# ── hash helpers ─────────────────────────────────────────────────────────────
-
-
-def _hash_source_mtime(source_path: str) -> str:
-    p = Path(source_path)
-    if not p.exists():
-        return "missing"
-    stat = p.stat()
-    return hashlib.sha256(f"{p.resolve()}:{stat.st_size}:{stat.st_mtime}".encode()).hexdigest()
-
-
-def _blob_index_key(source_path: str, assembly_id: str | None) -> str:
-    """Return a stable 64-char hex key that uniquely identifies a cached blob.
-
-    Different assemblies from the same parsed source get different keys, so the
-    index can store them independently.
-    """
-    cache_key = f"{source_path}__{assembly_id or ''}"
-    return hashlib.sha256(cache_key.encode()).hexdigest()
-
-
-def _chain_blob_key(source_path: str, assembly_id: str | None, chain_id: str) -> str:
-    """Return a stable 64-char key for a single-chain blob."""
-    raw = f"{source_path}__{assembly_id or '_none'}__{chain_id}"
-    return hashlib.sha256(raw.encode()).hexdigest()
-
 
 # ── json extraction helpers (move heavy parsing into prep once) ──────────────
 
@@ -430,6 +373,7 @@ def _ingest_cases_to_parquet(
     all_rows: dict[str, list[dict[str, Any]]] = {t: [] for t in PARQUET_TABLES}
     source_paths: set[str] = set()
     atom_cache_map: dict[str, str] = {}  # source_path → atoms_dir
+    source_case_dir_map: dict[str, str] = {}  # source_path → source_case_dir
     stats = {"ingested": 0, "skipped_no_bundles": 0, "errors": 0}
 
     for case_dir in case_dirs:
@@ -449,6 +393,7 @@ def _ingest_cases_to_parquet(
                     sp = row.get("source_path", "")
                     if sp:
                         source_paths.add(sp)
+                        source_case_dir_map.setdefault(sp, case_id)
                         if has_atoms and sp not in atom_cache_map:
                             atom_cache_map[sp] = str(atoms_dir)
                 for table_name in (
@@ -462,6 +407,7 @@ def _ingest_cases_to_parquet(
                         sp = row.get("source_path", "")
                         if sp:
                             source_paths.add(sp)
+                            source_case_dir_map.setdefault(sp, case_id)
                             if has_atoms and sp not in atom_cache_map:
                                 atom_cache_map[sp] = str(atoms_dir)
             stats["ingested"] += 1
@@ -488,100 +434,13 @@ def _ingest_cases_to_parquet(
             for sp, ad in sorted(atom_cache_map.items()):
                 fh.write(json.dumps({"source_path": sp, "atoms_dir": ad}, ensure_ascii=False) + "\n")
         paths["atoms"] = str(atoms_path)
+    if source_case_dir_map:
+        source_cases_path = tmp_dir / f"temp_{batch_id}_source_cases.jsonl"
+        with source_cases_path.open("w", encoding="utf-8") as fh:
+            for sp, case_id in sorted(source_case_dir_map.items()):
+                fh.write(json.dumps({"source_path": sp, "source_case_dir": case_id}, ensure_ascii=False) + "\n")
+        paths["source_cases"] = str(source_cases_path)
     return {"batch_id": batch_id, "paths": paths, "stats": stats}
-
-
-# ── Phase 2: cif_cache worker ───────────────────────────────────────────────
-
-
-def _cache_sources_to_temp(
-    args: tuple[list[tuple[str, list[str | None], str]], Path, int, dict[str, str] | None, set[str]],
-) -> dict[str, Any]:
-    """Process a batch of parse-stage atom caches into one coord chunk.
-
-    All source_paths in the batch write to a single ``temp_{worker_id}.bin`` +
-    ``temp_{worker_id}.idx`` pair — no inter-process coordination needed because
-    each batch runs in exactly one worker process.
-
-    Returns metadata only — no blob data through IPC.
-    """
-    chunk_tasks, tmp_dir, worker_id, atom_cache_map, _input_assembly_sources = args
-    tmp_dir = Path(tmp_dir)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    bin_path = tmp_dir / f"temp_{worker_id}.bin"
-    idx_path = tmp_dir / f"temp_{worker_id}.idx"
-    all_entries: list[dict[str, Any]] = []
-
-    with bin_path.open("ab") as bin_fh, idx_path.open("ab") as idx_fh:
-        for source_path, assembly_ids, _cif_files_directory in chunk_tasks:
-            atoms_dir = atom_cache_map.get(source_path) if atom_cache_map else None
-            if not atoms_dir:
-                for assembly_id in assembly_ids:
-                    cache_key = f"{source_path}__{assembly_id or ''}"
-                    all_entries.append({"cache_key": cache_key, "status": "missing_atom_cache"})
-                continue
-
-            atoms_dir = Path(atoms_dir)
-            try:
-                written_aliases: dict[Path, dict[str, tuple[int, int]]] = {}
-                for assembly_id in assembly_ids:
-                    cache_key = f"{source_path}__{assembly_id or ''}"
-                    pkl_name = f"{assembly_id or '_none'}.pkl"
-                    pkl_path = atoms_dir / pkl_name
-                    if not pkl_path.exists():
-                        all_entries.append({"cache_key": cache_key, "status": "empty"})
-                        continue
-                    real_pkl_path = pkl_path.resolve()
-                    alias_entries = written_aliases.get(real_pkl_path)
-                    if alias_entries is not None:
-                        for cid, (offset, length) in alias_entries.items():
-                            blob_key = _chain_blob_key(source_path, assembly_id, cid)
-                            idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                                blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                                offset, length,
-                            ))
-                        all_entries.append({"cache_key": cache_key, "status": "cached_alias" if alias_entries else "empty"})
-                        continue
-                    raw = pickle.loads(zlib.decompress(pkl_path.read_bytes()))
-                    if isinstance(raw, dict):
-                        aa = raw.get("atom_array", raw)
-                    else:
-                        aa = raw
-                    if aa is None or len(aa) == 0:
-                        written_aliases[real_pkl_path] = {}
-                        all_entries.append({"cache_key": cache_key, "status": "empty"})
-                        continue
-                    cached_any = False
-                    alias_entries = {}
-                    for cid in sorted(set(aa.chain_id)):
-                        chain_atoms = aa[aa.chain_id == cid]
-                        if chain_atoms is None or len(chain_atoms) == 0:
-                            continue
-                        wrapped = _compress_blob(pickle.dumps(
-                            {"atom_array": chain_atoms, "quality": None, "chain_ops": None},
-                            protocol=pickle.HIGHEST_PROTOCOL,
-                        ))
-                        offset = bin_fh.tell()
-                        bin_fh.write(wrapped)
-                        blob_key = _chain_blob_key(source_path, assembly_id, str(cid))
-                        idx_fh.write(_IDX_ENTRY_STRUCT.pack(
-                            blob_key.encode("ascii", errors="replace").ljust(64, b"\0")[:64],
-                            offset, len(wrapped),
-                        ))
-                        alias_entries[str(cid)] = (offset, len(wrapped))
-                        cached_any = True
-                    written_aliases[real_pkl_path] = alias_entries
-                    all_entries.append({"cache_key": cache_key, "status": "cached" if cached_any else "empty"})
-            except Exception as exc:
-                LOGGER.warning("Failed to cache parse atom pkl for %s: %s", source_path, exc)
-                for assembly_id in assembly_ids:
-                    cache_key = f"{source_path}__{assembly_id or ''}"
-                    all_entries.append({"cache_key": cache_key, "status": "error", "error": str(exc)})
-
-    return {"entries": all_entries,
-            "bin_path": str(bin_path) if bin_path.exists() else None,
-            "idx_path": str(idx_path) if idx_path.exists() else None}
 
 
 # ── Parquet merging helpers ──────────────────────────────────────────────────
@@ -623,34 +482,6 @@ def _merge_batch_stats(result: dict[str, Any], stats: dict[str, Any]) -> None:
         stats[key] += result.get("stats", {}).get(key, 0)
 
 
-def _count_cif_entries(result: dict[str, Any], stats: dict[str, int]) -> None:
-    """Count cached/skipped/error entries from a Phase 2 worker result."""
-    for entry in result.get("entries", []):
-        status = entry.get("status", "")
-        if status == "cached":
-            stats["cached"] += 1
-        elif status == "cached_alias":
-            stats["cached"] += 1
-            stats["cached_alias"] += 1
-        elif status == "empty":
-            stats["skipped"] += 1
-            stats["empty"] += 1
-        elif status == "missing_atom_cache":
-            stats["skipped"] += 1
-            stats["missing_atom_cache"] += 1
-        elif status == "error":
-            stats["skipped"] += 1
-            stats["errors"] += 1
-        elif status == "skipped":
-            stats["skipped"] += 1
-
-
-def _read_idx_entries(idx_path: Path) -> list[bytes]:
-    """Read all 76-byte index entries from a temp idx file."""
-    data = idx_path.read_bytes()
-    return [data[i:i + _IDX_ENTRY_SIZE] for i in range(0, len(data), _IDX_ENTRY_SIZE)]
-
-
 def _collect_source_paths_from_parquet(prep_dir: Path, sink: set[str]) -> None:
     """Read source_path columns from existing Parquet files into *sink*."""
     try:
@@ -672,82 +503,6 @@ def _collect_source_paths_from_parquet(prep_dir: Path, sink: set[str]) -> None:
         pass
 
 
-def _group_source_tasks(
-    tasks: list[tuple[str, list[str | None], str | None]],
-    num_workers: int,
-    atom_cache_map: dict[str, str],
-    *,
-    target_chunks_per_worker: int = 4,
-    target_chunk_bytes: int = 1 << 30,
-) -> list[list[tuple[str, list[str | None], str | None]]]:
-    """Split source-cache work into weight-balanced chunks.
-
-    Phase 2 cost is dominated by reading/decompressing parse atom pickle files
-    and writing compressed chain blobs.  Consecutive slicing after sorting by
-    size puts the largest structures into the same first chunks.  Use an LPT
-    greedy packing instead so large structures are spread across chunks and the
-    resulting ``cif_coords/chunk_*.bin`` files are less skewed.
-    """
-
-    if not tasks:
-        return []
-    weighted_tasks: list[tuple[int, tuple[str, list[str | None], str | None]]] = []
-    for task in tasks:
-        sp, aids, _ = task
-        weight = max(1, _atom_cache_task_weight(sp, aids, atom_cache_map))
-        weighted_tasks.append((weight, task))
-
-    total_weight = sum(weight for weight, _ in weighted_tasks)
-    chunks_by_workers = max(1, num_workers * target_chunks_per_worker)
-    chunks_by_bytes = max(1, math.ceil(total_weight / max(1, target_chunk_bytes)))
-    desired_chunks = max(chunks_by_workers, chunks_by_bytes)
-    desired_chunks = max(1, min(len(weighted_tasks), desired_chunks))
-
-    bins: list[tuple[int, int, list[tuple[str, list[str | None], str | None]]]] = [
-        (0, bin_id, []) for bin_id in range(desired_chunks)
-    ]
-    heapq.heapify(bins)
-
-    for weight, task in sorted(weighted_tasks, key=lambda item: item[0], reverse=True):
-        current_weight, bin_id, group = heapq.heappop(bins)
-        group.append(task)
-        heapq.heappush(bins, (current_weight + weight, bin_id, group))
-
-    return [group for current_weight, _bin_id, group in bins if group]
-
-
-def _summarize_ints(values: list[int]) -> dict[str, int | float]:
-    """Return compact distribution stats for manifest/debug logs."""
-
-    if not values:
-        return {"count": 0, "min": 0, "max": 0, "mean": 0.0, "total": 0}
-    total = sum(values)
-    return {
-        "count": len(values),
-        "min": min(values),
-        "max": max(values),
-        "mean": round(total / len(values), 1),
-        "total": total,
-    }
-
-
-def _atom_cache_task_weight(source_path: str, assembly_ids: list[str | None], atom_cache_map: dict[str, str]) -> int:
-    """Estimate prep Phase 2 cost from parse-stage atom pickle sizes."""
-
-    atoms_dir = atom_cache_map.get(source_path)
-    if not atoms_dir:
-        return 0
-    total = 0
-    base = Path(atoms_dir)
-    for assembly_id in assembly_ids:
-        pkl_path = base / f"{assembly_id or '_none'}.pkl"
-        try:
-            total += pkl_path.stat().st_size
-        except OSError:
-            continue
-    return total
-
-
 # ── main builder ─────────────────────────────────────────────────────────────
 
 
@@ -757,7 +512,6 @@ def build_prep_database(
     *,
     cif_files_directory: str | None = None,
     prep_jobs: int = 4,
-    load_cif_cache: bool = False,  # deprecated — now reads directly from parse pkl
 ) -> dict[str, Any]:
     """Build (or refresh) the clustering prep directory.
 
@@ -768,8 +522,6 @@ def build_prep_database(
     cif_files_directory: deprecated; ignored because prep consumes parse JSON
         and parse-stage atom pkl files only.
     prep_jobs: number of parallel workers.
-    load_cif_cache: if True, build the coordinate index from parse-stage atom
-        pkl files.
 
     Returns a manifest dict.
     """
@@ -810,8 +562,7 @@ def build_prep_database(
         result = _ingest_cases_to_parquet(task_args[0])
         _merge_batch_stats(result, stats)
     else:
-        from concurrent.futures import ThreadPoolExecutor as _TPE
-        with _TPE(max_workers=actual_jobs) as executor:
+        with ProcessPoolExecutor(max_workers=actual_jobs) as executor:
             futures = [executor.submit(_ingest_cases_to_parquet, arg) for arg in task_args]
             for future in tqdm(as_completed(futures), total=len(futures),
                                desc="Parsing case bundles", unit="batch"):
@@ -822,6 +573,7 @@ def build_prep_database(
 
     # Collect source_paths and atom cache map from temp files
     atom_cache_map: dict[str, str] = {}
+    source_case_dir_map: dict[str, str] = {}
     for sources_file in sorted(tmp_phase1.glob("temp_*_sources.txt")):
         with sources_file.open(encoding="utf-8") as handle:
             for line in handle:
@@ -841,6 +593,18 @@ def build_prep_database(
                 if sp and ad and sp not in atom_cache_map:
                     atom_cache_map[sp] = ad
         atoms_file.unlink()
+    for source_cases_file in sorted(tmp_phase1.glob("temp_*_source_cases.jsonl")):
+        with source_cases_file.open(encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                entry = json.loads(text)
+                sp = entry.get("source_path", "")
+                source_case_dir = entry.get("source_case_dir", "")
+                if sp and source_case_dir and sp not in source_case_dir_map:
+                    source_case_dir_map[sp] = source_case_dir
+        source_cases_file.unlink()
 
     # Merge temp Parquet files into final Parquet files (metadata-only concatenation)
     for table_name in tqdm(PARQUET_TABLES, desc="Merging Parquet", unit="table"):
@@ -870,7 +634,13 @@ def build_prep_database(
     LOGGER.info("Phase 1 complete (%.1fs): %d ingested, %d source paths",
                 time.monotonic() - t1, stats["ingested"], len(all_source_paths))
 
-    # ── Phase 2: parse atom pkl → AtomArray binary cache ─────────────────
+    source_map_path = prep_dir / "source_case_dir_map.json"
+    source_map_path.write_text(
+        json.dumps(source_case_dir_map, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    LOGGER.info("Wrote %d source_path -> case_dir mappings", len(source_case_dir_map))
+
     cif_stats = {
         "cached": 0,
         "cached_alias": 0,
@@ -880,126 +650,6 @@ def build_prep_database(
         "errors": 0,
     }
     coord_chunk_sizes: list[int] = []
-    if load_cif_cache and all_source_paths:
-        t2 = time.monotonic()
-        LOGGER.info("Phase 2: caching atom arrays for %d parsed source files", len(all_source_paths))
-
-        # Collect (source_path, assembly_id) pairs from all tables
-        cache_pairs: dict[str, set[str | None]] = {}
-        input_assembly_sources: set[str] = set()
-        source_paths_ordered = sorted(all_source_paths)
-        for sp in source_paths_ordered:
-            cache_pairs.setdefault(sp, set()).add(None)
-
-        # Add assembly_ids from parquet tables (if we have the files)
-        try:
-            import pyarrow.parquet as pq
-            for table_name in ["dimers", "multimers", "antibody_complexes", "tcr_complexes"]:
-                p = prep_dir / f"{table_name}.parquet"
-                if not p.exists():
-                    continue
-                pf = pq.ParquetFile(p)
-                schema_names = set(pf.schema_arrow.names)
-                if "source_path" not in schema_names:
-                    continue
-                for rg_idx in range(pf.metadata.num_row_groups):
-                    cols = ["source_path"]
-                    if "assembly_id" in schema_names:
-                        cols.append("assembly_id")
-                    if "assembly_mode" in schema_names:
-                        cols.append("assembly_mode")
-                    tbl = pf.read_row_group(rg_idx, columns=cols)
-                    sp_list = tbl.column("source_path").to_pylist()
-                    aid_list = tbl.column("assembly_id").to_pylist() if "assembly_id" in schema_names else [None] * len(sp_list)
-                    mode_list = (
-                        tbl.column("assembly_mode").to_pylist()
-                        if "assembly_mode" in schema_names
-                        else [""] * len(sp_list)
-                    )
-                    for sp, aid, mode in zip(sp_list, aid_list, mode_list):
-                        if sp and sp in cache_pairs:
-                            cache_pairs[sp].add(aid if aid else None)
-                            if str(mode or "") == "input_assembly":
-                                input_assembly_sources.add(sp)
-        except ImportError:
-            pass
-
-        tasks = [(sp, sorted(aids, key=lambda x: x or ""), cif_files_directory)
-                 for sp, aids in sorted(cache_pairs.items())]
-
-        num_workers = max(1, min(actual_jobs, len(tasks)))
-        LOGGER.info("Dispatching %d source files to %d worker processes", len(tasks), num_workers)
-
-        tmp_phase2 = get_fast_temp_dir("phase2")
-        try:
-            if len(tasks) <= 1:
-                chunk_tasks = [(sp, aids, cfd) for sp, aids, cfd in tasks]
-                result = _cache_sources_to_temp((chunk_tasks, tmp_phase2, 0, atom_cache_map, input_assembly_sources))
-                _count_cif_entries(result, cif_stats)
-            else:
-                # Split source files into more chunks than workers so that large
-                # atom caches are spread across workers and output chunks.
-                grouped = _group_source_tasks(tasks, num_workers, atom_cache_map)
-                group_sizes = [
-                    sum(max(1, _atom_cache_task_weight(sp, aids, atom_cache_map)) for sp, aids, _cfd in group)
-                    for group in grouped
-                ]
-                group_summary = _summarize_ints(group_sizes)
-                LOGGER.info(
-                    "Phase 2 weighted task chunks: %d chunks, estimated size min=%d max=%d mean=%.1f bytes",
-                    group_summary["count"],
-                    group_summary["min"],
-                    group_summary["max"],
-                    group_summary["mean"],
-                )
-                task_args = [(chunk_tasks, tmp_phase2, wid, atom_cache_map, input_assembly_sources)
-                             for wid, chunk_tasks in enumerate(grouped)]
-                with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                    futures = [executor.submit(_cache_sources_to_temp, arg) for arg in task_args]
-                    for future in tqdm(as_completed(futures), total=len(futures),
-                                       desc="Caching parsed structures", unit="source"):
-                        try:
-                            _count_cif_entries(future.result(), cif_stats)
-                        except Exception as exc:
-                            LOGGER.warning("Phase 2 worker failed: %s", exc)
-
-            # Move temp files to chunked storage — no concatenation needed.
-            # Each worker's output becomes an independent chunk file.
-            temp_bins = sorted(tmp_phase2.glob("temp_*.bin"))
-            temp_idxs = sorted(tmp_phase2.glob("temp_*.idx"))
-            if temp_bins:
-                coords_dir = prep_dir / "cif_coords"
-                coords_dir.mkdir(parents=True, exist_ok=True)
-                for old_chunk in list(coords_dir.glob("chunk_*.bin")) + list(coords_dir.glob("chunk_*.idx")):
-                    old_chunk.unlink()
-                for chunk_id, (tbin, tidx) in enumerate(zip(temp_bins, temp_idxs)):
-                    coord_chunk_sizes.append(tbin.stat().st_size)
-                    shutil.move(str(tbin), str(coords_dir / f"chunk_{chunk_id}.bin"))
-                    shutil.move(str(tidx), str(coords_dir / f"chunk_{chunk_id}.idx"))
-
-        finally:
-            shutil.rmtree(tmp_phase2, ignore_errors=True)
-
-        LOGGER.info(
-            "Phase 2 complete (%.1fs): %d cached (%d aliases), %d skipped "
-            "(%d empty, %d missing atom cache, %d errors)",
-            time.monotonic() - t2,
-            cif_stats["cached"],
-            cif_stats["cached_alias"],
-            cif_stats["skipped"],
-            cif_stats["empty"],
-            cif_stats["missing_atom_cache"],
-            cif_stats["errors"],
-        )
-        if coord_chunk_sizes:
-            chunk_summary = _summarize_ints(coord_chunk_sizes)
-            LOGGER.info(
-                "Phase 2 output chunks: %d chunks, size min=%d max=%d mean=%.1f bytes",
-                chunk_summary["count"],
-                chunk_summary["min"],
-                chunk_summary["max"],
-                chunk_summary["mean"],
-            )
 
     # ── Final summary ────────────────────────────────────────────────────
     elapsed = time.monotonic() - t0
@@ -1014,6 +664,9 @@ def build_prep_database(
         "skipped_no_bundles": stats["skipped_no_bundles"],
         "errors": stats["errors"],
         "total_source_paths": len(all_source_paths),
+        "coordinate_backend": "pkl_atoms",
+        "source_case_dir_map": str(source_map_path),
+        "source_case_dir_map_entries": len(source_case_dir_map),
         "cif_cached": cif_stats["cached"],
         "cif_skipped": cif_stats["skipped"],
         "coord_cached": cif_stats["cached"],
@@ -1080,21 +733,9 @@ def iter_parquet_rows(
         pf.close()
 
 
-# Shared index: set by CLI so that dimer/multimer/antibody/TCR builders
-# reuse the same in-memory dict instead of each loading their own copy.
-_shared_coord_index: dict[str, tuple[Path, int, int]] | None = None
-_shared_coord_index_prep_dir: Path | None = None
+# Shared pkl reader reused by dimer/multimer/antibody/TCR builders.
 _shared_pkl_reader: Any = None
 _shared_pkl_reader_prep_dir: Path | None = None
-
-
-def set_shared_coord_index(
-    index: dict[str, tuple[Path, int, int]] | None,
-    prep_dir: str | Path | None = None,
-) -> None:
-    global _shared_coord_index, _shared_coord_index_prep_dir
-    _shared_coord_index = index
-    _shared_coord_index_prep_dir = Path(prep_dir).resolve() if prep_dir is not None else None
 
 
 def _get_pkl_reader(prep_dir: str | Path) -> Any | None:
@@ -1122,243 +763,11 @@ def _get_pkl_reader(prep_dir: str | Path) -> Any | None:
         return None
 
 
-def load_cif_coords_index(prep_dir: str | Path) -> dict[str, tuple[Path, int, int]] | None:
-    """Load all chunk idx files from ``cif_coords/``.
-
-    Returns ``{blob_key: (chunk_bin_path, offset, length)}``, or None if the
-    chunk directory does not exist.  Also accepts legacy single-file
-    ``cif_coords.idx`` for backward compatibility.
-
-    When :func:`set_shared_coord_index` has been called the cached value is
-    returned immediately, avoiding duplicate loads.
-    """
-    prep_dir = Path(prep_dir).resolve()
-    if _shared_coord_index is not None and (
-        _shared_coord_index_prep_dir is None or _shared_coord_index_prep_dir == prep_dir
-    ):
-        return _shared_coord_index
-    coords_dir = prep_dir / "cif_coords"
-    index: dict[str, tuple[Path, int, int]] = {}
-
-    # New chunked format
-    if coords_dir.is_dir():
-        for idx_path in sorted(coords_dir.glob("chunk_*.idx")):
-            chunk_id = idx_path.stem.replace("chunk_", "")
-            bin_path = coords_dir / f"chunk_{chunk_id}.bin"
-            if not bin_path.exists():
-                continue
-            with idx_path.open("rb") as fh:
-                while True:
-                    entry = fh.read(_IDX_ENTRY_SIZE)
-                    if len(entry) < _IDX_ENTRY_SIZE:
-                        break
-                    source_hash, offset, length = _IDX_ENTRY_STRUCT.unpack(entry)
-                    key = source_hash.decode("ascii").rstrip("\0")
-                    index[key] = (bin_path, offset, length)
-        if index:
-            return index
-
-    # Legacy single-file format
-    idx_path = prep_dir / "cif_coords.idx"
-    bin_path = prep_dir / "cif_coords.bin"
-    if idx_path.exists() and bin_path.exists():
-        with idx_path.open("rb") as fh:
-            while True:
-                entry = fh.read(_IDX_ENTRY_SIZE)
-                if len(entry) < _IDX_ENTRY_SIZE:
-                    break
-                source_hash, offset, length = _IDX_ENTRY_STRUCT.unpack(entry)
-                key = source_hash.decode("ascii").rstrip("\0")
-                index[key] = (bin_path, offset, length)
-        if index:
-            return index
-
-    return None
-
-
-def load_cif_from_prep(
-    prep_dir: str | Path,
-    source_path: str,
-    assembly_id: str | None = None,
-    *,
-    index: dict[str, tuple[Path, int, int]] | None = None,
-    mmap: Any = None,
-) -> dict[str, Any] | None:
-    """Fetch a cached AtomArray + metadata from the binary index.
-
-    For the new chain-level format this returns a single-chain atom array
-    when *assembly_id* is None (asymmetric unit).  For full-assembly blobs
-    (legacy format) the behaviour is unchanged.
-
-    Returns a dict with ``atom_array``, ``quality``, ``chain_ops`` keys,
-    or None if not cached.
-    """
-    idx = index or load_cif_coords_index(prep_dir)
-    if idx is None:
-        return None
-    blob_key = _blob_index_key(source_path, assembly_id)
-    entry = idx.get(blob_key)
-    if entry is None:
-        return None
-
-    return _read_blob(entry)
-
-
-def load_chain_from_prep(
-    prep_dir: str | Path,
-    source_path: str,
-    label_asym_id: str,
-    *,
-    assembly_id: str | None = None,
-    index: dict[str, tuple[Path, int, int]] | None = None,
-) -> dict[str, Any] | None:
-    """Fetch a single-chain AtomArray from the per-chain index.
-
-    Returns a dict with ``atom_array``, ``quality``, ``chain_ops`` keys,
-    or None if the chain is not cached.
-    """
-    idx = index or load_cif_coords_index(prep_dir)
-    if idx is None:
-        return None
-    blob_key = _chain_blob_key(source_path, assembly_id, label_asym_id)
-    entry = idx.get(blob_key)
-    if entry is None:
-        return None
-    return _read_blob(entry)
-
-
-# Per-session blob I/O cache: open file descriptors reused via os.pread().
-# os.pread() is thread-safe (no shared seek pointer), so concurrent reads
-# on the same chunk file never interfere.
-_blob_fd_cache: dict[Path, int] = {}
-_blob_fd_cache_lock = threading.Lock()
-_chain_atom_cache: OrderedDict[tuple[str, str | None, str], tuple[Any, int]] = OrderedDict()
-_chain_atom_cache_lock = threading.Lock()
-_chain_atom_cache_max_bytes = 128 * 1024 * 1024
-_chain_atom_cache_bytes = 0
-
-
-def _atom_array_nbytes(atom_array: Any) -> int:
-    """Estimate the resident bytes retained by one AtomArray."""
-
-    seen: set[int] = set()
-    total = 0
-    values: list[Any] = [getattr(atom_array, "coord", None), getattr(atom_array, "box", None)]
-    try:
-        values.extend(
-            atom_array.get_annotation(category)
-            for category in atom_array.get_annotation_categories()
-        )
-    except (AttributeError, KeyError, TypeError):
-        pass
-    for value in values:
-        nbytes = getattr(value, "nbytes", None)
-        if nbytes is None or id(value) in seen:
-            continue
-        seen.add(id(value))
-        total += int(nbytes)
-    return max(total, int(getattr(getattr(atom_array, "coord", None), "nbytes", 0) or 0))
-
-
-def set_chain_atom_cache_limit(max_bytes: int | None) -> None:
-    """Set the in-process chain AtomArray cache byte budget."""
-
-    global _chain_atom_cache_max_bytes, _chain_atom_cache_bytes
-    _chain_atom_cache_max_bytes = max(0, int(max_bytes or 0))
-    if _chain_atom_cache_max_bytes == 0:
-        clear_chain_atom_cache()
-        return
-    with _chain_atom_cache_lock:
-        while _chain_atom_cache and _chain_atom_cache_bytes > _chain_atom_cache_max_bytes:
-            _, (_, evicted_bytes) = _chain_atom_cache.popitem(last=False)
-            _chain_atom_cache_bytes -= evicted_bytes
-
-
-def clear_chain_atom_cache() -> None:
-    """Clear cached single-chain AtomArrays loaded from prep chunks."""
-
-    global _chain_atom_cache_bytes
-    with _chain_atom_cache_lock:
-        _chain_atom_cache.clear()
-        _chain_atom_cache_bytes = 0
-
-
-def _read_blob(entry: tuple[Path, int, int]) -> dict[str, Any] | None:
-    bin_path, offset, length = entry
-    with _blob_fd_cache_lock:
-        fd = _blob_fd_cache.get(bin_path)
-        if fd is None:
-            try:
-                fd = _os.open(str(bin_path), _os.O_RDONLY)
-                _blob_fd_cache[bin_path] = fd
-            except OSError:
-                return None
-    try:
-        data = _os.pread(fd, length, offset)
-        return pickle.loads(_decompress_blob(data))
-    except Exception:
-        LOGGER.debug("Failed to read prep coordinate blob %s:%d+%d", bin_path, offset, length, exc_info=True)
-        return None
-
-
 def close_blob_handles() -> None:
-    """Close all cached chunk file descriptors (call after extraction finishes)."""
+    """Clear process-local prep readers."""
     global _shared_pkl_reader, _shared_pkl_reader_prep_dir
-    clear_chain_atom_cache()
-    with _blob_fd_cache_lock:
-        for fd in _blob_fd_cache.values():
-            try:
-                _os.close(fd)
-            except Exception:
-                pass
-        _blob_fd_cache.clear()
     _shared_pkl_reader = None
     _shared_pkl_reader_prep_dir = None
-
-
-def load_chain_atoms(
-    prep_dir: str | Path,
-    source_path: str,
-    label_asym_id: str,
-    *,
-    assembly_id: str | None = None,
-    index: dict[str, tuple[Path, int, int]] | None = None,
-) -> "AtomArray | None":
-    """Load a single-chain AtomArray from the chain-level index.
-
-    Convenience wrapper around :func:`load_chain_from_prep` that returns
-    just the atom array (or None).  Imported by extraction functions.
-    """
-    cache_key = (str(source_path), assembly_id, str(label_asym_id))
-    with _chain_atom_cache_lock:
-        cached = _chain_atom_cache.get(cache_key)
-        if cached is not None:
-            _chain_atom_cache.move_to_end(cache_key)
-            return cached[0]
-    loaded = load_chain_from_prep(
-        prep_dir,
-        source_path,
-        label_asym_id,
-        assembly_id=assembly_id,
-        index=index,
-    )
-    if loaded is None:
-        return None
-    atoms = loaded.get("atom_array")
-    if atoms is not None and _chain_atom_cache_max_bytes > 0:
-        global _chain_atom_cache_bytes
-        atom_bytes = _atom_array_nbytes(atoms)
-        with _chain_atom_cache_lock:
-            existing = _chain_atom_cache.pop(cache_key, None)
-            if existing is not None:
-                _chain_atom_cache_bytes -= existing[1]
-            _chain_atom_cache[cache_key] = (atoms, atom_bytes)
-            _chain_atom_cache_bytes += atom_bytes
-            _chain_atom_cache.move_to_end(cache_key)
-            while _chain_atom_cache and _chain_atom_cache_bytes > _chain_atom_cache_max_bytes:
-                _, (_, evicted_bytes) = _chain_atom_cache.popitem(last=False)
-                _chain_atom_cache_bytes -= evicted_bytes
-    return atoms
 
 
 def assemble_atom_array_from_chains(
@@ -1369,38 +778,21 @@ def assemble_atom_array_from_chains(
     assembly_id: str | None = None,
     index: dict[str, tuple[Path, int, int]] | None = None,
 ) -> "AtomArray | None":
-    """Load multiple chain blobs and concatenate into one AtomArray.
+    """Load multiple chains from parse-stage atom pkl caches.
 
     Returns None if any chain is not found.  Used by dimer/multimer/complex
-    extraction to avoid loading the full assembly blob.
+    extraction.
     """
-    import biotite.structure as _struc
-    idx = index or load_cif_coords_index(prep_dir)
-    arrays: list[Any] = []
-    for lbl, sym in chain_specs:
-        aa = load_chain_atoms(prep_dir, source_path, lbl, assembly_id=assembly_id, index=idx)
-        if aa is None:
-            reader = _get_pkl_reader(prep_dir)
-            if reader is not None:
-                aa = reader.load_chain(
-                    source_path,
-                    lbl,
-                    assembly_id=assembly_id,
-                    filter_hetero=False,
-                )
-        if aa is None or len(aa) == 0:
-            return None
-        if sym is not None and hasattr(aa, "sym_id"):
-            sym_mask = aa.sym_id == sym
-            if not bool(sym_mask.any()):
-                return None
-            aa = aa[sym_mask].copy()
-            if len(aa) == 0:
-                return None
-        arrays.append(aa)
-    if not arrays:
-        return None
-    return _struc.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+    del index
+    reader = _get_pkl_reader(prep_dir)
+    if reader is not None:
+        return reader.load_chains(
+            source_path,
+            chain_specs,
+            assembly_id=assembly_id,
+            filter_hetero=False,
+        )
+    return None
 
 
 # ── backward-compatible wrappers (for higher-order collect functions) ───────

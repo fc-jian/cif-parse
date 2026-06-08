@@ -571,6 +571,18 @@ def _nonempty_file(path: Path) -> bool:
         return False
 
 
+def _single_nonempty_assembly_atom_cache(atoms_dir: Path) -> Path | None:
+    try:
+        candidates = sorted(
+            path
+            for path in atoms_dir.glob("*.pkl")
+            if path.name != "_none.pkl" and _nonempty_file(path)
+        )
+    except OSError:
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _validate_existing_atom_cache(
     payloads: list[tuple[dict[str, Any], Path, Path]],
 ) -> list[str]:
@@ -583,12 +595,14 @@ def _validate_existing_atom_cache(
         if not assembly_id:
             assembly_id = _assembly_id_from_result_path(result_path) or ""
         atoms_dir = atom_root / "atoms"
-        required = [atoms_dir / "_none.pkl"]
         if assembly_id:
-            required.append(atoms_dir / f"{assembly_id}.pkl")
-        for atom_path in required:
-            if not _nonempty_file(atom_path):
-                missing.append(str(atom_path))
+            asm_path = atoms_dir / f"{assembly_id}.pkl"
+            if not _nonempty_file(asm_path):
+                missing.append(str(asm_path))
+            continue
+        au_path = atoms_dir / "_none.pkl"
+        if not _nonempty_file(au_path) and _single_nonempty_assembly_atom_cache(atoms_dir) is None:
+            missing.append(str(au_path))
     return missing
 
 

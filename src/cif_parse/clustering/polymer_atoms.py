@@ -47,6 +47,23 @@ def prepare_polymer_atoms_for_usalign(
     return copied
 
 
+def select_trace_atoms_for_usalign(atom_array: AtomArray) -> AtomArray:
+    """Keep only representative backbone atoms for USalign input PDBs.
+
+    Protein TM-score uses CA atoms; nucleic-acid alignments need P atoms.
+    Keeping both lets mixed protein/nucleic-acid complexes remain analyzable
+    while cutting most intermediate PDB volume.
+    """
+
+    if not hasattr(atom_array, "atom_name"):
+        return atom_array
+    atom_names = np.asarray([str(value).strip().upper() for value in atom_array.atom_name])
+    mask = np.isin(atom_names, ["CA", "P"])
+    if not bool(mask.any()):
+        return atom_array
+    return atom_array[mask]
+
+
 def polymer_residue_counts_by_chain(atom_array: AtomArray) -> dict[str, int]:
     """Count residues independently for each output PDB chain."""
 

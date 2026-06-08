@@ -153,6 +153,12 @@ def preflight_assembly_atom_counts(path: str | Path, *, cif_file: CIFFile | None
     _ATOMS_PER_RES = {"protein": 8, "rna": 20, "dna": 20, "unknown": 5}
     chain_est: dict[str, int] = {}
     entity_info: dict[str, tuple[str, int]] = {}
+    poly_seq_lengths: dict[str, int] = defaultdict(int)
+    for row in _category_rows(cif_file, "entity_poly_seq"):
+        eid = row.get("entity_id")
+        monomer_id = row.get("mon_id")
+        if eid and monomer_id:
+            poly_seq_lengths[eid] += 1
     for row in _category_rows(cif_file, "entity"):
         eid = row.get("id")
         etype = (row.get("type") or "").lower()
@@ -163,13 +169,13 @@ def preflight_assembly_atom_counts(path: str | Path, *, cif_file: CIFFile | None
         if not eid:
             continue
         seq = _sanitize_sequence(row.get("pdbx_seq_one_letter_code_can"))
-        length = len(seq) if seq else 0
+        length = len(seq) if seq else int(poly_seq_lengths.get(eid, 0))
         ptype = (row.get("type") or "").lower()
         etype = entity_info.get(eid, ("polymer", 0))[0]
-        if "ribo" in ptype:
-            apx = _ATOMS_PER_RES["rna"]
-        elif "deoxyribo" in ptype:
+        if "deoxyribo" in ptype:
             apx = _ATOMS_PER_RES["dna"]
+        elif "ribo" in ptype:
+            apx = _ATOMS_PER_RES["rna"]
         elif etype == "polymer":
             apx = _ATOMS_PER_RES["protein"]
         else:
@@ -224,6 +230,11 @@ def _normalize_cif_value(value: object) -> str | None:
 
 def _ordered_append(values: list[str], value: str | None) -> None:
     if value and value not in values:
+        values.append(value)
+
+
+def _append_ordered_value(values: list[str], value: str | None) -> None:
+    if value:
         values.append(value)
 
 
@@ -607,7 +618,7 @@ def _build_entity_map(cif_file: CIFFile) -> dict[str, dict[str, Any]]:
                 "monomer_ids": [],
             },
         )
-        _ordered_append(entity["monomer_ids"], monomer_id)
+        _append_ordered_value(entity["monomer_ids"], monomer_id)
 
     for row in _category_rows(cif_file, "pdbx_entity_nonpoly"):
         entity_id = row.get("entity_id")
@@ -746,7 +757,7 @@ def _build_atom_site_stats(cif_file: CIFFile) -> dict[str, dict[str, Any]]:
         if residue_key not in residue_seen[label_asym_id]:
             residue_seen[label_asym_id].add(residue_key)
             chain_stats["residue_count"] += 1
-            _ordered_append(chain_stats["residue_monomer_ids"], component_id)
+            _append_ordered_value(chain_stats["residue_monomer_ids"], component_id)
             if label_seq_id is not None:
                 try:
                     resolved_label_seq_id = int(label_seq_id)
@@ -1495,14 +1506,16 @@ def read_chain_inventory(
 
         monomer_ids = list(chain_stats.get("residue_monomer_ids") or entity.get("monomer_ids") or [])
         sequence = entity.get("sequence")
+        fallback_sequence_from_monomers = False
         if sequence is None and monomer_ids:
             sequence = "-".join(monomer_ids)
+            fallback_sequence_from_monomers = True
         component_ids = list(chain_stats.get("component_ids") or [])
 
         if _is_hoh_water_chain(entity, monomer_ids, component_ids, sequence):
             continue
 
-        length = len(sequence or "")
+        length = len(monomer_ids) if fallback_sequence_from_monomers else len(sequence or "")
         residue_count = int(chain_stats.get("residue_count") or len(monomer_ids))
         if entity.get("entity_type") != "polymer":
             length = residue_count

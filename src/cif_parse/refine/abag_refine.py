@@ -12,10 +12,10 @@ from typing import Any
 import numpy as np
 from scipy.spatial import cKDTree
 
-from cif_parse.clustering.prep import (
-    assemble_atom_array_from_chains,
-    load_cif_coords_index,
-    load_chain_from_prep,
+from cif_parse.clustering.atom_cache import (
+    PklAtomReader,
+    load_source_case_dir_map,
+    resolve_cases_root,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -375,17 +375,28 @@ def refine_antibody_complex(
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     prep_dir = Path(prep_dir)
-    prep_index = load_cif_coords_index(prep_dir)
+    pkl_reader = PklAtomReader(
+        resolve_cases_root(prep_dir),
+        load_source_case_dir_map(prep_dir),
+    )
     warnings: list[str] = []
 
     # ---- load per-chain atom arrays ----------------------------------------
     chain_arrays: dict[str, Any] = {}
     for cid in antibody_chain_ids + antigen_chain_ids:
-        blob = load_chain_from_prep(prep_dir, source_path, cid, assembly_id=assembly_id, index=prep_index)
-        if blob is None or blob.get("atom_array") is None:
+        aa = None
+        for aid in (assembly_id, None):
+            aa = pkl_reader.load_chain(
+                source_path,
+                cid,
+                assembly_id=aid,
+                filter_hetero=False,
+            )
+            if aa is not None:
+                break
+        if aa is None:
             warnings.append(f"chain {cid} atom array not found in prep")
             continue
-        aa = blob["atom_array"]
         chain_arrays[cid] = aa
 
     if not chain_arrays:

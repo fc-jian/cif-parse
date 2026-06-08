@@ -30,6 +30,7 @@ from cif_parse.clustering.parallel import iter_threaded_results, normalize_worke
 from cif_parse.clustering.polymer_atoms import (
     prepare_polymer_atoms_for_usalign,
     select_polymer_chain_atoms,
+    select_trace_atoms_for_usalign,
     validate_usalign_chain_lengths,
 )
 from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
@@ -493,6 +494,7 @@ def extract_multimer_structure(
             f"No analyzable atoms left for multimer {observation.multimer_observation_id}"
         )
 
+    multimer_atoms = select_trace_atoms_for_usalign(multimer_atoms)
     _, residue_names = get_residues(multimer_atoms)
     residue_count = int(len(residue_names))
     validate_usalign_chain_lengths(

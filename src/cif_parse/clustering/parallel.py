@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import threading
 from collections.abc import Iterator
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -11,21 +10,6 @@ from tqdm import tqdm
 
 ItemT = TypeVar("ItemT")
 ResultT = TypeVar("ResultT")
-
-# Global semaphore to cap total USalign subprocesses across ALL stages
-# (monomer, dimer, multimer, antibody, TCR).
-_global_usalign_semaphore: threading.BoundedSemaphore | None = None
-_global_usalign_limit: int | None = None
-
-
-def set_global_usalign_limit(max_concurrent: int) -> None:
-    """Cap the total number of concurrent USalign processes across all stages."""
-    global _global_usalign_limit, _global_usalign_semaphore
-    max_concurrent = normalize_worker_count(max_concurrent)
-    if _global_usalign_limit != max_concurrent:
-        _global_usalign_limit = max_concurrent
-        _global_usalign_semaphore = threading.BoundedSemaphore(max_concurrent)
-
 
 @dataclass(slots=True)
 class AlignmentTask:
@@ -44,13 +28,7 @@ def normalize_worker_count(value: int | None) -> int:
 
 
 def _semaphored_runner(runner, query, target, **kwargs):
-    if _global_usalign_semaphore is not None:
-        _global_usalign_semaphore.acquire()
-    try:
-        return runner(query, target, **kwargs)
-    finally:
-        if _global_usalign_semaphore is not None:
-            _global_usalign_semaphore.release()
+    return runner(query, target, **kwargs)
 
 
 def run_alignment_tasks(

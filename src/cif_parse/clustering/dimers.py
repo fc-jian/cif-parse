@@ -33,6 +33,7 @@ from cif_parse.clustering.parallel import normalize_worker_count
 from cif_parse.clustering.polymer_atoms import (
     prepare_polymer_atoms_for_usalign,
     select_polymer_chain_atoms,
+    select_trace_atoms_for_usalign,
     validate_usalign_chain_lengths,
 )
 from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
@@ -620,6 +621,7 @@ def extract_dimer_structure(
         )
         dimer_atoms = interface_selection.atom_array
 
+    dimer_atoms = select_trace_atoms_for_usalign(dimer_atoms)
     _, residue_names = get_residues(dimer_atoms)
     residue_count = int(len(residue_names))
     validate_usalign_chain_lengths(
@@ -665,10 +667,9 @@ def extract_dimer_structure(
 
 def _init_dimer_extraction_worker(prep_dir: str) -> None:
     global _dimer_worker_prep_dir, _dimer_worker_coord_index
-    from cif_parse.clustering.prep import load_cif_coords_index
 
     _dimer_worker_prep_dir = prep_dir
-    _dimer_worker_coord_index = load_cif_coords_index(prep_dir)
+    _dimer_worker_coord_index = None
 
 
 def _extract_dimer_observation_group(

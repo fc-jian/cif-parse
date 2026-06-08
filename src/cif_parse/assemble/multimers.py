@@ -106,12 +106,29 @@ def _detect_communities(
     *,
     resolution: float,
     min_member_instances: int,
-) -> tuple[list[list[str]], str]:
+    bridge_pruning_min_component_size: int,
+) -> tuple[list[list[str]], str, nx.Graph, list[tuple[str, str]]]:
     if graph.number_of_edges() == 0:
-        return [], "none"
+        return [], "none", graph.copy(), []
+
+    community_graph = graph.copy()
+    pruned_bridge_edges: list[tuple[str, str]] = []
+    for component_nodes in nx.connected_components(graph):
+        if len(component_nodes) <= max(min_member_instances, bridge_pruning_min_component_size):
+            continue
+        subgraph = graph.subgraph(component_nodes)
+        weights = sorted(float(data.get("weight", 0.0) or 0.0) for _, _, data in subgraph.edges(data=True))
+        if not weights:
+            continue
+        median_weight = weights[len(weights) // 2]
+        for u, v in nx.bridges(subgraph):
+            weight = float(graph.edges[u, v].get("weight", 0.0) or 0.0)
+            if weight <= median_weight and community_graph.has_edge(u, v):
+                community_graph.remove_edge(u, v)
+                pruned_bridge_edges.append(tuple(sorted((u, v))))
 
     communities = nx.community.louvain_communities(
-        graph,
+        community_graph,
         weight="weight",
         resolution=resolution,
         seed=0,
@@ -123,7 +140,10 @@ def _detect_communities(
         if len(community) >= min_member_instances
     ]
     normalized.sort(key=tuple)
-    return normalized, "louvain_communities"
+    method = "louvain_communities"
+    if pruned_bridge_edges:
+        method = "bridge_pruned_louvain_communities"
+    return normalized, method, community_graph, sorted(set(pruned_bridge_edges))
 
 
 def identify_tight_multimers(
@@ -178,10 +198,11 @@ def identify_tight_multimers(
             buried_area=buried_area,
         )
 
-    components, clustering_method = _detect_communities(
+    components, clustering_method, community_graph, pruned_bridge_edges = _detect_communities(
         graph,
         resolution=louvain_resolution,
         min_member_instances=min_member_instances,
+        bridge_pruning_min_component_size=large_component_warning_size,
     )
 
     multimers: list[TightMultimerRecord] = []
@@ -250,7 +271,14 @@ def identify_tight_multimers(
                 )
         warnings: list[str] = []
         if len(component) >= large_component_warning_size:
-            warnings.append("large_component_without_bridge_pruning")
+            warnings.append("large_component_after_bridge_pruning")
+        component_pruned_edges = [
+            edge
+            for edge in pruned_bridge_edges
+            if edge[0] in component or edge[1] in component
+        ]
+        if component_pruned_edges:
+            warnings.append("bridge_edges_pruned")
 
         support_score = (
             round(
@@ -289,7 +317,8 @@ def identify_tight_multimers(
                     "edge_weight_metric": "buried_area / 1000.0",
                     "community_detection_method": clustering_method,
                     "community_detection_resolution": louvain_resolution,
-                    "bridge_pruning_applied": False,
+                    "bridge_pruning_applied": True,
+                    "bridge_pruned_edges": [list(edge) for edge in component_pruned_edges],
                     "min_member_instances": min_member_instances,
                     "large_component_warning_size": large_component_warning_size,
                     "member_instance_source": "dimer_interface_instances",
@@ -298,6 +327,7 @@ def identify_tight_multimers(
                     ),
                     "component_assembly_ids": component_assembly_ids,
                     "graph_edge_count_after_buried_area_filter": graph.number_of_edges(),
+                    "graph_edge_count_after_bridge_pruning": community_graph.number_of_edges(),
                     "internal_edges": [list(edge) for edge in sorted(internal_edges)],
                 },
                 warnings=warnings,

@@ -953,11 +953,11 @@ def _dump_atom_cache(
 
         # For pre-split assembly files the input CIF already contains the
         # fully expanded assembly; there is no separate asymmetric unit.
-        # Keep _none.pkl as an alias for consumers that probe AU coordinates.
+        # Consumers that probe AU coordinates special-case the missing
+        # ``_none.pkl`` by falling back to the single assembly cache.
         if is_input_assembly:
             asm_id = selected_assembly_id or "1"
             asm_cache_path = atoms_dir / f"{asm_id}.pkl"
-            au_cache_path = atoms_dir / "_none.pkl"
             if not asm_cache_path.exists():
                 try:
                     atom_array = get_structure_with_altloc_fallback(
@@ -970,14 +970,6 @@ def _dump_atom_cache(
                         asm_cache_path.write_bytes(blob)
                 except Exception:
                     LOGGER.debug("Failed to cache assembly for %s", input_path)
-            if asm_cache_path.exists() and not au_cache_path.exists():
-                try:
-                    au_cache_path.symlink_to(asm_cache_path.name)
-                except OSError:
-                    try:
-                        au_cache_path.hardlink_to(asm_cache_path)
-                    except OSError:
-                        au_cache_path.write_bytes(asm_cache_path.read_bytes())
             return
 
         # Always cache asymmetric unit (needed by monomer extraction)

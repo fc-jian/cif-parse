@@ -203,11 +203,7 @@ def _resolve_worker_counts(args: argparse.Namespace, config_defaults: dict[str, 
 
 
 def _set_shared_prep_index(prep_dir: str | None) -> None:
-    if prep_dir:
-        from cif_parse.clustering.prep import load_cif_coords_index, set_shared_coord_index
-
-        shared = load_cif_coords_index(prep_dir)
-        set_shared_coord_index(shared, prep_dir)
+    return None
 
 
 def _close_prep_handles(prep_dir: str | None) -> None:
@@ -250,7 +246,6 @@ def _ensure_prep_for_full_command(args: argparse.Namespace) -> str | None:
         inputs=args.inputs,
         prep_dir=temp_prep_dir,
         prep_jobs=args.jobs,
-        load_cif_cache=False,
     )
     args.prep_dir = temp_prep_dir
     return str(temp_prep_dir)
@@ -294,7 +289,7 @@ def build_parser(
         "--prep-dir",
         type=Path,
         default=Path("clustering_prep"),
-        help="Output directory for prep files (Parquet + cif_coords)",
+        help="Output directory for prep files (Parquet + source maps)",
     )
     prep_parser.add_argument(
         "--cif-files-directory",
@@ -307,12 +302,6 @@ def build_parser(
         type=int,
         default=int(clustering_defaults.get("jobs", 4)),
         help="Number of parallel workers for prep database ingestion",
-    )
-    prep_parser.add_argument(
-        "--no-cif-cache",
-        action="store_true",
-        default=False,
-        help="Skip building the coordinate index from parse-stage atom pkl files",
     )
     prep_parser.add_argument(
         "--config",
@@ -343,8 +332,8 @@ def build_parser(
         default=None,
         help=(
             "Path to a prep directory built with `cif-parse-cluster prep`. When "
-            "provided, clustering reads case data only from prep Parquet/cif_coords "
-            "and --inputs is optional."
+            "provided, clustering reads case rows from prep Parquet and coordinates "
+            "from parse-stage atom pkl caches; --inputs is optional."
         ),
     )
     parser.add_argument(
@@ -604,7 +593,6 @@ def _run_prep(args: argparse.Namespace) -> int:
         prep_dir=args.prep_dir,
         cif_files_directory=None,
         prep_jobs=args.prep_jobs,
-        load_cif_cache=False,  # deprecated — now reads directly from parse pkl
     )
     LOGGER.info("Prep complete: %s", result)
     return 0
@@ -699,12 +687,6 @@ def _run_structure(
         except Exception:
             LOGGER.warning("[fallback] Failed to init PklAtomReader", exc_info=True)
 
-    cif_idx_for_pipeline: dict | None = None
-    if prep_dir:
-        from cif_parse.clustering.prep import load_cif_coords_index
-
-        cif_idx_for_pipeline = load_cif_coords_index(prep_dir)
-
     quality_cache: dict[str, Any] = {}
     atom_array_cache: dict[str, Any] = {}
     import threading
@@ -712,7 +694,6 @@ def _run_structure(
     extract_lock = threading.Lock()
 
     def _pipeline_extract(monomer) -> Any | None:
-        nonlocal cif_idx_for_pipeline
         from cif_parse.clustering.protein_structures import (
             extract_protein_monomer_structure,
             load_entry_quality_metadata_from_prep,
@@ -741,34 +722,6 @@ def _run_structure(
                         monomer.source_path, monomer.label_asym_id, None,
                         filter_hetero=False,
                     )
-            # Fallback: prep cif_coords blob index
-            if found is None and cif_idx_for_pipeline is not None:
-                from cif_parse.clustering.prep import load_chain_atoms, load_cif_from_prep
-                for aid in (monomer.assembly_id, None):
-                    if not aid:
-                        continue
-                    found = load_chain_atoms(
-                        prep_dir, monomer.source_path, monomer.label_asym_id,
-                        assembly_id=str(aid), index=cif_idx_for_pipeline,
-                    )
-                    if found is not None:
-                        break
-                if found is None:
-                    found = load_chain_atoms(
-                        prep_dir, monomer.source_path, monomer.label_asym_id,
-                        assembly_id=None, index=cif_idx_for_pipeline,
-                    )
-                if found is None:
-                    for aid in (monomer.assembly_id, None):
-                        if not aid:
-                            continue
-                        ca = load_cif_from_prep(
-                            prep_dir, monomer.source_path, str(aid),
-                            index=cif_idx_for_pipeline,
-                        )
-                        if ca is not None and ca.get("atom_array") is not None:
-                            found = ca["atom_array"]
-                            break
             if found is not None:
                 with extract_lock:
                     atom_array_cache[atom_key] = found
@@ -815,7 +768,6 @@ def _run_structure(
         extract_fn=_pipeline_extract,
         protein_subcluster_by_sequence=args.protein_subcluster_by_sequence,
         prep_dir=prep_dir,
-        cif_idx=cif_idx_for_pipeline,
     )
     manifest = result.get("manifest", {})
     LOGGER.info(
@@ -989,9 +941,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.antibody_complex_interface_residue_cutoff <= 0:
         parser.error("--antibody-complex-interface-residue-cutoff must be > 0")
 
-    from cif_parse.clustering.parallel import set_global_usalign_limit
-
-    set_global_usalign_limit(args.usalign_jobs)
     _warn_cif_override(args)
     if stage_subcommand is None:
         prep_dir = _ensure_prep_for_full_command(args)

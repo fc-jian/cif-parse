@@ -437,10 +437,10 @@ def build_review_report(results: list[dict[str, object]]) -> dict[str, object]:
                 "tcr_complex_warning_counts",
                 "unpaired_tcr_chain",
             ),
-            "large_multimer_without_bridge_pruning_warning": _top_warning_cases(
+            "large_multimer_after_bridge_pruning_warning": _top_warning_cases(
                 successful_results,
                 "multimer_warning_counts",
-                "large_component_without_bridge_pruning",
+                "large_component_after_bridge_pruning",
             ),
         }
     }

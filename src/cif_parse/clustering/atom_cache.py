@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import pickle
 import zlib
 from functools import lru_cache
@@ -50,6 +51,19 @@ def resolve_cases_root(prep_dir: str | Path) -> Path:
 
 def load_source_case_dir_map(prep_dir: str | Path) -> dict[str, str]:
     """Load source_path -> source_case_dir from prep Parquet tables."""
+
+    map_path = Path(prep_dir) / "source_case_dir_map.json"
+    if map_path.exists():
+        try:
+            data = json.loads(map_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {
+                    str(source_path): str(source_case_dir)
+                    for source_path, source_case_dir in data.items()
+                    if source_path and source_case_dir
+                }
+        except Exception:
+            LOGGER.debug("Failed to load source_case_dir map from %s", map_path, exc_info=True)
 
     def _read_table(table_name: str, mapping: dict[str, str]) -> None:
         import pyarrow.parquet as pq
@@ -106,6 +120,18 @@ def _candidate_atoms_dirs(root: Path, case_id: str) -> list[Path]:
     return unique
 
 
+def _single_assembly_cache_path(atoms_dir: Path) -> Path | None:
+    try:
+        candidates = sorted(
+            path
+            for path in atoms_dir.glob("*.pkl")
+            if path.name != "_none.pkl" and path.is_file()
+        )
+    except OSError:
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
 class PklAtomReader:
     """Read AtomArrays from parse ``atoms/{assembly_id}.pkl`` caches."""
 
@@ -150,6 +176,10 @@ class PklAtomReader:
         cache_key = (str(atoms_dir.resolve(strict=False)), assembly_id)
         if cache_key not in self._aa_cache:
             pkl_path = atoms_dir / f"{assembly_id or '_none'}.pkl"
+            if assembly_id is None and not pkl_path.exists():
+                fallback_path = _single_assembly_cache_path(atoms_dir)
+                if fallback_path is not None:
+                    pkl_path = fallback_path
             raw = _load_pkl_bytes(str(pkl_path))
             if raw is None:
                 return None

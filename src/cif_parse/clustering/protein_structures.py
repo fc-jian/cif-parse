@@ -21,6 +21,7 @@ from cif_parse.clustering.parallel import normalize_worker_count
 from cif_parse.clustering.polymer_atoms import (
     prepare_polymer_atoms_for_usalign,
     select_polymer_chain_atoms,
+    select_trace_atoms_for_usalign,
     validate_usalign_chain_lengths,
 )
 from cif_parse.clustering.usalign import run_usalign_command
@@ -31,7 +32,7 @@ from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_a
 LOGGER = logging.getLogger(__name__)
 
 SKIP_QUALITY_METADATA = object()
-USALIGN_PDB_FORMAT_VERSION = 2
+USALIGN_PDB_FORMAT_VERSION = 3
 
 ALIGNED_LENGTH_RE = re.compile(
     r"Aligned length=\s*(?P<aligned_length>\d+),\s*RMSD=\s*(?P<rmsd>[0-9.]+),\s*Seq_ID=.*"
@@ -96,6 +97,10 @@ def _coerce_chain_id_for_pdb(atom_array: AtomArray) -> AtomArray:
     if atom_array.array_length() == 0:
         return atom_array
     return prepare_polymer_atoms_for_usalign(atom_array, chain_id="A")
+
+
+def _prepare_trace_chain_for_pdb(atom_array: AtomArray) -> AtomArray:
+    return _coerce_chain_id_for_pdb(select_trace_atoms_for_usalign(atom_array))
 
 
 @dataclass(slots=True)
@@ -274,14 +279,23 @@ def extract_monomer_from_pkl(
     if resolved_count <= 2:
         return None
 
+    chain_atoms = _prepare_trace_chain_for_pdb(chain_atoms)
+    _, residue_names = get_residues(chain_atoms)
+    resolved_count = int(len(residue_names))
+    if resolved_count <= 2:
+        return None
+    validate_usalign_chain_lengths(
+        chain_atoms,
+        context=f"monomer {monomer.monomer_id}",
+    )
+
     # Write PDB file (needed by USalign)
     outdir_path = Path(outdir)
     outdir_path.mkdir(parents=True, exist_ok=True)
     asm_tag = monomer.assembly_id or "na"
     pdb_path = outdir_path / f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}.pdb"
-    _coerced = _coerce_chain_id_for_pdb(chain_atoms)
     pdb_file = PDBFile()
-    pdb_file.set_structure(_coerced)
+    pdb_file.set_structure(chain_atoms)
     pdb_file.write(pdb_path)
 
     quality = (quality_by_source or {}).get(
@@ -300,7 +314,7 @@ def extract_monomer_from_pkl(
         filter_counts=atom_array_filter_counts(filter_counts),
         quality=quality,
         assembly_id=monomer.assembly_id,
-        coordinate_fingerprint=_atom_coordinate_fingerprint(_coerced),
+        coordinate_fingerprint=_atom_coordinate_fingerprint(chain_atoms),
         model=1,
         keep_hydrogens=not drop_hydrogens,
     )
@@ -335,7 +349,7 @@ def extract_protein_monomer_structure(
     if chain_atoms.array_length() == 0:
         raise ValueError(f"No analyzable atoms left for monomer {monomer.monomer_id}")
 
-    chain_atoms = _coerce_chain_id_for_pdb(chain_atoms)
+    chain_atoms = _prepare_trace_chain_for_pdb(chain_atoms)
     _, residue_names = get_residues(chain_atoms)
     resolved_residue_count = int(len(residue_names))
     sequence_length = max(int(monomer.length or len(monomer.sequence)), len(monomer.sequence))
@@ -530,48 +544,44 @@ def extract_protein_monomer_structures(
 
     *extraction_jobs* controls how many monomers are extracted concurrently.
     When *prep_dir* is provided, pre-parsed AtomArrays are fetched from the
-    binary index instead of re-reading the original mmCIF files.
+    parse-stage atom pickle cache instead of re-reading the original mmCIF files.
     """
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    # Load cif_cache index when prep_dir is available
-    cif_idx: dict | None = None
+    pkl_reader: Any | None = None
     quality_by_source: dict[str, EntryQualityMetadata] = {}
     if prep_dir:
-        from cif_parse.clustering.prep import load_cif_coords_index, load_cif_from_prep
-        cif_idx = load_cif_coords_index(prep_dir)
+        from cif_parse.clustering.atom_cache import (
+            PklAtomReader,
+            load_source_case_dir_map,
+            resolve_cases_root,
+        )
+        try:
+            pkl_reader = PklAtomReader(
+                resolve_cases_root(prep_dir),
+                load_source_case_dir_map(prep_dir),
+            )
+        except (FileNotFoundError, OSError, ValueError):
+            pkl_reader = None
         quality_by_source = load_entry_quality_metadata_from_prep(prep_dir)
 
     structures: dict[str, ExtractedMonomerStructure] = {}
     failures: list[dict[str, str]] = []
 
-    def _load_cif_cache(_prep_dir, _source_path, _assembly_id, _idx):
-        from cif_parse.clustering.prep import load_cif_from_prep as _lcfp
-        return _lcfp(_prep_dir, _source_path, _assembly_id, index=_idx)
-
-    def _load_chain_from_prep_fn(_source_path, _label_asym_id, _assembly_id=None):
-        from cif_parse.clustering.prep import load_chain_from_prep
-        return load_chain_from_prep(prep_dir, _source_path, _label_asym_id,
-                                    assembly_id=_assembly_id, index=cif_idx)
-
     def _load_atom_array_for_monomer(_source_path, _label_asym_id, _assembly_id):
         """Try the monomer's specific assembly first, then asymmetric unit."""
-        if cif_idx is None:
+        if pkl_reader is None:
             return None
-        # Try the monomer's own assembly
-        if _assembly_id:
-            cached = _load_chain_from_prep_fn(_source_path, _label_asym_id, _assembly_id)
-            if cached is not None and cached.get("atom_array") is not None:
-                return cached["atom_array"]
-        # Fallback: asymmetric unit
-        cached = _load_chain_from_prep_fn(_source_path, _label_asym_id, None)
-        if cached is not None and cached.get("atom_array") is not None:
-            return cached["atom_array"]
-        # Fallback: try legacy full-assembly blob
-        cached = _load_cif_cache(prep_dir, _source_path, None, cif_idx)
-        if cached is not None and cached.get("atom_array") is not None:
-            return cached["atom_array"]
+        for assembly_id in (_assembly_id, None):
+            atoms = pkl_reader.load_chain(
+                _source_path,
+                _label_asym_id,
+                assembly_id=assembly_id,
+                filter_hetero=False,
+            )
+            if atoms is not None:
+                return atoms
         return None
 
     protein_monomers = sorted(
@@ -788,7 +798,6 @@ def _reconstruct_structure(
 
 
 _structure_worker_prep_dir: str | None = None
-_structure_worker_coord_index: dict[str, tuple[Path, int, int]] | None = None
 _structure_worker_pkl_reader: Any = None
 _structure_worker_quality: dict[str, EntryQualityMetadata] = {}
 _structure_worker_drop_hydrogens = True
@@ -803,7 +812,6 @@ def _init_structure_group_worker(
     """Initialize process-local coordinate readers once per Phase 1 worker."""
 
     global _structure_worker_prep_dir
-    global _structure_worker_coord_index
     global _structure_worker_pkl_reader
     global _structure_worker_quality
     global _structure_worker_drop_hydrogens
@@ -814,10 +822,8 @@ def _init_structure_group_worker(
         load_source_case_dir_map,
         resolve_cases_root,
     )
-    from cif_parse.clustering.prep import load_cif_coords_index
 
     _structure_worker_prep_dir = prep_dir
-    _structure_worker_coord_index = load_cif_coords_index(prep_dir)
     _structure_worker_quality = load_entry_quality_metadata_from_prep(prep_dir)
     _structure_worker_drop_hydrogens = bool(drop_hydrogens)
     _structure_worker_model = int(model)
@@ -831,19 +837,6 @@ def _init_structure_group_worker(
 
 
 def _load_structure_worker_chain(monomer: MonomerSample) -> AtomArray | None:
-    from cif_parse.clustering.prep import load_chain_atoms
-
-    if _structure_worker_prep_dir is not None and _structure_worker_coord_index is not None:
-        for assembly_id in (monomer.assembly_id, None):
-            atoms = load_chain_atoms(
-                _structure_worker_prep_dir,
-                monomer.source_path,
-                monomer.label_asym_id,
-                assembly_id=assembly_id,
-                index=_structure_worker_coord_index,
-            )
-            if atoms is not None:
-                return atoms
     if _structure_worker_pkl_reader is not None:
         for assembly_id in (monomer.assembly_id, None):
             atoms = _structure_worker_pkl_reader.load_chain(
@@ -956,9 +949,17 @@ def _process_one_group_worker(
         )
         if chain_atoms.array_length() == 0:
             continue
+        chain_atoms = _prepare_trace_chain_for_pdb(chain_atoms)
         _, residue_names = get_residues(chain_atoms)
         resolved_count = int(len(residue_names))
         if resolved_count <= 2:
+            continue
+        try:
+            validate_usalign_chain_lengths(
+                chain_atoms,
+                context=f"monomer {monomer.monomer_id}",
+            )
+        except ValueError:
             continue
 
         # Store chain atoms for later PDB write (only for subcluster reps).
@@ -1073,10 +1074,9 @@ def _process_one_group_worker(
                                                   prev[10], prev[11], rep.coordinate_fingerprint,
                                                   prev[13], prev[14])
         elif chain_aa is not None and not rep.extracted_pdb_path:
-            _coerced = _coerce_chain_id_for_pdb(chain_aa)
             try:
                 pdb_file = PDBFile()
-                pdb_file.set_structure(_coerced)
+                pdb_file.set_structure(chain_aa)
                 pdb_file.write(pdb_path)
             except Exception as exc:
                 LOGGER.warning(
@@ -1086,7 +1086,7 @@ def _process_one_group_worker(
                 )
                 continue
             rep.extracted_pdb_path = str(pdb_path)
-            rep.coordinate_fingerprint = _atom_coordinate_fingerprint(_coerced)
+            rep.coordinate_fingerprint = _atom_coordinate_fingerprint(chain_aa)
             prev = _extract_info.get(rep.monomer_id)
             if prev is not None:
                 _extract_info[rep.monomer_id] = (prev[0], prev[1], prev[2], prev[3], prev[4],
@@ -1373,7 +1373,7 @@ def _run_three_phase_clustering(
         for monomer_id in skipped_ids:
             warning_rows.append(
                 {
-                    "warning_code": "protein_structure_unavailable_skipped",
+                    "warning_code": "protein_structure_unavailable_fallback",
                     "sequence_cluster_id": sequence_cluster_id,
                     "monomer_id": monomer_id,
                 }
@@ -1384,6 +1384,7 @@ def _run_three_phase_clustering(
             "subcluster": subcluster,
             "pending": candidates,
             "clusters": [],
+            "fallback_member_ids": skipped_ids,
             "round_num": 0,
         }
 
@@ -1622,15 +1623,27 @@ def _run_three_phase_clustering(
     membership_rows: list[dict[str, Any]] = []
     representative_rows: list[dict[str, Any]] = []
     total_structure_clusters = 0
+    total_sequence_fallback_assignments = 0
+    total_all_failure_sequence_cluster_collapses = 0
+
+    def _empty_alignment_fields() -> dict[str, str]:
+        return {
+            "tm_score_min": "",
+            "tm_score_max": "",
+            "tm_score_for_clustering": "",
+            "alignment_coverage_shorter": "",
+            "alignment_coverage_resolved": "",
+        }
+
     for sequence_cluster_id, state in states.items():
         subcluster = state["subcluster"]
+        emitted_clusters: list[dict[str, Any]] = []
         for local_index, cluster in enumerate(state["clusters"], start=1):
             representative = cluster["representative"]
             structure_cluster_id = _protein_structure_cluster_id(
                 sequence_cluster_id,
                 local_index,
             )
-            total_structure_clusters += 1
             assigned_rep_ids = {
                 member.monomer_id for member, _ in cluster["assigned"]
             }
@@ -1643,6 +1656,17 @@ def _run_three_phase_clustering(
                 member.monomer_id: result
                 for member, result in cluster["assigned"]
             }
+            emitted_clusters.append(
+                {
+                    "structure_cluster_id": structure_cluster_id,
+                    "representative": representative,
+                    "cluster_member_ids": cluster_member_ids,
+                    "result_by_rep": result_by_rep,
+                    "assigned": cluster["assigned"],
+                    "fallback_member_ids": [],
+                    "cluster_source": "structure",
+                }
+            )
             for member, result in cluster["assigned"]:
                 if result is None:
                     continue
@@ -1668,12 +1692,79 @@ def _run_three_phase_clustering(
                         ),
                     }
                 )
+
+        fallback_member_ids = list(state.get("fallback_member_ids", []) or [])
+        if fallback_member_ids and emitted_clusters:
+            for monomer_id in fallback_member_ids:
+                monomer = monomer_index_light.get(monomer_id) or monomer_index.get(monomer_id)
+                monomer_sequence = monomer.sequence if monomer is not None else ""
+
+                def _representative_sequence(cluster: dict[str, Any]) -> str:
+                    representative_structure = cluster["representative"]
+                    representative_monomer = (
+                        monomer_index_light.get(representative_structure.monomer_id)
+                        or monomer_index.get(representative_structure.monomer_id)
+                    )
+                    return representative_monomer.sequence if representative_monomer is not None else ""
+
+                best_cluster = max(
+                    emitted_clusters,
+                    key=lambda cluster: (
+                        _sequence_similarity_ratio(
+                            monomer_sequence,
+                            _representative_sequence(cluster),
+                        ),
+                        -len(cluster["cluster_member_ids"]),
+                        cluster["structure_cluster_id"],
+                    ),
+                )
+                best_cluster["fallback_member_ids"].append(monomer_id)
+                total_sequence_fallback_assignments += 1
+        elif fallback_member_ids:
+            total_all_failure_sequence_cluster_collapses += 1
+            total_sequence_fallback_assignments += len(fallback_member_ids)
+            local_index = len(emitted_clusters) + 1
+            structure_cluster_id = _protein_structure_cluster_id(
+                sequence_cluster_id,
+                local_index,
+            )
+            representative_id = fallback_member_ids[0]
+            representative_monomer = monomer_index_light.get(representative_id) or monomer_index.get(
+                representative_id
+            )
+            emitted_clusters.append(
+                {
+                    "structure_cluster_id": structure_cluster_id,
+                    "representative": None,
+                    "fallback_representative_monomer": representative_monomer,
+                    "fallback_representative_id": representative_id,
+                    "cluster_member_ids": [],
+                    "result_by_rep": {},
+                    "assigned": [],
+                    "fallback_member_ids": sorted(fallback_member_ids),
+                    "cluster_source": "fallback_sequence",
+                }
+            )
+
+        for cluster in emitted_clusters:
+            total_structure_clusters += 1
+            structure_cluster_id = cluster["structure_cluster_id"]
+            representative = cluster["representative"]
+            fallback_representative_monomer = cluster.get("fallback_representative_monomer")
+            representative_id = (
+                representative.monomer_id
+                if representative is not None
+                else str(cluster.get("fallback_representative_id", ""))
+            )
+            result_by_rep = cluster["result_by_rep"]
+            cluster_member_ids = list(cluster["cluster_member_ids"])
+            fallback_ids = sorted(cluster["fallback_member_ids"])
             for monomer_id in cluster_member_ids:
-                representative_id = subcluster[monomer_id]
-                result = result_by_rep.get(representative_id)
-                if monomer_id == representative.monomer_id:
+                member_representative_id = subcluster[monomer_id]
+                result = result_by_rep.get(member_representative_id)
+                if representative is not None and monomer_id == representative.monomer_id:
                     reason = "representative"
-                elif monomer_id != representative_id:
+                elif monomer_id != member_representative_id:
                     reason = "identical_sequence_subcluster"
                 else:
                     reason = "representative_alignment"
@@ -1682,9 +1773,12 @@ def _run_three_phase_clustering(
                         "polymer_class": "protein",
                         "sequence_cluster_id": sequence_cluster_id,
                         "structure_cluster_id": structure_cluster_id,
-                        "representative_monomer_id": representative.monomer_id,
+                        "representative_monomer_id": (
+                            representative.monomer_id if representative is not None else representative_id
+                        ),
                         "member_monomer_id": monomer_id,
                         "assignment_reason": reason,
+                        "cluster_source": "structure",
                         "tm_score_min": (
                             result.get("tm_score_min", "") if result is not None else ""
                         ),
@@ -1706,24 +1800,47 @@ def _run_three_phase_clustering(
                         ),
                     }
                 )
+            for monomer_id in fallback_ids:
+                membership_rows.append(
+                    {
+                        "polymer_class": "protein",
+                        "sequence_cluster_id": sequence_cluster_id,
+                        "structure_cluster_id": structure_cluster_id,
+                        "representative_monomer_id": representative_id,
+                        "member_monomer_id": monomer_id,
+                        "assignment_reason": "fallback_missing_coordinates",
+                        "cluster_source": "fallback_sequence",
+                        **_empty_alignment_fields(),
+                    }
+                )
+            representative_monomer = representative or fallback_representative_monomer
             representative_rows.append(
                 {
                     "sequence_cluster_id": sequence_cluster_id,
                     "structure_cluster_id": structure_cluster_id,
-                    "representative_monomer_id": representative.monomer_id,
-                    "num_members": len(cluster_member_ids),
-                    "pdb_id": representative.pdb_id,
-                    "label_asym_id": representative.label_asym_id,
-                    "auth_asym_id": representative.auth_asym_id or "",
-                    "resolved_fraction": representative.resolved_fraction,
+                    "representative_monomer_id": representative_id,
+                    "num_members": len(cluster_member_ids) + len(fallback_ids),
+                    "cluster_source": cluster["cluster_source"],
+                    "pdb_id": representative_monomer.pdb_id if representative_monomer is not None else "",
+                    "label_asym_id": (
+                        representative_monomer.label_asym_id if representative_monomer is not None else ""
+                    ),
+                    "auth_asym_id": (
+                        representative_monomer.auth_asym_id or ""
+                        if representative_monomer is not None
+                        else ""
+                    ),
+                    "resolved_fraction": (
+                        representative.resolved_fraction if representative is not None else ""
+                    ),
                     "primary_method": (
                         representative.quality.primary_method
-                        if representative.quality is not None
+                        if representative is not None and representative.quality is not None
                         else ""
                     ),
                     "resolution": (
                         representative.quality.resolution
-                        if representative.quality is not None
+                        if representative is not None and representative.quality is not None
                         else ""
                     ),
                 }
@@ -1750,12 +1867,13 @@ def _run_three_phase_clustering(
         "num_structure_clusters": total_structure_clusters,
         "num_alignment_runs": total_alignment_runs,
         "num_alignment_failures": total_alignment_failures,
-        "num_sequence_fallback_assignments": 0,
-        "num_all_failure_sequence_cluster_collapses": 0,
+        "num_sequence_fallback_assignments": total_sequence_fallback_assignments,
+        "num_all_failure_sequence_cluster_collapses": total_all_failure_sequence_cluster_collapses,
         "num_membership_rows": len(membership_rows),
         "num_extracted": extracted_count,
         "num_extraction_failures": extraction_failures,
-        "num_structure_members_skipped_missing_coordinates": extraction_failures,
+        "num_structure_members_skipped_missing_coordinates": 0,
+        "num_structure_members_fallback_missing_coordinates": total_sequence_fallback_assignments,
         "num_tasks_generated": total_tasks_generated,
         "num_cache_hits": total_cache_hits,
         "tm_score_threshold": tm_score_threshold,

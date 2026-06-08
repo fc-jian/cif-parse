@@ -60,7 +60,7 @@ Clustering consumes parsed case outputs, preferably from `--assembly-mode all`. 
 
 ### Pre-processing (recommended for large inputs)
 
-For large batch outputs (thousands to millions of cases), first build a prep directory that consolidates all case bundles into columnar Parquet files and pre-caches per-chain atom coordinates into indexed chunk files. The chunk count equals the number of worker processes, keeping the total file count bounded regardless of scale:
+For large batch outputs (thousands to millions of cases), first build a prep directory that consolidates all case bundles into columnar Parquet files and records a stable `source_path -> case_dir` map. Coordinates remain in the parse-stage `atoms/*.pkl` files, so prep avoids creating a second coordinate cache:
 
 ```bash
 cif-parse-cluster prep \
@@ -78,13 +78,12 @@ clustering_prep/
 ├── multimers.parquet             # pre-parsed tight multimer rows
 ├── antibody_complexes.parquet    # pre-parsed antibody-antigen complex rows
 ├── tcr_complexes.parquet         # pre-parsed TCR-pMHC complex rows
-└── cif_coords/                   # per-chain atom array chunks
-    ├── chunk_0.bin + chunk_0.idx
-    ├── chunk_1.bin + chunk_1.idx
-    └── ...                        (num_workers chunks total)
+├── entry_quality.parquet         # parse-stage quality metadata
+├── source_case_dir_map.json      # coordinate source lookup
+└── manifest.json                 # includes coordinate_backend=pkl_atoms
 ```
 
-Atoms are stored **per-chain** rather than per-assembly: monomer / dimer / multimer / complex extraction each reads only the chains they need via direct index lookup, eliminating repeated slicing of full assembly blobs. During clustering, per-chain AtomArrays loaded from prep are also kept in a shared in-process LRU cache, so monomer structure extraction and later higher-order complex extraction can reuse the same chain coordinates.
+During clustering, monomer / dimer / multimer / complex extraction reads only the chains it needs from the original parse atom pickle cache. Per-chain AtomArrays are kept in a shared in-process LRU cache, so monomer structure extraction and later higher-order complex extraction can reuse the same chain coordinates.
 
 Pass `--prep-dir` to the clustering command to read only from the prep directory. In this mode `--inputs` is no longer required because the Parquet files contain the monomer, dimer, multimer, antibody-complex, and TCR-complex rows needed by clustering:
 
@@ -94,9 +93,7 @@ cif-parse-cluster \
   --outdir cluster_outputs
 ```
 
-Full clustering and every structure/high-order subcommand consume prep data for coordinates; clustering reads parse JSON, prep Parquet, and parse-stage atom pickle caches only. The `seq` stage can still run directly from `--inputs` because it only needs case JSON. If the legacy full command is run with `--inputs` but no `--prep-dir`, it builds a temporary prep directory first and then runs clustering from that prep data.
-
-Use `--no-cif-cache` to skip Phase 2 coordinate indexing when only the Parquet files are needed. Structure and high-order clustering require the coordinate index.
+Full clustering and every structure/high-order subcommand consume prep data and parse-stage atom pickle caches for coordinates. The `seq` stage can still run directly from `--inputs` because it only needs case JSON. If the legacy full command is run with `--inputs` but no `--prep-dir`, it builds a temporary prep directory first and then runs clustering from that prep data.
 
 ### Running Clustering
 

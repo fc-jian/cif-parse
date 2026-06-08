@@ -80,8 +80,8 @@ tight_multimer_louvain_resolution = 0.8
 # Allowed values: integer >= 2.
 tight_multimer_min_member_instances = 2
 
-# Emit `large_component_without_bridge_pruning` once a tight multimer reaches
-# this many instance-level member nodes.
+# Emit `large_component_after_bridge_pruning` when a tight multimer still reaches
+# this many instance-level member nodes after bridge-edge pruning.
 # Allowed values: integer >= 2.
 tight_multimer_large_component_warning_size = 8
 
