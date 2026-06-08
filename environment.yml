@@ -4,21 +4,22 @@ channels:
   - bioconda
   - defaults
 dependencies:
-  - python=3.12
+  - python>=3.12,<3.13
   - pip
   - numpy>=2.3,<3
   - biotite>=1.6,<2
   - pandas>=2.3,<3
   - scipy>=1.17,<2
   - networkx>=3.6,<4
-  - mmseqs2
-  - usalign
-  - tqdm
-  - pyarrow>=18,<20
-  - biopython>=1.85,<2
-  - pyhmmer>=0.11,<1
+  - mmseqs2=18.8cc5c
+  - usalign=20241201
+  - tqdm>=4.68,<5
+  - pyarrow>=24,<25
+  - biopython>=1.87,<2
+  - pyhmmer>=0.12,<1
   - rdkit>=2026.03
-  - sadie-antibody=2.0
-  - pytest>=8,<9
+  - sadie-antibody>=2.0,<2.1
+  - matplotlib-base>=3.10,<4
+  - pytest>=8.4,<9
   - pip:
       - -e .

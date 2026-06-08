@@ -34,9 +34,12 @@ Worker resources:
 
 Execution:
   --config PATH              cif-parse config.toml; passed before the batch subcommand
-  --cif-parse-cmd VALUE      Command before "batch" (default: python -m cif_parse.cli)
+  --cif-parse-cmd VALUE      Command before "batch" (default: cif-parse)
                              Example: --cif-parse-cmd "mamba run -n bioinfo cif-parse"
   --python VALUE             Python used for split/merge helpers (default: python)
+  --use-repo-pythonpath      Set PYTHONPATH to this checkout's src directory in
+                             coordinator/worker Python processes. Default is off;
+                             install the package with "pip install -e ." instead.
   Parse-stage options such as --input-assembly, --assembly-mode, and
   --max-assembly-atoms must appear after "--" so they are forwarded to
   cif-parse batch on every shard.  --metadata-cif-dir and --metadata-table may
@@ -155,6 +158,7 @@ JOB_NAME="cif-parse"
 CIF_PARSE_CMD="${CIF_PARSE_CMD:-cif-parse}"
 CONFIG_PATH=""
 PYTHON_BIN="${PYTHON_BIN:-python}"
+USE_REPO_PYTHONPATH="${CIF_PARSE_USE_REPO_PYTHONPATH:-0}"
 LOCAL_RUN=0
 LOCAL_PARALLEL=1
 WAIT_INTERVAL=30
@@ -234,6 +238,14 @@ while [[ $# -gt 0 ]]; do
             PYTHON_BIN="${2:-}"
             shift 2
             ;;
+        --use-repo-pythonpath)
+            USE_REPO_PYTHONPATH=1
+            shift
+            ;;
+        --no-use-repo-pythonpath)
+            USE_REPO_PYTHONPATH=0
+            shift
+            ;;
         --local-run)
             LOCAL_RUN=1
             shift
@@ -279,6 +291,10 @@ done
 [[ "$SHARDS" =~ ^[0-9]+$ ]] && [[ "$SHARDS" -ge 1 ]] || die "--shards must be >= 1"
 [[ "$JOBS_PER_SHARD" =~ ^[0-9]+$ ]] && [[ "$JOBS_PER_SHARD" -ge 1 ]] || die "--jobs-per-shard must be >= 1"
 [[ "$LOCAL_PARALLEL" =~ ^[0-9]+$ ]] && [[ "$LOCAL_PARALLEL" -ge 1 ]] || die "--local-parallel must be >= 1"
+case "$USE_REPO_PYTHONPATH" in
+    0|1) ;;
+    *) die "CIF_PARSE_USE_REPO_PYTHONPATH must be 0 or 1" ;;
+esac
 [[ -f "$INPUT_LIST" ]] || die "input list not found: $INPUT_LIST"
 if [[ -n "$CONFIG_PATH" ]]; then
     [[ -f "$CONFIG_PATH" ]] || die "config file not found: $CONFIG_PATH"
@@ -307,6 +323,14 @@ SHARD_OUT_DIR="$OUTDIR/shards"
 LOG_DIR="$WORK_DIR/logs"
 mkdir -p "$SHARD_LIST_DIR" "$SHARD_OUT_DIR" "$LOG_DIR"
 
+unset PYTHONHOME
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+if [[ "$USE_REPO_PYTHONPATH" -eq 1 ]]; then
+    export PYTHONPATH="$REPO_ROOT/src"
+else
+    unset PYTHONPATH
+fi
+
 echo "Coordinator: $HOSTNAME"
 echo "Input list : $INPUT_LIST"
 echo "Output dir : $OUTDIR"
@@ -316,6 +340,7 @@ echo "Command    : $CIF_PARSE_CMD"
 echo "Config     : ${CONFIG_PATH:-(none)}"
 echo "Meta CIF   : ${METADATA_CIF_DIR:-(none)}"
 echo "Meta table : ${METADATA_TABLE:-(none)}"
+echo "Repo PYTHONPATH: $USE_REPO_PYTHONPATH"
 echo "Parse args : ${PARSE_ARGS[*]:-(none)}"
 
 if [[ "$MERGE_ONLY" -eq 0 ]]; then
@@ -343,7 +368,13 @@ SHARD_OUT="\${3:?shard output dir}"
 JOBS="\${4:?jobs}"
 mkdir -p "\$SHARD_OUT"
 cd "$REPO_ROOT"
-export PYTHONPATH="$REPO_ROOT/src\${PYTHONPATH:+:\$PYTHONPATH}"
+unset PYTHONHOME
+export PYTHONNOUSERSITE="\${PYTHONNOUSERSITE:-1}"
+if [[ "$USE_REPO_PYTHONPATH" -eq 1 ]]; then
+    export PYTHONPATH="$REPO_ROOT/src"
+else
+    unset PYTHONPATH
+fi
 export MPLCONFIGDIR="\${MPLCONFIGDIR:-/tmp/mpl-cif-parse-\${SLURM_JOB_ID:-\$\$}}"
 mkdir -p "\$MPLCONFIGDIR"
 echo "Shard \$SHARD_ID on \${HOSTNAME}: \$(wc -l < "\$SHARD_LIST") inputs, \$JOBS workers"
