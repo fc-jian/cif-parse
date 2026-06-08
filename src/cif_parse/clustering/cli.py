@@ -732,12 +732,14 @@ def _run_structure(
                         continue
                     found = pkl_reader.load_chain(
                         monomer.source_path, monomer.label_asym_id, str(aid),
+                        filter_hetero=False,
                     )
                     if found is not None:
                         break
                 if found is None:
                     found = pkl_reader.load_chain(
                         monomer.source_path, monomer.label_asym_id, None,
+                        filter_hetero=False,
                     )
             # Fallback: prep cif_coords blob index
             if found is None and cif_idx_for_pipeline is not None:

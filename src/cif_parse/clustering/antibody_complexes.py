@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -30,6 +29,7 @@ from cif_parse.clustering.protein_structures import (
 )
 from cif_parse.clustering.parallel import iter_threaded_results, normalize_worker_count
 from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
+from cif_parse.clustering.usalign import run_usalign_command
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
 
@@ -832,9 +832,9 @@ def run_antibody_complex_usalign_alignment(
         "-ter",
         "1",
     ]
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    stdout = run_usalign_command(command)
     return parse_usalign_output(
-        completed.stdout,
+        stdout,
         query_monomer_id=query.complex_observation_id,
         target_monomer_id=target.complex_observation_id,
         query_length=query.residue_count,

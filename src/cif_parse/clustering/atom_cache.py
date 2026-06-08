@@ -128,7 +128,7 @@ class PklAtomReader:
         label_asym_id: str,
         assembly_id: str | None = None,
         *,
-        filter_hetero: bool = True,
+        filter_hetero: bool = False,
     ) -> Any | None:
         full = self.load_assembly(source_path, assembly_id)
         if full is None or len(full) == 0:
@@ -166,7 +166,7 @@ class PklAtomReader:
         chain_specs: list[tuple[str, int | None]],
         assembly_id: str | None = None,
         *,
-        filter_hetero: bool = True,
+        filter_hetero: bool = False,
     ) -> Any | None:
         import biotite.structure as _struc
         full = self.load_assembly(source_path, assembly_id)

@@ -89,7 +89,7 @@ def _refine_signature_groups_greedy_round_barrier(
     min_alignment_coverage_ratio: float = 0.50,
     can_skip_alignment: Callable[[MemberT, MemberT], bool] | None = None,
     show_progress: bool = True,
-    fail_fast: bool = True,
+    fail_fast: bool = False,
 ) -> GreedySignatureRefinementResult:
     """Refine signature buckets with a stage-wide USalign queue.
 
@@ -338,7 +338,7 @@ def refine_signature_groups_three_phase(
     min_alignment_coverage_ratio: float = 0.50,
     can_skip_alignment: Callable[[MemberT, MemberT], bool] | None = None,
     show_progress: bool = True,
-    fail_fast: bool = True,
+    fail_fast: bool = False,
 ) -> GreedySignatureRefinementResult:
     """Compatibility wrapper for the bounded greedy high-order scheduler."""
 
@@ -377,7 +377,7 @@ def refine_signature_groups_greedy(
     min_alignment_coverage_ratio: float = 0.50,
     can_skip_alignment: Callable[[MemberT, MemberT], bool] | None = None,
     show_progress: bool = True,
-    fail_fast: bool = True,
+    fail_fast: bool = False,
 ) -> GreedySignatureRefinementResult:
     """Refine independent signature groups with one asynchronous worker pool."""
 
@@ -471,6 +471,14 @@ def refine_signature_groups_greedy(
             failure = state["round_failures"].get(candidate_id)
             if failure is not None:
                 num_alignment_failures += 1
+                LOGGER.warning(
+                    "USalign failed for %s vs %s in %s; keeping the candidate "
+                    "for a later cluster: %s",
+                    member_id(representative),
+                    candidate_id,
+                    state["signature_cluster_id"],
+                    failure,
+                )
                 warning_rows.append(
                     alignment_failure_warning(
                         state["signature_cluster_id"],
@@ -497,6 +505,7 @@ def refine_signature_groups_greedy(
     future_to_item: dict[Any, tuple[dict[str, Any], MemberT, tuple[str, str]]] = {}
     max_pending = alignment_jobs * 4
     progress = tqdm(
+        total=0,
         desc="Running high-order USalign",
         unit="alignment",
         disable=not show_progress,
@@ -520,6 +529,7 @@ def refine_signature_groups_greedy(
                 representative_id = member_id(representative)
                 candidate_id = member_id(candidate)
                 pair_key = tuple(sorted((representative_id, candidate_id)))
+                progress.total = int(progress.total or 0) + 1
                 cached = alignment_cache.get(pair_key)
                 if cached is not None:
                     state["round_results"][candidate_id] = cached

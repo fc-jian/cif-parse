@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -27,7 +26,13 @@ from cif_parse.clustering.protein_structures import (
     parse_usalign_output,
 )
 from cif_parse.clustering.parallel import iter_threaded_results, normalize_worker_count
+from cif_parse.clustering.polymer_atoms import (
+    prepare_polymer_atoms_for_usalign,
+    select_polymer_chain_atoms,
+    validate_usalign_chain_lengths,
+)
 from cif_parse.clustering.signature_outputs import write_signature_cluster_membership_csv
+from cif_parse.clustering.usalign import run_usalign_command
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.settings import resolve_source_path
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
@@ -175,18 +180,15 @@ def _pdb_chain_id(index: int) -> str:
 
 
 def _select_chain_atoms(atom_array: AtomArray, chain_id: str, sym_id: int | None = None) -> AtomArray:
-    mask = atom_array.chain_id == chain_id
-    if hasattr(atom_array, "hetero"):
-        mask &= ~atom_array.hetero
-    if sym_id is not None and hasattr(atom_array, "sym_id"):
-        mask &= atom_array.sym_id == sym_id
-    return atom_array[mask]
+    return select_polymer_chain_atoms(
+        atom_array,
+        label_asym_id=chain_id,
+        sym_id=sym_id,
+    )
 
 
 def _coerce_chain_id(atom_array: AtomArray, chain_id: str) -> AtomArray:
-    copied = atom_array.copy()
-    copied.chain_id[:] = chain_id
-    return copied
+    return prepare_polymer_atoms_for_usalign(atom_array, chain_id=chain_id)
 
 
 def _structure_chain_ids(
@@ -617,11 +619,10 @@ def extract_tcr_complex_structure(
         )
     _, residue_names = get_residues(complex_atoms)
     residue_count = int(len(residue_names))
-    if residue_count <= 2:
-        raise ValueError(
-            f"Resolved residue count {residue_count} is too short for TCR complex USalign: "
-            f"{observation.complex_observation_id}"
-        )
+    validate_usalign_chain_lengths(
+        complex_atoms,
+        context=f"TCR complex {observation.complex_observation_id}",
+    )
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -772,9 +773,9 @@ def run_tcr_complex_usalign_alignment(
         "-ter",
         "1",
     ]
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    stdout = run_usalign_command(command)
     return parse_usalign_output(
-        completed.stdout,
+        stdout,
         query_monomer_id=query.complex_observation_id,
         target_monomer_id=target.complex_observation_id,
         query_length=query.residue_count,

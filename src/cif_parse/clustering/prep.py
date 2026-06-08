@@ -1382,7 +1382,12 @@ def assemble_atom_array_from_chains(
         if aa is None:
             reader = _get_pkl_reader(prep_dir)
             if reader is not None:
-                aa = reader.load_chain(source_path, lbl, assembly_id=assembly_id)
+                aa = reader.load_chain(
+                    source_path,
+                    lbl,
+                    assembly_id=assembly_id,
+                    filter_hetero=False,
+                )
         if aa is None or len(aa) == 0:
             return None
         if sym is not None and hasattr(aa, "sym_id"):

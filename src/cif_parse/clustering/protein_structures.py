@@ -6,8 +6,7 @@ import logging
 import math
 import re
 import shutil
-import subprocess
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -18,7 +17,13 @@ from biotite.structure import AtomArray, get_residues
 from biotite.structure.io.pdb import PDBFile
 
 from cif_parse.clustering.monomers import MonomerSample
-from cif_parse.clustering.parallel import AlignmentTask, normalize_worker_count, run_alignment_tasks
+from cif_parse.clustering.parallel import normalize_worker_count
+from cif_parse.clustering.polymer_atoms import (
+    prepare_polymer_atoms_for_usalign,
+    select_polymer_chain_atoms,
+    validate_usalign_chain_lengths,
+)
+from cif_parse.clustering.usalign import run_usalign_command
 from cif_parse.export import dump_csv_rows, dump_json, dump_jsonl
 from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_array_for_analysis
 
@@ -26,6 +31,7 @@ from cif_parse.utils.atom_filters import atom_array_filter_counts, filter_atom_a
 LOGGER = logging.getLogger(__name__)
 
 SKIP_QUALITY_METADATA = object()
+USALIGN_PDB_FORMAT_VERSION = 2
 
 ALIGNED_LENGTH_RE = re.compile(
     r"Aligned length=\s*(?P<aligned_length>\d+),\s*RMSD=\s*(?P<rmsd>[0-9.]+),\s*Seq_ID=.*"
@@ -89,9 +95,7 @@ def _resolved_residue_count_from_segments(segments: Iterable[dict[str, Any]]) ->
 def _coerce_chain_id_for_pdb(atom_array: AtomArray) -> AtomArray:
     if atom_array.array_length() == 0:
         return atom_array
-    copied = atom_array.copy()
-    copied.chain_id[:] = "A"
-    return copied
+    return prepare_polymer_atoms_for_usalign(atom_array, chain_id="A")
 
 
 @dataclass(slots=True)
@@ -241,11 +245,21 @@ def extract_monomer_from_pkl(
     for aid in (monomer.assembly_id, None):
         if not aid:
             continue
-        chain_atoms = reader.load_chain(monomer.source_path, monomer.label_asym_id, str(aid))
+        chain_atoms = reader.load_chain(
+            monomer.source_path,
+            monomer.label_asym_id,
+            str(aid),
+            filter_hetero=False,
+        )
         if chain_atoms is not None:
             break
     if chain_atoms is None:
-        chain_atoms = reader.load_chain(monomer.source_path, monomer.label_asym_id, None)
+        chain_atoms = reader.load_chain(
+            monomer.source_path,
+            monomer.label_asym_id,
+            None,
+            filter_hetero=False,
+        )
     if chain_atoms is None or chain_atoms.array_length() == 0:
         return None
 
@@ -265,8 +279,7 @@ def extract_monomer_from_pkl(
     outdir_path.mkdir(parents=True, exist_ok=True)
     asm_tag = monomer.assembly_id or "na"
     pdb_path = outdir_path / f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}.pdb"
-    _coerced = chain_atoms.copy()
-    _coerced.chain_id[:] = "A"
+    _coerced = _coerce_chain_id_for_pdb(chain_atoms)
     pdb_file = PDBFile()
     pdb_file.set_structure(_coerced)
     pdb_file.write(pdb_path)
@@ -307,10 +320,10 @@ def extract_protein_monomer_structure(
     full_atom_array = atom_array
     if full_atom_array is None:
         raise ValueError(f"Cached coordinates are required for monomer {monomer.monomer_id}")
-    chain_mask = full_atom_array.chain_id == monomer.label_asym_id
-    if hasattr(full_atom_array, "hetero"):
-        chain_mask &= ~full_atom_array.hetero
-    chain_atoms = full_atom_array[chain_mask]
+    chain_atoms = select_polymer_chain_atoms(
+        full_atom_array,
+        label_asym_id=monomer.label_asym_id,
+    )
     if chain_atoms.array_length() == 0:
         raise ValueError(f"No polymer atoms found for monomer {monomer.monomer_id}")
 
@@ -326,10 +339,10 @@ def extract_protein_monomer_structure(
     _, residue_names = get_residues(chain_atoms)
     resolved_residue_count = int(len(residue_names))
     sequence_length = max(int(monomer.length or len(monomer.sequence)), len(monomer.sequence))
-    if resolved_residue_count <= 2:
-        raise ValueError(
-            f"Resolved residue count {resolved_residue_count} is too short for USalign: {monomer.monomer_id}"
-        )
+    validate_usalign_chain_lengths(
+        chain_atoms,
+        context=f"monomer {monomer.monomer_id}",
+    )
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -443,9 +456,9 @@ def run_usalign_alignment(
         "-mol",
         mol,
     ]
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    stdout = run_usalign_command(command)
     return parse_usalign_output(
-        completed.stdout,
+        stdout,
         query_monomer_id=query.monomer_id,
         target_monomer_id=target.monomer_id,
         query_length=query.sequence_length,
@@ -743,526 +756,6 @@ def greedy_cluster_protein_structures(
         cif_idx=cif_idx,
     )
 
-    available_structures = len(extracted_structures)
-
-    alignment_rows: list[dict[str, Any]] = []
-    membership_out_rows: list[dict[str, Any]] = []
-    representative_rows: list[dict[str, Any]] = []
-    warning_rows: list[dict[str, Any]] = []
-
-    total_struct_clusters = 0
-    total_alignments = 0
-    total_alignment_failures = 0
-    total_sequence_fallback_assignments = 0
-    total_all_failure_cluster_collapses = 0
-
-    total_monomers_to_extract = 0
-    total_extraction_failures = 0
-
-    pairwise_alignment_jobs = normalize_worker_count(pairwise_alignment_jobs)
-
-    def process_sequence_group(sequence_group: tuple[str, list[str]]) -> dict[str, Any]:
-        sequence_cluster_id, member_ids = sequence_group
-        local_alignment_cache: dict[tuple[str, str], USalignAlignmentResult] = {}
-        local_alignment_rows: list[dict[str, Any]] = []
-        local_membership_rows: list[dict[str, Any]] = []
-        local_representative_rows: list[dict[str, Any]] = []
-        local_warning_rows: list[dict[str, Any]] = []
-        local_struct_clusters = 0
-        local_alignments = 0
-        local_alignment_failures = 0
-        local_sequence_fallback_assignments = 0
-        local_all_failure_cluster_collapses = 0
-        local_extracted = 0
-        local_extraction_failures = 0
-
-        # On-the-fly extraction when no pre-extracted structures available
-        if extract_fn is not None:
-            for member_id in member_ids:
-                if member_id in extracted_structures:
-                    continue
-                monomer = monomer_index.get(member_id)
-                if monomer is None:
-                    continue
-                try:
-                    local_extracted += 1
-                    ext = extract_fn(monomer)
-                    if ext is not None:
-                        extracted_structures[member_id] = ext
-                    else:
-                        local_extraction_failures += 1
-                except Exception:
-                    local_extraction_failures += 1
-
-        candidates = [
-            extracted_structures[member_id]
-            for member_id in member_ids
-            if member_id in extracted_structures
-        ]
-        if not candidates:
-            structure_cluster_id = _protein_structure_cluster_id(sequence_cluster_id, 1)
-            representative_monomer_id = member_ids[0]
-            local_struct_clusters += 1
-            local_sequence_fallback_assignments += len(member_ids)
-            local_warning_rows.append(
-                {
-                    "warning_code": "no_extracted_structures_in_sequence_cluster",
-                    "sequence_cluster_id": sequence_cluster_id,
-                    "structure_cluster_id": structure_cluster_id,
-                    "representative_monomer_id": representative_monomer_id,
-                    "member_monomer_ids": member_ids,
-                }
-            )
-            for member_id in member_ids:
-                local_membership_rows.append(
-                    {
-                        "polymer_class": "protein",
-                        "sequence_cluster_id": sequence_cluster_id,
-                        "structure_cluster_id": structure_cluster_id,
-                        "representative_monomer_id": representative_monomer_id,
-                        "member_monomer_id": member_id,
-                        "assignment_reason": "structure_extraction_failure_sequence_cluster_collapse",
-                        "tm_score_min": "",
-                        "tm_score_max": "",
-                        "tm_score_for_clustering": "",
-                        "alignment_coverage_shorter": "",
-                        "alignment_coverage_resolved": "",
-                    }
-                )
-            local_representative_rows.append(
-                {
-                    "sequence_cluster_id": sequence_cluster_id,
-                    "structure_cluster_id": structure_cluster_id,
-                    "representative_monomer_id": representative_monomer_id,
-                    "num_members": len(member_ids),
-                    "pdb_id": monomer_index[representative_monomer_id].pdb_id,
-                    "label_asym_id": monomer_index[representative_monomer_id].label_asym_id,
-                    "auth_asym_id": monomer_index[representative_monomer_id].auth_asym_id or "",
-                    "resolved_fraction": "",
-                    "primary_method": "",
-                    "resolution": "",
-                }
-            )
-            return {
-                "alignment_rows": local_alignment_rows,
-                "membership_rows": local_membership_rows,
-                "representative_rows": local_representative_rows,
-                "warning_rows": local_warning_rows,
-                "num_structure_clusters": local_struct_clusters,
-                "num_alignment_runs": local_alignments,
-                "num_alignment_failures": local_alignment_failures,
-                "num_sequence_fallback_assignments": local_sequence_fallback_assignments,
-                "num_all_failure_sequence_cluster_collapses": local_all_failure_cluster_collapses,
-            }
-
-        # --- subcluster by exact sequence identity --------------------------------
-        # Group monomers with 100% identical sequences into subclusters.  Only
-        # subcluster representatives participate in pairwise USalign; other
-        # members are assigned to the same structure cluster as their rep.
-        subcluster_rep: dict[str, str] = {}  # monomer_id → representative monomer_id
-        if protein_subcluster_by_sequence:
-            from collections import defaultdict as _defaultdict
-            seq_groups: dict[str, list[ExtractedMonomerStructure]] = _defaultdict(list)
-            monomer_seq: dict[str, str] = {}
-            for candidate in candidates:
-                monomer = monomer_index.get(candidate.monomer_id)
-                seq = monomer.sequence if monomer else ""
-                monomer_seq[candidate.monomer_id] = seq
-                seq_groups[seq].append(candidate)
-            candidates = []
-            for _seq, members in seq_groups.items():
-                rep = min(members, key=lambda item: item.quality_sort_key())
-                candidates.append(rep)
-                for m in members:
-                    subcluster_rep[m.monomer_id] = rep.monomer_id
-            if len(candidates) < len(seq_groups):
-                LOGGER.debug(
-                    "Subcluster: %d extracted → %d unique sequences in %s",
-                    len(seq_groups), len(candidates), sequence_cluster_id,
-                )
-
-        pending = sorted(candidates, key=lambda item: item.quality_sort_key())
-        cluster_states: list[dict[str, Any]] = []
-        failed_candidates: list[dict[str, Any]] = []
-        alignment_success_count = 0
-        sequence_member_ids = {candidate.monomer_id for candidate in candidates}
-        missing_structure_member_ids = sorted(set(member_ids) - {m.monomer_id for m in pending})
-        local_cluster_index = 0
-        while pending:
-            representative = pending[0]
-            local_cluster_index += 1
-            local_struct_clusters += 1
-            structure_cluster_id = _protein_structure_cluster_id(
-                sequence_cluster_id,
-                local_cluster_index,
-            )
-            assigned = [representative]
-            remaining: list[ExtractedMonomerStructure] = []
-
-            alignment_tasks: list[AlignmentTask] = []
-            for candidate in pending[1:]:
-                pair_key = tuple(sorted((representative.monomer_id, candidate.monomer_id)))
-                if pair_key not in local_alignment_cache:
-                    alignment_tasks.append(
-                        AlignmentTask(
-                            key=pair_key,
-                            query=representative,
-                            target=candidate,
-                            context={"candidate": candidate},
-                        )
-                    )
-
-            successes, failures = run_alignment_tasks(
-                alignment_tasks,
-                runner,
-                max_workers=pairwise_alignment_jobs,
-                progress_desc=f"USalign {sequence_cluster_id}",
-                usalign_executable=usalign_executable,
-                tm_score_threshold=tm_score_threshold,
-                min_alignment_coverage_ratio=min_alignment_coverage_ratio,
-            )
-            failure_by_candidate_id: dict[str, Exception] = {
-                task.context["candidate"].monomer_id: exc for task, exc in failures
-            }
-            for task, result in successes:
-                local_alignment_cache[task.key] = result
-            success_keys = {task.key for task, _ in successes}
-
-            for candidate in pending[1:]:
-                pair_key = tuple(sorted((representative.monomer_id, candidate.monomer_id)))
-                if candidate.monomer_id in failure_by_candidate_id:
-                    exc = failure_by_candidate_id[candidate.monomer_id]
-                    local_alignment_failures += 1
-                    failed_candidates.append(
-                        {
-                            "candidate": candidate,
-                            "failed_against_representative": representative.monomer_id,
-                            "error": str(exc),
-                        }
-                    )
-                    local_warning_rows.append(
-                        {
-                            "warning_code": "usalign_failed_sequence_fallback",
-                            "sequence_cluster_id": sequence_cluster_id,
-                            "candidate_monomer_id": candidate.monomer_id,
-                            "representative_monomer_id": representative.monomer_id,
-                            "error": str(exc),
-                        }
-                    )
-                    continue
-                if pair_key in local_alignment_cache:
-                    result = local_alignment_cache[pair_key]
-                    if pair_key in success_keys:
-                        local_alignment_rows.append(
-                            {
-                                "sequence_cluster_id": sequence_cluster_id,
-                                "query_monomer_id": result.query_monomer_id,
-                                "target_monomer_id": result.target_monomer_id,
-                                "aligned_length": result.aligned_length,
-                                "rmsd": result.rmsd,
-                                "tm_score_query": result.tm_score_query,
-                                "tm_score_target": result.tm_score_target,
-                                "tm_score_min": result.min_tm_score,
-                                "tm_score_max": result.max_tm_score,
-                                "tm_score_for_clustering": result.max_tm_score,
-                                "alignment_coverage_shorter": result.shorter_length_coverage,
-                                "alignment_coverage_resolved": result.resolved_length_coverage,
-                                "meets_tm_threshold": result.meets_tm_threshold,
-                                "meets_coverage_threshold": result.meets_coverage_threshold,
-                            }
-                        )
-                        local_alignments += 1
-                        alignment_success_count += 1
-                    if result.meets_tm_threshold and result.meets_coverage_threshold:
-                        assigned.append(candidate)
-                    else:
-                        remaining.append(candidate)
-            cluster_states.append(
-                {
-                    "structure_cluster_id": structure_cluster_id,
-                    "representative": representative,
-                    "members": assigned,
-                    "fallback_member_ids": [],
-                }
-            )
-            pending = remaining
-
-        if failed_candidates and alignment_success_count == 0:
-            local_all_failure_cluster_collapses += 1
-            local_struct_clusters -= len(cluster_states)
-            local_struct_clusters += 1
-            representative = min(candidates, key=lambda item: item.quality_sort_key())
-            structure_cluster_id = _protein_structure_cluster_id(sequence_cluster_id, 1)
-            cluster_states = [
-                {
-                    "structure_cluster_id": structure_cluster_id,
-                    "representative": representative,
-                    "members": sorted(candidates, key=lambda item: item.quality_sort_key()),
-                    "fallback_member_ids": [],
-                }
-            ]
-            local_warning_rows.append(
-                {
-                    "warning_code": "all_usalign_failed_sequence_cluster_collapsed",
-                    "sequence_cluster_id": sequence_cluster_id,
-                    "structure_cluster_id": structure_cluster_id,
-                    "member_monomer_ids": sorted(sequence_member_ids),
-                }
-            )
-        elif failed_candidates:
-            for failed_item in failed_candidates:
-                candidate = failed_item["candidate"]
-                candidate_sequence = monomer_index[candidate.monomer_id].sequence
-                target_cluster = max(
-                    cluster_states,
-                    key=lambda state: (
-                        _sequence_similarity_ratio(
-                            candidate_sequence,
-                            monomer_index[state["representative"].monomer_id].sequence,
-                        ),
-                        -state["representative"].quality_sort_key()[0],
-                        -state["representative"].resolved_fraction,
-                        state["representative"].monomer_id,
-                    ),
-                )
-                target_cluster["members"].append(candidate)
-                local_sequence_fallback_assignments += 1
-                local_warning_rows.append(
-                    {
-                        "warning_code": "usalign_failed_assigned_by_sequence_similarity",
-                        "sequence_cluster_id": sequence_cluster_id,
-                        "candidate_monomer_id": candidate.monomer_id,
-                        "assigned_structure_cluster_id": target_cluster["structure_cluster_id"],
-                        "assigned_representative_monomer_id": target_cluster["representative"].monomer_id,
-                        "failed_against_representative": failed_item["failed_against_representative"],
-                        "error": failed_item["error"],
-                        "sequence_similarity_to_assigned_representative": _sequence_similarity_ratio(
-                            candidate_sequence,
-                            monomer_index[target_cluster["representative"].monomer_id].sequence,
-                        ),
-                    }
-                )
-
-        if missing_structure_member_ids:
-            for member_id in missing_structure_member_ids:
-                member_sequence = monomer_index[member_id].sequence
-                target_cluster = max(
-                    cluster_states,
-                    key=lambda state: (
-                        _sequence_similarity_ratio(
-                            member_sequence,
-                            monomer_index[state["representative"].monomer_id].sequence,
-                        ),
-                        -state["representative"].quality_sort_key()[0],
-                        -state["representative"].resolved_fraction,
-                        state["representative"].monomer_id,
-                    ),
-                )
-                target_cluster["fallback_member_ids"].append(member_id)
-                local_sequence_fallback_assignments += 1
-                local_warning_rows.append(
-                    {
-                        "warning_code": "structure_extraction_failed_assigned_by_sequence_similarity",
-                        "sequence_cluster_id": sequence_cluster_id,
-                        "member_monomer_id": member_id,
-                        "assigned_structure_cluster_id": target_cluster["structure_cluster_id"],
-                        "assigned_representative_monomer_id": target_cluster["representative"].monomer_id,
-                        "sequence_similarity_to_assigned_representative": _sequence_similarity_ratio(
-                            member_sequence,
-                            monomer_index[target_cluster["representative"].monomer_id].sequence,
-                        ),
-                    }
-                )
-
-        for cluster_state in cluster_states:
-            representative = cluster_state["representative"]
-            structure_cluster_id = cluster_state["structure_cluster_id"]
-            ordered_members = sorted(
-                cluster_state["members"],
-                key=lambda item: (item.monomer_id != representative.monomer_id, item.monomer_id),
-            )
-            for member in ordered_members:
-                assignment_reason = "representative"
-                tm_score_min: float | str = ""
-                tm_score_max: float | str = ""
-                tm_score_for_clustering: float | str = ""
-                alignment_coverage_shorter: float | str = ""
-                alignment_coverage_resolved: float | str = ""
-                if member.monomer_id != representative.monomer_id:
-                    pair_key = tuple(sorted((representative.monomer_id, member.monomer_id)))
-                    if pair_key in local_alignment_cache:
-                        result = local_alignment_cache[pair_key]
-                        assignment_reason = "representative_alignment"
-                        tm_score_min = result.min_tm_score
-                        tm_score_max = result.max_tm_score
-                        tm_score_for_clustering = result.max_tm_score
-                        alignment_coverage_shorter = result.shorter_length_coverage
-                        alignment_coverage_resolved = result.resolved_length_coverage
-                    elif failed_candidates:
-                        assignment_reason = "tm_failure_sequence_fallback"
-                local_membership_rows.append(
-                    {
-                        "polymer_class": "protein",
-                        "sequence_cluster_id": sequence_cluster_id,
-                        "structure_cluster_id": structure_cluster_id,
-                        "representative_monomer_id": representative.monomer_id,
-                        "member_monomer_id": member.monomer_id,
-                        "assignment_reason": assignment_reason,
-                        "tm_score_min": tm_score_min,
-                        "tm_score_max": tm_score_max,
-                        "tm_score_for_clustering": tm_score_for_clustering,
-                        "alignment_coverage_shorter": alignment_coverage_shorter,
-                        "alignment_coverage_resolved": alignment_coverage_resolved,
-                    }
-                )
-
-                # Expand subcluster members: any monomer that has an identical
-                # sequence to the rep (but was never aligned via USalign) gets
-                # the same structure cluster assignment.
-                if subcluster_rep:
-                    for m_id, rep_id in subcluster_rep.items():
-                        if rep_id == representative.monomer_id and m_id != rep_id:
-                            local_membership_rows.append(
-                                {
-                                    "polymer_class": "protein",
-                                    "sequence_cluster_id": sequence_cluster_id,
-                                    "structure_cluster_id": structure_cluster_id,
-                                    "representative_monomer_id": representative.monomer_id,
-                                    "member_monomer_id": m_id,
-                                    "assignment_reason": "identical_sequence_subcluster",
-                                    "tm_score_min": "",
-                                    "tm_score_max": "",
-                                    "tm_score_for_clustering": "",
-                                    "alignment_coverage_shorter": "",
-                                    "alignment_coverage_resolved": "",
-                                }
-                            )
-
-            for member_id in sorted(cluster_state["fallback_member_ids"]):
-                local_membership_rows.append(
-                    {
-                        "polymer_class": "protein",
-                        "sequence_cluster_id": sequence_cluster_id,
-                        "structure_cluster_id": structure_cluster_id,
-                        "representative_monomer_id": representative.monomer_id,
-                        "member_monomer_id": member_id,
-                        "assignment_reason": "structure_extraction_failure_sequence_fallback",
-                        "tm_score_min": "",
-                        "tm_score_max": "",
-                        "tm_score_for_clustering": "",
-                        "alignment_coverage_shorter": "",
-                        "alignment_coverage_resolved": "",
-                    }
-                )
-
-            subcluster_extra = sum(
-                1 for m_id, rep_id in subcluster_rep.items()
-                if rep_id == representative.monomer_id and m_id != rep_id
-            ) if subcluster_rep else 0
-            local_representative_rows.append(
-                {
-                    "sequence_cluster_id": sequence_cluster_id,
-                    "structure_cluster_id": structure_cluster_id,
-                    "representative_monomer_id": representative.monomer_id,
-                    "num_members": len(cluster_state["members"]) + len(cluster_state["fallback_member_ids"]) + subcluster_extra,
-                    "pdb_id": representative.pdb_id,
-                    "label_asym_id": representative.label_asym_id,
-                    "auth_asym_id": representative.auth_asym_id or "",
-                    "resolved_fraction": representative.resolved_fraction,
-                    "primary_method": (
-                        representative.quality.primary_method
-                        if representative.quality is not None
-                        else ""
-                    ),
-                    "resolution": (
-                        representative.quality.resolution
-                        if representative.quality is not None
-                        and representative.quality.resolution is not None
-                        else ""
-                    ),
-                }
-            )
-
-        return {
-            "alignment_rows": local_alignment_rows,
-            "membership_rows": local_membership_rows,
-            "representative_rows": local_representative_rows,
-            "warning_rows": local_warning_rows,
-            "num_structure_clusters": local_struct_clusters,
-            "num_alignment_runs": local_alignments,
-            "num_alignment_failures": local_alignment_failures,
-            "num_sequence_fallback_assignments": local_sequence_fallback_assignments,
-            "num_all_failure_sequence_cluster_collapses": local_all_failure_cluster_collapses,
-            "num_extracted": local_extracted,
-            "num_extraction_failures": local_extraction_failures,
-        }
-
-    sequence_group_items = list(sequence_groups.items())
-    sequence_cluster_jobs = min(normalize_worker_count(sequence_cluster_jobs), max(1, len(sequence_group_items)))
-    if sequence_cluster_jobs <= 1:
-        group_results = [
-            process_sequence_group(item)
-            for item in tqdm(sequence_group_items, desc="Clustering protein structures", unit="seq-group")
-        ]
-    else:
-        from tqdm.contrib.concurrent import thread_map
-        group_results = thread_map(
-            process_sequence_group,
-            sequence_group_items,
-            max_workers=sequence_cluster_jobs,
-            desc="Clustering protein structures",
-            unit="seq-group",
-        )
-
-    for group_result in group_results:
-        alignment_rows.extend(group_result["alignment_rows"])
-        membership_out_rows.extend(group_result["membership_rows"])
-        representative_rows.extend(group_result["representative_rows"])
-        warning_rows.extend(group_result["warning_rows"])
-        total_struct_clusters += group_result["num_structure_clusters"]
-        total_alignments += group_result["num_alignment_runs"]
-        total_alignment_failures += group_result["num_alignment_failures"]
-        total_sequence_fallback_assignments += group_result["num_sequence_fallback_assignments"]
-        total_all_failure_cluster_collapses += group_result["num_all_failure_sequence_cluster_collapses"]
-        total_monomers_to_extract += group_result.get("num_extracted", 0)
-        total_extraction_failures += group_result.get("num_extraction_failures", 0)
-
-    dump_csv_rows(outdir / "protein_structure_cluster_membership.csv", membership_out_rows)
-    dump_csv_rows(outdir / "protein_structure_cluster_representatives.csv", representative_rows)
-    dump_jsonl(outdir / "protein_structure_pairwise_alignments.jsonl", alignment_rows)
-    dump_jsonl(outdir / "protein_structure_cluster_warnings.jsonl", warning_rows)
-    manifest = {
-        "num_sequence_clusters": len(sequence_groups),
-        "num_structure_clusters": total_struct_clusters,
-        "num_alignment_runs": total_alignments,
-        "num_alignment_failures": total_alignment_failures,
-        "num_sequence_fallback_assignments": total_sequence_fallback_assignments,
-        "num_all_failure_sequence_cluster_collapses": total_all_failure_cluster_collapses,
-        "num_membership_rows": len(membership_out_rows),
-        "num_extracted": total_monomers_to_extract,
-        "num_extraction_failures": total_extraction_failures,
-        "tm_score_threshold": tm_score_threshold,
-        "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
-        "sequence_cluster_jobs": sequence_cluster_jobs,
-        "pairwise_alignment_jobs": pairwise_alignment_jobs,
-    }
-    dump_json(outdir / "protein_structure_cluster_manifest.json", manifest, indent=2)
-    LOGGER.info(
-        "Protein monomer clustering: %d sequence clusters -> %d structure clusters (%d alignments, %d failures)",
-        len(sequence_groups),
-        total_struct_clusters,
-        total_alignments,
-        total_alignment_failures,
-    )
-    return {
-        "manifest": manifest,
-        "membership_rows": membership_out_rows,
-        "representative_rows": representative_rows,
-        "alignment_rows": alignment_rows,
-        "sequence_groups": _group_member_map if '_group_member_map' in dir() else sequence_groups,
-        "monomer_index": _monomer_index_light if '_monomer_index_light' in dir() else monomer_index,
-    }
-
 
 def _reconstruct_structure(
     monomer_id: str,
@@ -1357,6 +850,7 @@ def _load_structure_worker_chain(monomer: MonomerSample) -> AtomArray | None:
                 monomer.source_path,
                 monomer.label_asym_id,
                 assembly_id=assembly_id,
+                filter_hetero=False,
             )
             if atoms is not None:
                 return atoms
@@ -1402,7 +896,8 @@ def _process_one_group_worker(
         asm_tag = monomer.assembly_id or "na"
         pdb_path = group_dir / (
             f"{monomer.pdb_id}_{asm_tag}_{monomer.label_asym_id}"
-            f"_m{_structure_worker_model}_h{int(not _structure_worker_drop_hydrogens)}.pdb"
+            f"_m{_structure_worker_model}_h{int(not _structure_worker_drop_hydrogens)}"
+            f"_v{USALIGN_PDB_FORMAT_VERSION}.pdb"
         )
         if pdb_path.exists() and pdb_path.stat().st_size > 0:
             try:
@@ -1560,7 +1055,8 @@ def _process_one_group_worker(
         asm_tag = monomer_map[rep.monomer_id].assembly_id or "na"
         pdb_path = group_dir / (
             f"{rep.pdb_id}_{asm_tag}_{rep.label_asym_id}"
-            f"_m{_structure_worker_model}_h{int(not _structure_worker_drop_hydrogens)}.pdb"
+            f"_m{_structure_worker_model}_h{int(not _structure_worker_drop_hydrogens)}"
+            f"_v{USALIGN_PDB_FORMAT_VERSION}.pdb"
         )
         if pdb_path.exists() and pdb_path.stat().st_size > 0:
             rep.extracted_pdb_path = str(pdb_path)
@@ -1577,8 +1073,7 @@ def _process_one_group_worker(
                                                   prev[10], prev[11], rep.coordinate_fingerprint,
                                                   prev[13], prev[14])
         elif chain_aa is not None and not rep.extracted_pdb_path:
-            _coerced = chain_aa.copy()
-            _coerced.chain_id[:] = "A"
+            _coerced = _coerce_chain_id_for_pdb(chain_aa)
             pdb_file = PDBFile()
             pdb_file.set_structure(_coerced)
             pdb_file.write(pdb_path)
@@ -1639,472 +1134,6 @@ def _batch_structure_group_items(
     if current:
         batches.append(current)
     return batches
-
-
-def _run_three_phase_clustering_legacy(
-    *,
-    monomer_index: dict[str, Any],
-    sequence_groups: dict[str, list[str]],
-    extracted_structures: dict[str, ExtractedMonomerStructure],
-    outdir: Path,
-    runner: Any,
-    tm_score_threshold: float,
-    min_alignment_coverage_ratio: float,
-    usalign_executable: str,
-    sequence_cluster_jobs: int,
-    pairwise_alignment_jobs: int,
-    model: int,
-    drop_hydrogens: bool,
-    extract_fn: Any | None,
-    protein_subcluster_by_sequence: bool,
-    prep_dir: str | Path | None = None,
-    cif_idx: Any = None,
-) -> dict[str, Any]:
-    """Three-phase parallel monomer structure clustering.
-
-    Phase 1 — extract + subcluster + generate alignment tasks → SQLite
-    Phase 2 — execute all pending USalign tasks globally, update cache + SQLite
-    Phase 3 — per-group greedy reconstruction from SQLite results
-    """
-    import heapq
-    from collections import defaultdict as _dd
-    from cif_parse.clustering.usalign_cache import (
-        AlignmentCacheDB, alignment_cache_key, get_fast_temp_dir,
-    )
-
-    cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
-    LOGGER.info("[checkpoint] SQLite db: %s", outdir / "usalign_tasks.db")
-    pdb_dir = outdir / "pdbs"
-    pdb_dir.mkdir(parents=True, exist_ok=True)
-
-    # ---- Phase 1: extract + subcluster + generate tasks --------------------
-    LOGGER.info("[checkpoint] Phase 1 start: %d sequence groups, %d monomers to extract",
-                len(sequence_groups), sum(len(v) for v in sequence_groups.values()))
-
-    all_subcluster: dict[str, dict[str, str]] = {}  # seq_group → {member_id: rep_id}
-    total_tasks = 0
-    total_cached = 0
-    total_prefiltered = 0
-
-    # Collect unique monomers to extract
-    to_extract: set[str] = set()
-    for member_ids in sequence_groups.values():
-        to_extract.update(member_ids)
-
-    # ---- Phase 1: per-group ProcessPool (extract + subcluster + PDB + tasks) ---
-    # Each worker is fully self-contained for one sequence group.
-    from cif_parse.clustering.atom_cache import resolve_cases_root
-    cases_root: str = str(resolve_cases_root(prep_dir)) if prep_dir else ""
-    # Load entry quality metadata for representative ranking
-    quality_by_source: dict[str, EntryQualityMetadata] = {}
-    try:
-        quality_by_source = load_entry_quality_metadata_from_prep(prep_dir)
-    except (FileNotFoundError, OSError, ValueError):
-        LOGGER.debug("[fallback] Failed to load entry quality metadata", exc_info=True)
-
-    # ---- Phase 1: per-group ProcessPool (extract + subcluster + PDB + tasks) ---
-    # Build picklable payloads, sorted largest-first to minimize long tail.
-    # Each worker is fully self-contained for one sequence group.
-
-    # Pre-serialize once, not per-group.
-    _monomer_dicts: dict[str, dict[str, Any]] = {
-        mid: asdict(m)
-        for mid in tqdm(to_extract, desc="Serialize monomers", unit="monomer")
-        if (m := monomer_index.get(mid))
-    }
-    _quality_dicts: dict[str, dict[str, Any]] = {
-        k: asdict(v) for k, v in quality_by_source.items()
-    }
-    _group_payloads = [
-        (seq_id, member_ids,
-         [{**_monomer_dicts[mid]} for mid in member_ids if mid in _monomer_dicts],
-         cases_root, str(pdb_dir), min_alignment_coverage_ratio,
-         _quality_dicts)
-        for seq_id, member_ids in tqdm(sorted(sequence_groups.items()), desc="Build group payloads", unit="group")
-    ]
-
-    task_rows: list[dict[str, Any]] = []
-    cluster_order: list[tuple[str, int]] = []
-    all_subcluster: dict[str, dict[str, str]] = {}
-    total_tasks = 0
-    total_prefiltered = 0
-    ext_success = 0
-    ext_fail = 0
-
-    # Sort largest groups first to minimize ProcessPool long tail
-    _group_payloads.sort(key=lambda g: -len(g[1]))
-
-    # Save lightweight structures needed by Phase 3, then release heavy ones
-    # before forking ProcessPool workers.
-    _group_member_map: dict[str, list[str]] = {k: list(v) for k, v in sequence_groups.items()}
-    _monomer_index_light: dict[str, Any] = {mid: m for mid, m in monomer_index.items()
-                                             if mid in to_extract}
-    del monomer_index, sequence_groups
-
-    # Close SQLite before fork — each worker opens its own if needed.
-    # An open SQLite connection inherited by 64 forked processes causes
-    # file descriptor exhaustion and WAL locking conflicts.
-    cache_db.close()
-
-    n_workers = max(1, min(sequence_cluster_jobs, len(_group_payloads))) if sequence_cluster_jobs > 1 else 1
-    if n_workers > 1 and len(_group_payloads) > 1:
-        from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _ac
-        with _PPE(max_workers=n_workers) as _gex:
-            futures = {_gex.submit(_process_one_group_worker, g): i for i, g in enumerate(_group_payloads)}
-            for f in tqdm(_ac(futures), total=len(futures),
-                          desc="Phase 1 (extract+subcluster)", unit="group"):
-                r = f.result()
-                cluster_order.append((r["cluster_id"], len(cluster_order)))
-                all_subcluster[r["cluster_id"]] = r["subcluster"]
-                total_prefiltered += r.get("prefiltered", 0)
-                for mid, info in r.get("extracted_info", {}).items():
-                    extracted_structures[mid] = _reconstruct_structure(mid, info, _monomer_index_light)
-                task_rows.extend(r["tasks"])
-                total_tasks += len(r["tasks"])
-    else:
-        for g in tqdm(_group_payloads, desc="Phase 1 (extract+subcluster)", unit="group"):
-            r = _process_one_group_worker(g)
-            cluster_order.append((r["cluster_id"], len(cluster_order)))
-            all_subcluster[r["cluster_id"]] = r["subcluster"]
-            total_prefiltered += r.get("prefiltered", 0)
-            for mid, info in r.get("extracted_info", {}).items():
-                extracted_structures[mid] = _reconstruct_structure(mid, info, _monomer_index_light)
-            task_rows.extend(r["tasks"])
-            total_tasks += len(r["tasks"])
-
-    ext_success = sum(1 for mid in to_extract if mid in extracted_structures)
-    ext_fail = len(to_extract) - ext_success
-    LOGGER.info("[checkpoint] Phase 1: %d/%d monomers extracted (%d failures), %d tasks",
-                ext_success, len(to_extract), ext_fail, total_tasks)
-
-    # Reopen SQLite after fork
-    cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
-
-    existing_completed_keys = cache_db.cache_get_completed_keys()
-    existing_task_keys = cache_db.task_get_all_keys()
-    new_task_rows = [
-        t for t in task_rows
-        if t["cache_key"] not in existing_completed_keys
-        and t["cache_key"] not in existing_task_keys
-    ]
-    skipped_tasks = len(task_rows) - len(new_task_rows)
-    if skipped_tasks:
-        LOGGER.info("[checkpoint] Phase 1: Skipped %d tasks already present in DB", skipped_tasks)
-
-    # Batch insert tasks into SQLite + upsert cache entries
-    LOGGER.info("[checkpoint] Phase 1: Start insert %d tasks into SQLite", len(new_task_rows))
-    if new_task_rows:
-        cache_db.task_insert_many(new_task_rows)
-        all_keys = [t["cache_key"] for t in new_task_rows]
-        cache_db.cache_upsert_pending_many(all_keys)
-
-    # ---- Phase 2: execute all pending USalign tasks globally ---------------
-    pending_tasks = cache_db.task_get_pending()
-    if pending_tasks:
-        LOGGER.info("[checkpoint] Phase 2 start: %d USalign tasks, %d workers",
-                    len(pending_tasks), pairwise_alignment_jobs)
-        from cif_parse.clustering.parallel import AlignmentTask
-
-        def _build_alignment_task(t: dict[str, Any]) -> AlignmentTask:
-            q = extracted_structures.get(t["query_monomer_id"])
-            tgt = extracted_structures.get(t["target_monomer_id"])
-            if q is None or tgt is None:
-                raise ValueError(f"Missing structure for {t['query_monomer_id']} or {t['target_monomer_id']}")
-            return AlignmentTask(key=t["cache_key"], query=q, target=tgt, context={"task": t})
-
-        pending_tasks.sort(key=lambda t: -(t["query_pdb_size"] + t["target_pdb_size"]))
-        batch_size = max(1, min(200, len(pending_tasks)))
-
-        for i in tqdm(range(0, len(pending_tasks), batch_size), desc="Phase 2 (USalign)", unit="batch"):
-            batch = pending_tasks[i:i + batch_size]
-            align_tasks = [_build_alignment_task(t) for t in batch]
-            successes, failures = run_alignment_tasks(
-                align_tasks, runner,
-                max_workers=pairwise_alignment_jobs,
-                progress_desc="USalign batch",
-                usalign_executable=usalign_executable,
-                tm_score_threshold=tm_score_threshold,
-                min_alignment_coverage_ratio=min_alignment_coverage_ratio,
-            )
-            done_ids: list[int] = []
-            for task, result in successes:
-                cache_db.cache_write_result(task.key, {
-                    "tm_score_query": result.tm_score_query, "tm_score_target": result.tm_score_target,
-                    "tm_score_max": result.max_tm_score, "rmsd": result.rmsd,
-                    "aligned_length": result.aligned_length,
-                    "shorter_length_coverage": result.shorter_length_coverage,
-                    "resolved_length_coverage": result.resolved_length_coverage,
-                })
-                tid = task.context.get("task", {}).get("task_id")
-                if tid is not None: done_ids.append(int(tid))
-            for task, exc in failures:
-                cache_db.cache_write_error(task.key, str(exc))
-                tid = task.context.get("task", {}).get("task_id")
-                if tid is not None: done_ids.append(int(tid))
-            if done_ids:
-                cache_db.task_status_batch_update(done_ids, "completed")
-
-        LOGGER.info("Phase 2 complete: %d tasks", len(pending_tasks))
-
-    # ---- Phase 3: per-group greedy reconstruction --------------------------
-    LOGGER.info("[checkpoint] Phase 3 start: %d groups, %d total members",
-                len(cluster_order), sum(len(_group_member_map[g[0]]) for g in cluster_order))
-
-    alignment_rows: list[dict[str, Any]] = []
-    membership_rows: list[dict[str, Any]] = []
-    representative_rows: list[dict[str, Any]] = []
-    warning_rows: list[dict[str, Any]] = []
-
-    total_struct_clusters = 0
-    total_alignments = 0
-    total_alignment_failures = 0
-    total_sequence_fallback = 0
-    total_all_failure_collapses = 0
-
-    for seq_cluster_id, group_idx in tqdm(cluster_order, desc="Phase 3 (reconstruct)", unit="group"):
-        member_ids = _group_member_map[seq_cluster_id]
-        subcluster_rep = all_subcluster.get(seq_cluster_id, {})
-        db_tasks = cache_db.tasks_for_group(seq_cluster_id)
-
-        # Build candidate structures
-        candidates = sorted(
-            [extracted_structures[mid] for mid in member_ids if mid in extracted_structures],
-            key=lambda item: item.quality_sort_key(),
-        )
-        if not candidates:
-            # All extractions failed — collapse whole group
-            scid = _protein_structure_cluster_id(seq_cluster_id, 1)
-            total_struct_clusters += 1
-            total_sequence_fallback += len(member_ids)
-            total_all_failure_collapses += 1
-            warning_rows.append({
-                "warning_code": "no_extracted_structures_in_sequence_cluster",
-                "sequence_cluster_id": seq_cluster_id,
-                "structure_cluster_id": scid,
-                "representative_monomer_id": member_ids[0],
-                "member_monomer_ids": member_ids,
-            })
-            for mid in member_ids:
-                membership_rows.append({
-                    "polymer_class": "protein",
-                    "sequence_cluster_id": seq_cluster_id,
-                    "structure_cluster_id": scid,
-                    "representative_monomer_id": member_ids[0],
-                    "member_monomer_id": mid,
-                    "assignment_reason": "structure_extraction_failure_sequence_cluster_collapse",
-                    "tm_score_min": "", "tm_score_max": "", "tm_score_for_clustering": "",
-                    "alignment_coverage_shorter": "", "alignment_coverage_resolved": "",
-                })
-            rep_mono = _monomer_index_light.get(member_ids[0])
-            representative_rows.append({
-                "sequence_cluster_id": seq_cluster_id,
-                "structure_cluster_id": scid,
-                "representative_monomer_id": member_ids[0],
-                "num_members": len(member_ids),
-                "pdb_id": rep_mono.pdb_id if rep_mono else "",
-                "label_asym_id": rep_mono.label_asym_id if rep_mono else "",
-                "auth_asym_id": rep_mono.auth_asym_id or "" if rep_mono else "",
-                "resolved_fraction": "", "primary_method": "", "resolution": "",
-            })
-            continue
-
-        # Group tasks by round, build result lookup
-        results_by_key: dict[str, dict[str, Any]] = {}
-        failures_by_key: set[str] = set()
-        for t in db_tasks:
-            if t.get("error_message"):
-                failures_by_key.add(t["cache_key"])
-            elif t.get("tm_score_max") is not None:
-                results_by_key[t["cache_key"]] = t
-
-        # Replay greedy clustering
-        # Start with subcluster representatives as the pending pool
-        if subcluster_rep:
-            rep_ids = set(subcluster_rep.values())
-            pending = sorted(
-                [s for s in candidates if s.monomer_id in rep_ids],
-                key=lambda item: item.quality_sort_key(),
-            )
-            if not pending:
-                pending = sorted(candidates, key=lambda item: item.quality_sort_key())
-        else:
-            pending = sorted(candidates, key=lambda item: item.quality_sort_key())
-
-        cluster_states: list[dict[str, Any]] = []
-        failed_candidates: list[Any] = []
-        extracted_ids = {s.monomer_id for s in candidates}
-        missing_ids = sorted(set(member_ids) - extracted_ids)
-        local_ci = 0
-
-        while pending:
-            rep = pending[0]
-            local_ci += 1
-            scid = _protein_structure_cluster_id(seq_cluster_id, local_ci)
-            assigned = [rep]
-            remaining = []
-
-            for candidate in pending[1:]:
-                ck = alignment_cache_key(
-                    seq_query=_monomer_index_light[rep.monomer_id].sequence if rep.monomer_id in _monomer_index_light else "",
-                    seq_target=_monomer_index_light[candidate.monomer_id].sequence if candidate.monomer_id in _monomer_index_light else "",
-                    source_query=rep.source_path,
-                    source_target=candidate.source_path,
-                )
-                result = results_by_key.get(ck)
-                if result is None:
-                    # Was cached/prefiltered — check if still applicable
-                    cached = cache_db.cache_lookup(ck)
-                    if cached:
-                        result = {"tm_score_max": cached["tm_score_max"], "rmsd": cached["rmsd"],
-                                  "aligned_length": cached["aligned_length"],
-                                  "shorter_length_coverage": cached["shorter_length_coverage"],
-                                  "resolved_length_coverage": cached["resolved_length_coverage"]}
-
-                if ck in failures_by_key:
-                    total_alignment_failures += 1
-                    remaining.append(candidate)
-                elif (result
-                      and result.get("tm_score_max", 0) >= tm_score_threshold
-                      and result.get("resolved_length_coverage", 0) >= min_alignment_coverage_ratio):
-                    assigned.append(candidate)
-                    total_alignments += 1
-                    alignment_rows.append({
-                        "sequence_cluster_id": seq_cluster_id,
-                        "query_monomer_id": rep.monomer_id,
-                        "target_monomer_id": candidate.monomer_id,
-                        "aligned_length": result.get("aligned_length", 0),
-                        "rmsd": result.get("rmsd", 0),
-                        "tm_score_query": result.get("tm_score_query", result.get("tm_score_max", 0)),
-                        "tm_score_target": result.get("tm_score_target", result.get("tm_score_max", 0)),
-                        "tm_score_min": result.get("tm_score_min", result.get("tm_score_max", 0)),
-                        "tm_score_max": result.get("tm_score_max", 0),
-                        "tm_score_for_clustering": result.get("tm_score_max", 0),
-                    })
-                else:
-                    remaining.append(candidate)
-
-            cluster_states.append({"rep": rep, "assigned": assigned, "scid": scid})
-            pending = remaining
-
-        # Build rep→cluster_id mapping for subcluster expansion
-        rep_to_cluster: dict[str, str] = {}
-        for state in cluster_states:
-            scid = state["scid"]
-            for member in state["assigned"]:
-                rep_to_cluster[member.monomer_id] = scid
-
-        # Write membership + representative rows
-        for state in cluster_states:
-            rep = state["rep"]
-            scid = state["scid"]
-            total_struct_clusters += 1
-
-            ordered = sorted(state["assigned"], key=lambda item: (item.monomer_id != rep.monomer_id, item.monomer_id))
-            for member in ordered:
-                reason = "representative"
-                tm_min, tm_max, tm_clus, cov_shorter, cov_resolved = "", "", "", "", ""
-                if member.monomer_id != rep.monomer_id:
-                    reason = "representative_alignment"
-                    pair_key = alignment_cache_key(
-                        seq_query=_monomer_index_light[rep.monomer_id].sequence if rep.monomer_id in _monomer_index_light else "",
-                        seq_target=_monomer_index_light[member.monomer_id].sequence if member.monomer_id in _monomer_index_light else "",
-                        source_query=rep.source_path, source_target=member.source_path,
-                    )
-                    result = results_by_key.get(pair_key)
-                    if result is not None:
-                        tm_min = result.get("tm_score_min", "") or result.get("tm_score_max", "")
-                        tm_max = result.get("tm_score_max", "")
-                        tm_clus = result.get("tm_score_max", "")
-                        cov_shorter = result.get("shorter_length_coverage", "")
-                        cov_resolved = result.get("resolved_length_coverage", "")
-                membership_rows.append({
-                    "polymer_class": "protein", "sequence_cluster_id": seq_cluster_id,
-                    "structure_cluster_id": scid,
-                    "representative_monomer_id": rep.monomer_id,
-                    "member_monomer_id": member.monomer_id,
-                    "assignment_reason": reason,
-                    "tm_score_min": tm_min, "tm_score_max": tm_max,
-                    "tm_score_for_clustering": tm_clus,
-                    "alignment_coverage_shorter": cov_shorter,
-                    "alignment_coverage_resolved": cov_resolved,
-                })
-
-            # Expand subcluster members assigned to this cluster
-            if subcluster_rep:
-                for mid, rid in subcluster_rep.items():
-                    assigned_cluster = rep_to_cluster.get(rid)
-                    if assigned_cluster and assigned_cluster == scid and mid != rid:
-                        membership_rows.append({
-                            "polymer_class": "protein", "sequence_cluster_id": seq_cluster_id,
-                            "structure_cluster_id": assigned_cluster,
-                            "representative_monomer_id": rid,
-                            "member_monomer_id": mid,
-                            "assignment_reason": "identical_sequence_subcluster",
-                            "tm_score_min": "", "tm_score_max": "", "tm_score_for_clustering": "",
-                            "alignment_coverage_shorter": "", "alignment_coverage_resolved": "",
-                        })
-
-            sub_extra = sum(
-                1 for mid, rid in subcluster_rep.items()
-                if rid == rep.monomer_id and mid != rid
-            ) if subcluster_rep else 0
-            representative_rows.append({
-                "sequence_cluster_id": seq_cluster_id,
-                "structure_cluster_id": scid,
-                "representative_monomer_id": rep.monomer_id,
-                "num_members": len(state["assigned"]) + sub_extra + (len(missing_ids) if state == cluster_states[0] else 0),
-                "pdb_id": rep.pdb_id, "label_asym_id": rep.label_asym_id,
-                "auth_asym_id": rep.auth_asym_id or "",
-                "resolved_fraction": rep.resolved_fraction,
-                "primary_method": rep.quality.primary_method if rep.quality else "",
-                "resolution": rep.quality.resolution if rep.quality else "",
-            })
-
-        # Fallback members (extraction failures assigned to first cluster)
-        if missing_ids:
-            fallback_scid = cluster_states[0]["scid"] if cluster_states else _protein_structure_cluster_id(seq_cluster_id, 1)
-            for mid in sorted(missing_ids):
-                membership_rows.append({
-                    "polymer_class": "protein", "sequence_cluster_id": seq_cluster_id,
-                    "structure_cluster_id": fallback_scid,
-                    "representative_monomer_id": cluster_states[0]["rep"].monomer_id if cluster_states else member_ids[0],
-                    "member_monomer_id": mid,
-                    "assignment_reason": "structure_extraction_failure_sequence_fallback",
-                    "tm_score_min": "", "tm_score_max": "", "tm_score_for_clustering": "",
-                    "alignment_coverage_shorter": "", "alignment_coverage_resolved": "",
-                })
-
-    cache_db.close()
-
-    manifest = {
-        "num_sequence_groups": len(_group_member_map),
-        "num_structure_clusters": total_struct_clusters,
-        "num_alignment_runs": total_alignments,
-        "num_alignment_failures": total_alignment_failures,
-        "num_sequence_fallback_assignments": total_sequence_fallback,
-        "num_all_failure_sequence_cluster_collapses": total_all_failure_collapses,
-        "num_membership_rows": len(membership_rows),
-        "num_prefiltered": total_prefiltered,
-        "num_cache_hits": total_cached,
-        "tm_score_threshold": tm_score_threshold,
-        "min_alignment_coverage_ratio": min_alignment_coverage_ratio,
-    }
-
-    # Write CSVs for high-order stages consumption
-    dump_csv_rows(outdir / "protein_structure_cluster_membership.csv", membership_rows)
-    dump_csv_rows(outdir / "protein_structure_cluster_representatives.csv", representative_rows)
-    dump_jsonl(outdir / "protein_structure_pairwise_alignments.jsonl", alignment_rows)
-    dump_jsonl(outdir / "protein_structure_cluster_warnings.jsonl", warning_rows)
-
-    return {
-        "manifest": manifest,
-        "membership_rows": membership_rows,
-        "representative_rows": representative_rows,
-        "alignment_rows": alignment_rows,
-        "warning_rows": warning_rows,
-        "sequence_groups": _group_member_map if '_group_member_map' in dir() else sequence_groups,
-        "monomer_index": _monomer_index_light if '_monomer_index_light' in dir() else monomer_index,
-    }
 
 
 def _structure_alignment_cache_key(
@@ -2392,6 +1421,14 @@ def _run_three_phase_clustering(
             error = state["round_failures"].get(candidate.monomer_id)
             if error is not None:
                 remaining.append(candidate)
+                LOGGER.warning(
+                    "USalign failed for protein structures %s vs %s in %s; "
+                    "keeping the candidate for a later cluster: %s",
+                    representative.monomer_id,
+                    candidate.monomer_id,
+                    state["sequence_cluster_id"],
+                    error,
+                )
                 warning_rows.append(
                     {
                         "warning_code": "protein_usalign_failed",
@@ -2424,7 +1461,7 @@ def _run_three_phase_clustering(
     pairwise_alignment_jobs = max(1, int(pairwise_alignment_jobs))
     future_to_item: dict[Any, dict[str, Any]] = {}
     max_pending = pairwise_alignment_jobs * 4
-    progress = tqdm(desc="Phase 2 (USalign)", unit="alignment")
+    progress = tqdm(total=0, desc="Phase 2 (USalign)", unit="alignment")
     with ThreadPoolExecutor(max_workers=pairwise_alignment_jobs) as executor:
         while ready_states or future_to_item or active_state_count:
             capacity = max_pending - len(future_to_item)
@@ -2456,6 +1493,7 @@ def _run_three_phase_clustering(
                 )
 
             if scheduled_items:
+                progress.total = int(progress.total or 0) + len(scheduled_items)
                 cache_records = cache_db.cache_get_records(
                     [item["cache_key"] for item in scheduled_items]
                 )
