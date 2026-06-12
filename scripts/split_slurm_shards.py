@@ -7,6 +7,7 @@ import argparse
 import heapq
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -19,6 +20,22 @@ def _load_inputs(path: Path) -> list[str]:
     return inputs
 
 
+def _strip_mmcif_suffix(name: str) -> str:
+    lowered = name.lower()
+    for suffix in (".cif.gz", ".bcif.gz", ".cif", ".bcif"):
+        if lowered.endswith(suffix):
+            return lowered[: -len(suffix)]
+    return lowered
+
+
+def _input_assembly_group_key(path: str) -> str:
+    stem = _strip_mmcif_suffix(Path(path).name)
+    match = re.search(r"^(.{4})(?:[-_].*)?[-_]assembly[-_]?[a-z0-9]+(?:$|[-_])", stem)
+    if match:
+        return f"pdb:{match.group(1)}"
+    return f"path:{path}"
+
+
 def split_input_list(input_list: Path, shard_dir: Path, num_shards: int) -> list[dict[str, object]]:
     paths = _load_inputs(input_list)
     if not paths:
@@ -28,29 +45,36 @@ def split_input_list(input_list: Path, shard_dir: Path, num_shards: int) -> list
     for old in shard_dir.glob("shard_*.txt"):
         old.unlink()
 
-    weights: list[tuple[int, str]] = []
+    grouped: dict[str, list[str]] = {}
     for path in paths:
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = 0
-        weights.append((size, path))
+        grouped.setdefault(_input_assembly_group_key(path), []).append(path)
 
-    actual_shards = min(max(1, int(num_shards)), len(paths))
-    heap: list[tuple[int, int, list[str]]] = [(0, idx, []) for idx in range(actual_shards)]
+    weights: list[tuple[int, str, list[str]]] = []
+    for group_key, group_paths in grouped.items():
+        total_size = 0
+        for path in group_paths:
+            try:
+                total_size += os.path.getsize(path)
+            except OSError:
+                pass
+        weights.append((total_size, group_key, group_paths))
+
+    actual_shards = min(max(1, int(num_shards)), len(weights))
+    heap: list[tuple[int, int, int, list[str]]] = [(0, idx, 0, []) for idx in range(actual_shards)]
     heapq.heapify(heap)
-    for size, path in sorted(weights, reverse=True):
-        total, idx, bucket = heapq.heappop(heap)
-        bucket.append(path)
-        heapq.heappush(heap, (total + size, idx, bucket))
+    for size, _group_key, group_paths in sorted(weights, reverse=True):
+        total, idx, group_count, bucket = heapq.heappop(heap)
+        bucket.extend(group_paths)
+        heapq.heappush(heap, (total + size, idx, group_count + 1, bucket))
 
     plan: list[dict[str, object]] = []
-    for total, idx, bucket in sorted(heap, key=lambda item: item[1]):
+    for total, idx, group_count, bucket in sorted(heap, key=lambda item: item[1]):
         shard_path = shard_dir / f"shard_{idx:04d}.txt"
         shard_path.write_text("\n".join(bucket) + "\n", encoding="utf-8")
         plan.append({
             "shard": idx,
             "input_count": len(bucket),
+            "group_count": group_count,
             "estimated_bytes": total,
             "path": str(shard_path),
         })

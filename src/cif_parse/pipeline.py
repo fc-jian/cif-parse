@@ -317,6 +317,29 @@ def _infer_pdb_id_from_assembly_path(path: Path) -> str:
     return name.upper()[:4]
 
 
+def find_metadata_cif_path(cif_dir: Path, pdb_id: str) -> Path | None:
+    """Find the original full mmCIF for *pdb_id* in a metadata CIF tree."""
+    pdb_lower = pdb_id.lower()
+    candidates = [
+        cif_dir / f"{pdb_lower}.cif.gz",
+        cif_dir / f"{pdb_lower}.bcif.gz",
+        cif_dir / f"{pdb_lower}.cif",
+        cif_dir / f"{pdb_lower}.bcif",
+        cif_dir / f"{pdb_id.upper()}.cif.gz",
+        cif_dir / f"{pdb_id.upper()}.bcif.gz",
+        cif_dir / f"{pdb_id.upper()}.cif",
+        cif_dir / f"{pdb_id.upper()}.bcif",
+        cif_dir / pdb_lower[1:3] / f"{pdb_lower}.cif.gz",
+        cif_dir / pdb_lower[1:3] / f"{pdb_lower}.bcif.gz",
+        cif_dir / pdb_lower[1:3] / f"{pdb_lower}.cif",
+        cif_dir / pdb_lower[1:3] / f"{pdb_lower}.bcif",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _query_metadata_table(table_path: Path, pdb_id: str) -> dict[str, Any] | None:
     """Query a parquet or CSV metadata table for *pdb_id*."""
     rows = _load_metadata_table(table_path)
@@ -382,25 +405,15 @@ def _query_metadata_cif_dir(cif_dir: Path, pdb_id: str) -> dict[str, Any] | None
     """Find the original full mmCIF for *pdb_id* in *cif_dir* and read metadata."""
     from cif_parse.io.cif_reader import read_case_metadata as _read_meta
 
-    pdb_lower = pdb_id.lower()
-    candidates = [
-        cif_dir / f"{pdb_lower}.cif.gz",
-        cif_dir / f"{pdb_lower}.cif",
-        cif_dir / f"{pdb_id.upper()}.cif.gz",
-        cif_dir / f"{pdb_id.upper()}.cif",
-        # PDB two-char shard layout: yw/5ywo.cif.gz
-        cif_dir / pdb_lower[1:3] / f"{pdb_lower}.cif.gz",
-        cif_dir / pdb_lower[1:3] / f"{pdb_lower}.cif",
-    ]
-    for cand in candidates:
-        if cand.exists():
-            try:
-                meta = _read_meta(str(cand))
-                if meta.get("experimental_method") or meta.get("resolution"):
-                    meta["metadata_source"] = "full_mmcif"
-                    return meta
-            except Exception:
-                continue
+    cand = find_metadata_cif_path(cif_dir, pdb_id)
+    if cand is not None:
+        try:
+            meta = _read_meta(str(cand))
+            if meta.get("experimental_method") or meta.get("resolution"):
+                meta["metadata_source"] = "full_mmcif"
+                return meta
+        except Exception:
+            return None
     return None
 
 
@@ -458,6 +471,7 @@ def process_single_structure(
     settings: AppSettings,
     *,
     _allowed_assembly_ids: list[str] | None = None,
+    _force_asym_assembly_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the full processing pipeline for one structure and persist outputs."""
 
@@ -521,6 +535,45 @@ def process_single_structure(
                 },
             )
 
+    if _force_asym_assembly_id is not None:
+        forced_id = str(_force_asym_assembly_id)
+        summary.assembly_ids = [forced_id]
+        summary.assembly_descriptions = {
+            forced_id: "asymmetric unit included as assembly 0",
+        }
+        _dump_atom_cache_as_assembly(
+            outdir=outdir,
+            input_path=input_path,
+            cif_file=cif_file,
+            assembly_id=forced_id,
+            model=settings.model,
+        )
+        result = _process_single_structure_for_mode(
+            input_path=input_path,
+            outdir=outdir,
+            settings=settings,
+            summary=summary,
+            chain_inventory=chain_inventory,
+            cif_file=cif_file,
+            analysis_assembly_mode="input_assembly",
+            selected_assembly_id=forced_id,
+            bundle_name=f"result_assembly_{forced_id}.json.gz",
+        )
+        result["num_assemblies_processed"] = 1
+        result["processed_assembly_ids"] = [forced_id]
+        result["_meta"] = metadata
+        LOGGER.info(
+            "Finished %s asymmetric unit as assembly %s: %d chains, %d dimers, %d multimers, %d antibody complexes, %d TCR complexes",
+            summary.pdb_id,
+            forced_id,
+            result["num_chains"],
+            result["num_dimers"],
+            result["num_multimers"],
+            result["num_antibody_antigen_complexes"],
+            result["num_tcr_pmhc_complexes"],
+        )
+        return result
+
     # Validate pre-split assembly files: chain IDs must be unique.
     if settings.input_assembly:
         from collections import Counter as _Counter
@@ -568,6 +621,9 @@ def process_single_structure(
             selected_assembly_id=selected_assembly_id,
             bundle_name=_resolve_single_mode_bundle_name(settings, selected_assembly_id),
         )
+        if selected_assembly_id is not None:
+            result["num_assemblies_processed"] = 1
+            result["processed_assembly_ids"] = [selected_assembly_id]
         result["_meta"] = metadata
         LOGGER.info(
             "Finished %s: %d chains, %d dimers, %d multimers, %d antibody complexes, %d TCR complexes",
@@ -883,6 +939,35 @@ def _dump_atom_cache_au(
             )
     except Exception:
         LOGGER.debug("Failed to cache asymmetric unit for %s", input_path)
+
+
+def _dump_atom_cache_as_assembly(
+    *,
+    outdir: Path,
+    input_path: Path,
+    cif_file: CIFFile | None = None,
+    assembly_id: str,
+    model: int,
+) -> None:
+    """Write asymmetric-unit coordinates directly as ``atoms/{assembly_id}.pkl``."""
+    atoms_dir = outdir / "atoms"
+    atoms_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = atoms_dir / f"{assembly_id}.pkl"
+    if cache_path.exists():
+        return
+    try:
+        cif_file = cif_file or read_cif_file(input_path)
+        atom_array = get_structure_with_altloc_fallback(
+            cif_file,
+            model=model,
+            use_author_fields=False,
+        )
+        if atom_array is not None and len(atom_array) > 0:
+            cache_path.write_bytes(
+                zlib.compress(pickle.dumps(atom_array, protocol=pickle.HIGHEST_PROTOCOL), 3)
+            )
+    except Exception:
+        LOGGER.debug("Failed to cache asymmetric unit as assembly %s for %s", assembly_id, input_path)
 
 
 def _process_single_assembly_parallel(

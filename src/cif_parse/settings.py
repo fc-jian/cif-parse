@@ -98,6 +98,7 @@ class AppSettings:
     output_format: str = "json"
     assembly_mode: str = "asymmetric_unit"
     input_assembly: bool = False
+    include_asym: bool = False
     metadata_cif_dir: str = ""
     metadata_table: str = ""
     coverage_mode: str = "nearest"
@@ -133,6 +134,10 @@ class AppSettings:
             raise ValueError(f"Unsupported output format: {self.output_format}")
         if self.assembly_mode not in SUPPORTED_ASSEMBLY_MODES:
             raise ValueError(f"Unsupported assembly mode: {self.assembly_mode}")
+        if self.include_asym and not self.input_assembly:
+            raise ValueError("include_asym is only supported with input_assembly mode")
+        if self.include_asym and not str(self.metadata_cif_dir or "").strip():
+            raise ValueError("include_asym requires metadata_cif_dir")
         if self.coverage_mode not in SUPPORTED_COVERAGE_MODES:
             raise ValueError(f"Unsupported coverage mode: {self.coverage_mode}")
         if self.log_level.upper() not in SUPPORTED_LOG_LEVELS:
@@ -284,6 +289,7 @@ def default_cli_config() -> dict[str, Any]:
             "output_format": "json",
             "assembly_mode": "asymmetric_unit",
             "input_assembly": False,
+            "include_asym": False,
             "metadata_cif_dir": "",
             "metadata_table": "",
             "coverage_mode": "nearest",
@@ -419,6 +425,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
             "output_format",
             "assembly_mode",
             "input_assembly",
+            "include_asym",
             "metadata_cif_dir",
             "metadata_table",
             "coverage_mode",
@@ -496,6 +503,7 @@ def _merge_toml_config(config: dict[str, Any], parsed: dict[str, Any]) -> None:
         "output_format": validated_settings.output_format,
         "assembly_mode": validated_settings.assembly_mode,
         "input_assembly": validated_settings.input_assembly,
+        "include_asym": validated_settings.include_asym,
         "metadata_cif_dir": validated_settings.metadata_cif_dir,
         "metadata_table": validated_settings.metadata_table,
         "coverage_mode": validated_settings.coverage_mode,

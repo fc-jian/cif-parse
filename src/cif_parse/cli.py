@@ -14,7 +14,12 @@ from typing import Any
 
 from cif_parse.export import dump_json, load_case_output_bundle, load_json, resolve_json_path
 from cif_parse.io import read_case_metadata, read_structure_summary
-from cif_parse.pipeline import StructureSkipWarning, infer_case_id, process_single_structure
+from cif_parse.pipeline import (
+    StructureSkipWarning,
+    find_metadata_cif_path,
+    infer_case_id,
+    process_single_structure,
+)
 from cif_parse.reporting import (
     build_batch_html_report,
     build_review_report,
@@ -193,6 +198,15 @@ def _add_runtime_args(
         help="CIF files are already split per-assembly; skip assembly expansion and validate chain uniqueness",
     )
     parser.add_argument(
+        "--include-asym",
+        action=argparse.BooleanOptionalAction,
+        default=bool(settings_defaults.get("include_asym", False)),
+        help=(
+            "With --input-assembly, also process each source PDB asymmetric unit from "
+            "--metadata-cif-dir as synthetic assembly 0"
+        ),
+    )
+    parser.add_argument(
         "--metadata-cif-dir",
         type=str,
         default=str(settings_defaults.get("metadata_cif_dir", "")),
@@ -335,6 +349,7 @@ def _settings_from_args(args: argparse.Namespace) -> AppSettings:
         output_format=args.format,
         assembly_mode="asymmetric_unit" if args.input_assembly else args.assembly_mode,
         input_assembly=args.input_assembly,
+        include_asym=args.include_asym,
         metadata_cif_dir=args.metadata_cif_dir or "",
         metadata_table=args.metadata_table or "",
         coverage_mode=args.coverage_mode,
@@ -413,8 +428,22 @@ def _resolve_batch_inputs(inputs: list[Path], input_list: Path | None) -> list[P
     return resolved_inputs
 
 
-def _build_case_specs(input_paths: list[Path], outdir: Path) -> list[dict[str, Any]]:
-    """Assign unique case ids and output directories for batch processing."""
+def _infer_input_assembly_pdb_id(input_path: Path) -> str:
+    case_id = infer_case_id(input_path)
+    lowered = case_id.lower()
+    for marker in ("-assembly", "_assembly"):
+        if marker in lowered:
+            lowered = lowered[: lowered.index(marker)]
+            break
+    return lowered[:4].upper()
+
+
+def _build_case_specs(
+    input_paths: list[Path],
+    outdir: Path,
+    settings: AppSettings | None = None,
+) -> list[dict[str, Any]]:
+    """Assign unique assembly-level case ids and output directories for batch processing."""
 
     total_counts: dict[str, int] = {}
     for input_path in input_paths:
@@ -436,6 +465,33 @@ def _build_case_specs(input_paths: list[Path], outdir: Path) -> list[dict[str, A
                 "output_dir": str(outdir / "cases" / case_id),
             }
         )
+    if settings is not None and settings.include_asym:
+        metadata_dir = Path(settings.metadata_cif_dir)
+        existing_case_ids = {str(spec["case_id"]) for spec in case_specs}
+        seen_pdb_ids: set[str] = set()
+        for input_path in input_paths:
+            pdb_id = _infer_input_assembly_pdb_id(input_path)
+            if not pdb_id or pdb_id in seen_pdb_ids:
+                continue
+            seen_pdb_ids.add(pdb_id)
+            case_id = f"{pdb_id.lower()}-assembly0"
+            if case_id in existing_case_ids:
+                LOGGER.debug("Skipping synthetic asymmetric-unit case %s because it already exists", case_id)
+                continue
+            source_path = find_metadata_cif_path(metadata_dir, pdb_id)
+            spec: dict[str, Any] = {
+                "case_id": case_id,
+                "input_path": str(source_path or ""),
+                "output_dir": str(outdir / "cases" / case_id),
+                "_force_asym_assembly_id": "0",
+                "_source_pdb_id": pdb_id.lower(),
+            }
+            if source_path is None:
+                spec["_missing_metadata_cif"] = (
+                    f"full mmCIF for {pdb_id.lower()} was not found under {metadata_dir}"
+                )
+            case_specs.append(spec)
+            existing_case_ids.add(case_id)
     return case_specs
 
 
@@ -699,7 +755,7 @@ def _result_from_existing_case(task: dict[str, Any]) -> tuple[dict[str, Any] | N
 
 
 def _settings_fingerprint(settings_payload: dict[str, Any]) -> dict[str, Any]:
-    ignored = {"log_level", "verbose"}
+    ignored = {"include_asym", "log_level", "verbose"}
     return {
         key: settings_payload[key]
         for key in sorted(settings_payload)
@@ -888,10 +944,26 @@ def _process_batch_case(task: dict[str, Any]) -> dict[str, Any]:
     settings = AppSettings(**task["settings"])
     configure_logging(settings.log_level)
     allowed_assembly_ids = task.get("_preflight_allowed_assembly_ids")
+    if task.get("_missing_metadata_cif"):
+        return {
+            "case_id": task["case_id"],
+            "pdb_id": str(task.get("_source_pdb_id", "") or ""),
+            "input_path": task.get("input_path", ""),
+            "output_dir": task["output_dir"],
+            "status": "skipped",
+            "warning_code": "missing_metadata_cif_for_include_asym",
+            "warning": str(task["_missing_metadata_cif"]),
+            "warning_details": {
+                "metadata_cif_dir": settings.metadata_cif_dir,
+                "pdb_id": str(task.get("_source_pdb_id", "") or ""),
+            },
+            "_meta": {},
+        }
     try:
         result = process_single_structure(
             task["input_path"], task["output_dir"], settings,
             _allowed_assembly_ids=allowed_assembly_ids,
+            _force_asym_assembly_id=task.get("_force_asym_assembly_id"),
         )
         result["case_id"] = task["case_id"]
         result["status"] = "ok"
@@ -976,6 +1048,7 @@ def _print_single_result(settings: AppSettings, outdir: Path, result: dict[str, 
                         "output_format": settings.output_format,
                         "assembly_mode": settings.assembly_mode,
                         "input_assembly": settings.input_assembly,
+                        "include_asym": settings.include_asym,
                         "metadata_cif_dir": settings.metadata_cif_dir,
                         "metadata_table": settings.metadata_table,
                         "coverage_mode": settings.coverage_mode,
@@ -1030,6 +1103,7 @@ def _print_batch_result(
                         "output_format": settings.output_format,
                         "assembly_mode": settings.assembly_mode,
                         "input_assembly": settings.input_assembly,
+                        "include_asym": settings.include_asym,
                         "metadata_cif_dir": settings.metadata_cif_dir,
                         "metadata_table": settings.metadata_table,
                         "coverage_mode": settings.coverage_mode,
@@ -1076,9 +1150,15 @@ def _write_batch_artifacts(
     outdir: Path,
     input_paths: list[str | Path],
     results: list[dict[str, Any]],
+    planned_case_count: int | None = None,
+    submitted_case_count: int | None = None,
 ) -> tuple[dict[str, Any], Path, Path, Path, Path]:
     results.sort(key=lambda item: item["case_id"])
     summary = _summarize_batch_results(results)
+    if planned_case_count is not None:
+        summary["planned_case_count"] = planned_case_count
+    if submitted_case_count is not None:
+        summary["submitted_case_count"] = submitted_case_count
     resumed_count = sum(1 for result in results if result.get("resumed"))
     if resumed_count:
         summary["resumed_existing_count"] = resumed_count
@@ -1152,10 +1232,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2))
         return 0
 
-    settings = _settings_from_args(args)
+    try:
+        settings = _settings_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     configure_logging(settings.log_level)
     if args.command == "batch" and args.jobs < 1:
         parser.error("--jobs must be >= 1")
+    if getattr(settings, "include_asym", False) and args.command != "batch":
+        parser.error("--include-asym is only supported for batch --input-assembly")
 
     if args.command == "single":
         if args.input is None:
@@ -1183,6 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
         "output_format": settings.output_format,
         "assembly_mode": settings.assembly_mode,
         "input_assembly": settings.input_assembly,
+        "include_asym": settings.include_asym,
         "metadata_cif_dir": settings.metadata_cif_dir,
         "metadata_table": settings.metadata_table,
         "coverage_mode": settings.coverage_mode,
@@ -1220,7 +1306,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.inputs or args.input_list is not None:
             input_paths = _resolve_batch_inputs(args.inputs, args.input_list)
-            case_specs = _build_case_specs(input_paths, args.outdir)
+            case_specs = _build_case_specs(input_paths, args.outdir, settings)
             manifest_input_paths: list[str | Path] = input_paths
         elif manifest_results:
             case_specs = _build_case_specs_from_manifest(args.outdir, manifest_results)
@@ -1283,10 +1369,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if summary["failure_count"] == 0 else 1
 
     input_paths = _resolve_batch_inputs(args.inputs, args.input_list)
-    case_specs = _build_case_specs(input_paths, args.outdir)
+    case_specs = _build_case_specs(input_paths, args.outdir, settings)
+    planned_case_count = len(case_specs)
     LOGGER.info(
-        "Starting batch processing for %d inputs with %d worker(s)",
-        len(case_specs),
+        "Planned %d assembly-level task(s) from %d input(s) with %d worker(s)",
+        planned_case_count,
+        len(input_paths),
         args.jobs,
     )
     if args.resume:
@@ -1341,6 +1429,11 @@ def main(argv: list[str] | None = None) -> int:
                 resumed,
                 len(tasks),
             )
+    submitted_case_count = len(tasks)
+    LOGGER.info(
+        "Submitting %d assembly-level task(s) after resume/existing-output filtering",
+        submitted_case_count,
+    )
 
     # ── Streaming preflight → priority heap → process pool ──────────────
     # Pre-scan preflight results stream into a max-heap (largest assembly
@@ -1497,6 +1590,8 @@ def main(argv: list[str] | None = None) -> int:
         outdir=args.outdir,
         input_paths=input_paths,
         results=results,
+        planned_case_count=planned_case_count,
+        submitted_case_count=submitted_case_count,
     )
     LOGGER.info(
         "Finished batch: %d success, %d failure",

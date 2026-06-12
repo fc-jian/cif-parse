@@ -17,6 +17,11 @@ output_format = "json"
 #   assembly.
 assembly_mode = "all"
 
+# When parsing pre-split assembly CIFs (`--input-assembly`), optionally add one
+# asymmetric-unit task per source PDB from `metadata_cif_dir`. The synthetic
+# asymmetric-unit task is recorded as assembly id 0.
+include_asym = false
+
 # Method for assigning observed coordinates to polymer sequence positions.
 # Options:
 # - "nearest": assign by nearest residue/atom coordinate when direct identifiers
