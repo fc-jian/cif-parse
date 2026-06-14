@@ -6,7 +6,7 @@ import logging
 import json
 import pickle
 import zlib
-from functools import lru_cache
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +14,9 @@ from cif_parse.pipeline import infer_case_id
 
 LOGGER = logging.getLogger(__name__)
 
-_MAX_CACHE_SIZE = 128
+_DEFAULT_ASSEMBLY_CACHE_SIZE = 8
 
 
-@lru_cache(maxsize=_MAX_CACHE_SIZE)
 def _load_pkl_bytes(path: str) -> bytes | None:
     try:
         return zlib.decompress(Path(path).read_bytes())
@@ -139,10 +138,13 @@ class PklAtomReader:
         self,
         cases_root: str | Path,
         source_case_dir_map: dict[str, str] | None = None,
+        *,
+        max_cache_size: int = _DEFAULT_ASSEMBLY_CACHE_SIZE,
     ) -> None:
         self._root = Path(cases_root)
         self._source_case_dir_map = dict(source_case_dir_map or {})
-        self._aa_cache: dict[tuple[str, str | None], Any] = {}
+        self._max_cache_size = max(0, int(max_cache_size))
+        self._aa_cache: OrderedDict[tuple[str, str | None], Any] = OrderedDict()
 
     # ------------------------------------------------------------------
     # public API
@@ -174,21 +176,31 @@ class PklAtomReader:
         atoms_dirs = _candidate_atoms_dirs(self._root, case_id)
         atoms_dir = next((candidate for candidate in atoms_dirs if candidate.is_dir()), atoms_dirs[0])
         cache_key = (str(atoms_dir.resolve(strict=False)), assembly_id)
-        if cache_key not in self._aa_cache:
-            pkl_path = atoms_dir / f"{assembly_id or '_none'}.pkl"
-            if assembly_id is None and not pkl_path.exists():
-                fallback_path = _single_assembly_cache_path(atoms_dir)
-                if fallback_path is not None:
-                    pkl_path = fallback_path
-            raw = _load_pkl_bytes(str(pkl_path))
-            if raw is None:
-                return None
-            try:
-                self._aa_cache[cache_key] = pickle.loads(raw)
-            except Exception:
-                LOGGER.debug("[fallback] Failed to unpickle %s", pkl_path, exc_info=True)
-                return None
-        return self._aa_cache[cache_key]
+        cached = self._aa_cache.get(cache_key)
+        if cached is not None:
+            self._aa_cache.move_to_end(cache_key)
+            return cached
+
+        pkl_path = atoms_dir / f"{assembly_id or '_none'}.pkl"
+        if assembly_id is None and not pkl_path.exists():
+            fallback_path = _single_assembly_cache_path(atoms_dir)
+            if fallback_path is not None:
+                pkl_path = fallback_path
+        raw = _load_pkl_bytes(str(pkl_path))
+        if raw is None:
+            return None
+        try:
+            atom_array = pickle.loads(raw)
+        except Exception:
+            LOGGER.debug("[fallback] Failed to unpickle %s", pkl_path, exc_info=True)
+            return None
+
+        if self._max_cache_size > 0:
+            self._aa_cache[cache_key] = atom_array
+            self._aa_cache.move_to_end(cache_key)
+            while len(self._aa_cache) > self._max_cache_size:
+                self._aa_cache.popitem(last=False)
+        return atom_array
 
     def load_chains(
         self,

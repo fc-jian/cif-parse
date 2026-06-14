@@ -17,7 +17,10 @@ from cif_parse.clustering.common import discover_case_output_dirs
 from cif_parse.clustering.dimers import build_dimer_signature_clusters
 from cif_parse.clustering.monomers import MonomerSample, build_monomer_sequence_dataset
 from cif_parse.clustering.multimers import build_multimer_signature_clusters
-from cif_parse.clustering.protein_structures import greedy_cluster_protein_structures
+from cif_parse.clustering.protein_structures import (
+    greedy_cluster_protein_structures,
+    resolve_usalign_executable,
+)
 from cif_parse.clustering.tcr_complexes import build_tcr_complex_signature_clusters
 from cif_parse.export import load_json
 from cif_parse.settings import (
@@ -649,12 +652,15 @@ def _run_structure(
     args: argparse.Namespace,
     sequence_dataset: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    sequence_dataset = _load_or_use_sequence_dataset(args, sequence_dataset)
-    prep_dir = _prep_dir(args)
     if args.protein_structure_mode != "greedy":
+        _load_or_use_sequence_dataset(args, sequence_dataset)
         LOGGER.info("Protein structure clustering skipped because protein_structure_mode=%s", args.protein_structure_mode)
         return None
+    args.usalign_executable = resolve_usalign_executable(args.usalign_executable)
+    LOGGER.info("Using USalign executable: %s", args.usalign_executable)
 
+    sequence_dataset = _load_or_use_sequence_dataset(args, sequence_dataset)
+    prep_dir = _prep_dir(args)
     t1 = time.monotonic()
     protein_monomer_count = sum(1 for m in sequence_dataset["monomers"] if m.polymer_class == "protein")
     seq_cluster_count = len({

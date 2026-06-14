@@ -33,6 +33,7 @@ LOGGER = logging.getLogger(__name__)
 
 SKIP_QUALITY_METADATA = object()
 USALIGN_PDB_FORMAT_VERSION = 3
+USALIGN_CACHE_FORMAT_VERSION = 2
 
 ALIGNED_LENGTH_RE = re.compile(
     r"Aligned length=\s*(?P<aligned_length>\d+),\s*RMSD=\s*(?P<rmsd>[0-9.]+),\s*Seq_ID=.*"
@@ -460,11 +461,10 @@ def run_usalign_alignment(
 ) -> USalignAlignmentResult:
     """Run USalign on one monomer pair and parse the result."""
 
-    if shutil.which(usalign_executable) is None:
-        raise FileNotFoundError(f"{usalign_executable} executable not found in PATH")
+    resolved_executable = resolve_usalign_executable(usalign_executable)
 
     command = [
-        usalign_executable,
+        resolved_executable,
         query.extracted_pdb_path,
         target.extracted_pdb_path,
         "-mol",
@@ -481,6 +481,23 @@ def run_usalign_alignment(
         target_resolved_residue_count=target.resolved_residue_count,
         tm_score_threshold=tm_score_threshold,
         min_alignment_coverage_ratio=min_alignment_coverage_ratio,
+    )
+
+
+def resolve_usalign_executable(executable: str) -> str:
+    """Resolve USalign once so a missing binary fails before expensive work."""
+
+    resolved = shutil.which(executable)
+    if resolved is None:
+        raise FileNotFoundError(f"{executable} executable not found in PATH")
+    return str(Path(resolved).resolve())
+
+
+def _is_usalign_executable_error(error: str) -> bool:
+    normalized = error.lower()
+    return (
+        "usalign executable not found in path" in normalized
+        or ("usalign" in normalized and "no such file or directory" in normalized)
     )
 
 
@@ -1196,7 +1213,8 @@ def _run_three_phase_clustering(
 
     del extract_fn, cif_idx
     outdir.mkdir(parents=True, exist_ok=True)
-    cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
+    cache_db_path = outdir / f"usalign_tasks_v{USALIGN_CACHE_FORMAT_VERSION}.db"
+    cache_db = AlignmentCacheDB(cache_db_path)
     pdb_dir = outdir / "pdbs"
     pdb_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1214,6 +1232,9 @@ def _run_three_phase_clustering(
         for monomer_id, monomer in monomer_index.items()
         if monomer_id in member_id_set
     }
+    del member_id_set
+    del monomer_index
+    del sequence_groups
     all_subcluster: dict[str, dict[str, str]] = {}
 
     to_extract = set(monomer_index_light)
@@ -1224,14 +1245,6 @@ def _run_three_phase_clustering(
     )
 
     if prep_dir is not None:
-        serialized_monomers = {
-            monomer_id: asdict(monomer)
-            for monomer_id, monomer in tqdm(
-                monomer_index_light.items(),
-                desc="Serialize monomers",
-                unit="monomer",
-            )
-        }
         group_items = sorted(
             group_member_map.items(),
             key=lambda item: (-len(item[1]), item[0]),
@@ -1242,7 +1255,11 @@ def _run_three_phase_clustering(
             return (
                 sequence_cluster_id,
                 member_ids,
-                [serialized_monomers[mid] for mid in member_ids if mid in serialized_monomers],
+                [
+                    asdict(monomer_index_light[mid])
+                    for mid in member_ids
+                    if mid in monomer_index_light
+                ],
                 str(pdb_dir),
                 protein_subcluster_by_sequence,
             )
@@ -1314,7 +1331,7 @@ def _run_three_phase_clustering(
                             ] = batch
                 finally:
                     progress.close()
-        cache_db = AlignmentCacheDB(outdir / "usalign_tasks.db")
+        cache_db = AlignmentCacheDB(cache_db_path)
     else:
         for sequence_cluster_id, member_ids in group_member_map.items():
             available = [
@@ -1516,11 +1533,17 @@ def _run_three_phase_clustering(
                         cached.get("tm_score_max") is not None
                         or cached.get("error_message")
                     ):
-                        total_cache_hits += 1
-                        if cached.get("error_message"):
-                            state["round_failures"][candidate.monomer_id] = str(
-                                cached["error_message"]
+                        cached_error = str(cached.get("error_message") or "")
+                        if cached_error and _is_usalign_executable_error(cached_error):
+                            raise RuntimeError(
+                                "The USalign cache contains an infrastructure failure "
+                                f"for {item['cache_key']}: {cached_error}. "
+                                f"Move or clean {cache_db_path.name} before resuming."
                             )
+                        total_cache_hits += 1
+                        if cached_error:
+                            total_alignment_failures += 1
+                            state["round_failures"][candidate.monomer_id] = cached_error
                         else:
                             state["round_results"][candidate.monomer_id] = cached
                         state["round_done"] += 1
@@ -1602,6 +1625,13 @@ def _run_three_phase_clustering(
                         result_rows.append((cache_key, result_record))
                         total_alignment_runs += 1
                         completed_keys.append(cache_key)
+                    except FileNotFoundError as exc:
+                        for pending_future in future_to_item:
+                            pending_future.cancel()
+                        raise RuntimeError(
+                            "USalign became unavailable during structure clustering; "
+                            "aborting without caching the infrastructure failure"
+                        ) from exc
                     except Exception as exc:
                         error_text = str(exc)
                         state["round_failures"][candidate.monomer_id] = error_text
@@ -1696,14 +1726,13 @@ def _run_three_phase_clustering(
         fallback_member_ids = list(state.get("fallback_member_ids", []) or [])
         if fallback_member_ids and emitted_clusters:
             for monomer_id in fallback_member_ids:
-                monomer = monomer_index_light.get(monomer_id) or monomer_index.get(monomer_id)
+                monomer = monomer_index_light.get(monomer_id)
                 monomer_sequence = monomer.sequence if monomer is not None else ""
 
                 def _representative_sequence(cluster: dict[str, Any]) -> str:
                     representative_structure = cluster["representative"]
-                    representative_monomer = (
-                        monomer_index_light.get(representative_structure.monomer_id)
-                        or monomer_index.get(representative_structure.monomer_id)
+                    representative_monomer = monomer_index_light.get(
+                        representative_structure.monomer_id
                     )
                     return representative_monomer.sequence if representative_monomer is not None else ""
 
@@ -1729,9 +1758,7 @@ def _run_three_phase_clustering(
                 local_index,
             )
             representative_id = fallback_member_ids[0]
-            representative_monomer = monomer_index_light.get(representative_id) or monomer_index.get(
-                representative_id
-            )
+            representative_monomer = monomer_index_light.get(representative_id)
             emitted_clusters.append(
                 {
                     "structure_cluster_id": structure_cluster_id,
